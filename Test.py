@@ -1,4 +1,5 @@
-# 🛩️ eVTOL Mini-Lab — Streamlit demo (HUD + animation + normalized health + mobile-friendly + Fleet + Copilot)
+# 🛩️ eVTOL Mini-Lab — Streamlit demo
+# Features: Planner + Perception + Health + Fleet UTM + Logs/Export + Physics Fidelity + Copilot (heuristic by default)
 # Run: streamlit run app.py
 
 import os, math, time, json
@@ -660,35 +661,46 @@ with tab4:
         st.success("Simulation finished ✅")
         st.caption("Tip: open **📜 Logs & Export** below to download results.")
 
-# ============ 5) Copilot (LLM chat over plans/health/logs) ============
+# ============ 5) Copilot (heuristic by default; optional cloud LLM) ============
 with tab5:
-    st.subheader("Copilot (LLM chat)")
-    st.caption("Ask about mission plans, energy, health, or fleet runs. If OPENAI_API_KEY is set, answers use the model; otherwise a local heuristic reply is used.")
+    st.subheader("Copilot (log-aware helper)")
+    st.caption("Default: local heuristic (no network). Optionally enable a cloud LLM with an API key.")
 
+    # Controls
+    enable_cloud_llm = st.toggle("Enable cloud LLM (optional)", value=False, help="Off = local heuristic only")
+    api_key_input = ""
+    if enable_cloud_llm:
+        api_key_input = st.text_input("OpenAI API key", type="password", help="Or set OPENAI_API_KEY env var")
+    api_key_env = os.getenv("OPENAI_API_KEY", "") if enable_cloud_llm else ""
+    api_key = (api_key_input.strip() or api_key_env) if enable_cloud_llm else ""
+
+    # Chat history
     st.session_state.setdefault("chat_msgs", [])
     for role, content in st.session_state["chat_msgs"]:
         with st.chat_message(role):
             st.write(content)
 
-    user_msg = st.chat_input("Ask a question (e.g., 'Why NO-GO?', 'Summarize last fleet run')")
+    user_msg = st.chat_input("Ask: 'Why NO-GO?', 'Summarize', 'Fleet results?'")
     if user_msg:
         st.session_state["chat_msgs"].append(("user", user_msg))
         with st.chat_message("user"): st.write(user_msg)
 
+        # Context from latest logs
         df_logs = logs_dataframe()
-        last_plan = df_logs[df_logs["event"].str.contains("plan_snapshot")].tail(1).to_dict("records")
-        last_rating = df_logs[df_logs["event"]=="mission_rating"].tail(1).to_dict("records")
+        last_plan  = df_logs[df_logs["event"].str.contains("plan_snapshot")].tail(1).to_dict("records")
+        last_rate  = df_logs[df_logs["event"]=="mission_rating"].tail(1).to_dict("records")
         last_fleet = df_logs[df_logs["event"]=="fleet_sim_completed"].tail(1).to_dict("records")
         context = {
-            "last_plan": last_plan[0] if last_plan else {},
-            "last_rating": last_rating[0] if last_rating else {},
+            "last_plan":  last_plan[0] if last_plan else {},
+            "last_rating":last_rate[0] if last_rate else {},
             "last_fleet": last_fleet[0] if last_fleet else {},
         }
 
-        api_key = os.getenv("OPENAI_API_KEY", "")
         reply = None
+        mode = "heuristic"
 
-        if api_key:
+        # Optional cloud LLM
+        if enable_cloud_llm and api_key:
             try:
                 import requests
                 prompt = (
@@ -700,52 +712,55 @@ with tab5:
                 res = requests.post(
                     "https://api.openai.com/v1/chat/completions",
                     headers={"Authorization": f"Bearer {api_key}", "Content-Type":"application/json"},
-                    json={
-                        "model": "gpt-4o-mini",
-                        "messages": [{"role":"user","content": prompt}],
-                        "temperature": 0.2,
-                    },
+                    json={"model": "gpt-4o-mini", "messages":[{"role":"user","content":prompt}], "temperature":0.2},
                     timeout=20
                 )
                 data = res.json()
                 reply = data["choices"][0]["message"]["content"].strip()
-            except Exception as e:
-                reply = f"_LLM unavailable; local reasoning fallback. Error: {e}_"
+                mode = "openai"
+            except Exception:
+                reply = None
+                mode = "heuristic"
 
+        # Heuristic fallback / default
         if not reply:
             lines = []
             q = user_msg.lower()
+            p = context["last_plan"]; r = context["last_rating"]; f = context["last_fleet"]
+
+            def have_plan(): return bool(p)
+            def have_fleet(): return bool(f)
+            def have_rating(): return bool(r)
+
             if "summary" in q or "summarize" in q:
-                if context["last_plan"]:
-                    p = context["last_plan"]
+                if have_plan():
                     try:
-                        lines.append(f"• Plan: {p.get('distance_m','?'):.0f} m, Need {p.get('energy_need_Wh','?'):.0f} Wh, "
-                                     f"Reserve {p.get('reserve_Wh','?'):.0f} Wh → GO={p.get('go')}")
+                        lines.append(
+                            f"• Plan: {p.get('distance_m',0):.0f} m, Need {p.get('energy_need_Wh',0):.0f} Wh, "
+                            f"Reserve {p.get('reserve_Wh',0):.0f} Wh → GO={p.get('go')}"
+                        )
                     except Exception:
-                        lines.append("• Plan: summary available; keys missing for pretty print.")
-                if context["last_rating"]:
-                    r = context["last_rating"]
-                    lines.append(f"• Mission Rating: {r.get('rating')}, Health {r.get('health')}")
-                if context["last_fleet"]:
-                    f = context["last_fleet"]
+                        lines.append("• Plan: summary available (some fields missing).")
+                if have_rating():
+                    lines.append(f"• Mission rating: {r.get('rating')} (Health {r.get('health')})")
+                if have_fleet():
                     lines.append(f"• Fleet: N={f.get('N')}, LOS={f.get('los_violations')}, Reached={f.get('reached')}")
-                if not lines: lines.append("• No recent logs. Run a plan/flight or fleet sim, then ask again.")
+                if not lines:
+                    lines.append("• No recent logs. Run a plan/flight or fleet sim, then ask again.")
             elif "why no-go" in q or "no-go" in q:
-                p = context["last_plan"]
-                if p:
-                    need = p.get("energy_need_Wh"); reserve = p.get("reserve_Wh"); batt = p.get("battery_Wh")
-                    if all(x is not None for x in [need, reserve, batt]) and (need + reserve) > batt:
-                        lines.append("• Need + Reserve exceeds Battery. Reduce reserve %, distance, mass, or hover; or increase battery.")
+                if have_plan():
+                    need, reserve, batt = p.get("energy_need_Wh"), p.get("reserve_Wh"), p.get("battery_Wh")
+                    if None not in (need, reserve, batt) and (need + reserve) > batt:
+                        lines.append("• Need + Reserve > Battery. Reduce reserve %, distance, mass, hover, or increase battery.")
                     else:
-                        lines.append("• Could not verify NO-GO; re-run planner and log a snapshot.")
+                        lines.append("• Last snapshot doesn't show NO-GO. Re-run planner and snapshot again.")
                 else:
                     lines.append("• No plan snapshot found. Run a plan and click Log snapshot.")
             elif "fleet" in q or "los" in q or "coordination" in q:
-                f = context["last_fleet"]
-                if f:
+                if have_fleet():
                     lines.append(f"• Last fleet run: N={f.get('N')}, LOS={f.get('los_violations')}, "
                                  f"Adaptive={f.get('adaptive')}, Sep={f.get('sep')}")
-                    lines.append("• Tip: raise fusion confidence or separation; enable Adaptive to lower LOS.")
+                    lines.append("• Tip: raise fusion confidence or separation; enable Adaptive to reduce LOS.")
                 else:
                     lines.append("• No fleet run logged yet. Open Fleet UTM → Run simulation → ask again.")
             else:
@@ -756,7 +771,7 @@ with tab5:
         with st.chat_message("assistant"):
             st.write(reply)
         st.session_state["chat_msgs"].append(("assistant", reply))
-        log_event("copilot_exchange", question=user_msg, answer=reply)
+        log_event("copilot_exchange", mode=mode, question=user_msg, answer=reply)
 
 # ─────────────────────────────────────────────────────────
 # 📜 Logs & Export
