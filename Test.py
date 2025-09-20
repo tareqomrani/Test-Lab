@@ -1,7 +1,7 @@
 # tesla_toy_boat_streamlit.py
 # Tesla’s Toy Boat — Royal Blue • Mobile-friendly + D-pad/Joystick + Haptics + Speaker-friendly audio
-# Features: HUD inside pond (Score/Speed/Signal/Lag), Lamp tap/hold/toggle, Reset, Mute, Victory banner
-# Plus: Radio Signal bars + Radio Latency slider
+# HUD inside pond (Score/Speed/Signal/Lag) • Lamp tap/hold/toggle • Reset • Mute • Victory
+# Radio Signal bars + Radio Latency slider • Audio unlock/envelope (mobile) • HUD padding/safe-area
 
 import json
 import streamlit as st
@@ -12,7 +12,7 @@ st.set_page_config(page_title="Tesla’s Toy Boat", page_icon="⛵️", layout="
 # Sidebar tuning
 st.sidebar.header("⛵️ Game Settings")
 buoy_goal   = st.sidebar.slider("Buoy goal (win condition)", 5, 25, 10, 1)
-buoy_count  = st.sidebar.slider("Total buoys spawned", buoy_goal, 40, max(14, buoy_goal), 1)
+buoy_count  = st.sidebar.slider("Total buoys spawned", max(5, buoy_goal), 40, max(14, buoy_goal), 1)
 reeds_count = st.sidebar.slider("Reeds (hazards)", 0, 40, 18, 1)
 max_speed   = st.sidebar.slider("Max boat speed (pixels/s)", 120, 360, 240, 10)
 drag        = st.sidebar.slider("Water drag (higher = slows faster)", 0.2, 1.2, 0.6, 0.05)
@@ -44,13 +44,27 @@ HTML = r"""
   header h1{font-size:1.15rem;margin:0;color:var(--royal)}
   .pill{font-size:.9rem;padding:.2rem .6rem;border-radius:999px;background:#00000010;border:1px solid #0002}
 
-  #pond{border:4px solid #ffffffaa;border-radius:16px;position:relative;overflow:hidden;min-height:420px;max-width:1200px;margin:.25rem auto 6.5rem auto}
+  /* Pond with padding for HUD + safe-area inset */
+  #pond{
+    border:4px solid #ffffffaa;
+    border-radius:16px;
+    position:relative;
+    overflow:hidden;
+    min-height:420px;
+    max-width:1200px;
+    margin:.25rem auto 6.5rem auto;
+    padding-bottom: calc(84px + env(safe-area-inset-bottom, 0px));
+    box-sizing: border-box;
+  }
   canvas{display:block;width:100%;height:100%}
   .hint{color:#000a;text-align:center;padding:.4rem 0}
 
   /* HUD bottom-right inside pond */
   .hud{
-    position:absolute; right:.75rem; bottom:.75rem; z-index:2;
+    position:absolute;
+    right:.75rem;
+    bottom: calc(0.75rem + env(safe-area-inset-bottom, 0px));
+    z-index:2;
     background:#ffffffee; border:2px solid #0002; border-radius:12px; padding:.4rem .6rem;
     display:flex; gap:.7rem; align-items:center; box-shadow:0 4px 0 #0001; font-weight:700;
     pointer-events:none;
@@ -134,37 +148,52 @@ HTML = r"""
 <script id="cfg" type="application/json">__CFG_JSON__</script>
 <script>
 (() => {
-  // --- Config + Audio/Haptics ---
   const cfg = JSON.parse(document.getElementById('cfg').textContent || "{}");
-  let audioCtx, muted=false;
+
+  /* ===================== Audio ===================== */
+  let audioCtx, muted=false, audioUnlocked=false;
   const AC = window.AudioContext || window.webkitAudioContext;
   function ensureAudio(){ if(!audioCtx && AC){ audioCtx=new AC(); } if(audioCtx && audioCtx.state==='suspended') audioCtx.resume(); }
-
-  // Speaker-friendly beep: square+sine, lower pitch, higher gain
-  function beep(freq=440, dur=150){
-    if(muted || !audioCtx) return;
-    const osc1 = audioCtx.createOscillator();
-    const osc2 = audioCtx.createOscillator();
-    const gain = audioCtx.createGain();
-    osc1.type = "square";  osc1.frequency.value = freq;      // mid
-    osc2.type = "sine";    osc2.frequency.value = freq / 2;  // body
-    gain.gain.value = 0.15;
-    osc1.connect(gain); osc2.connect(gain); gain.connect(audioCtx.destination);
-    osc1.start(); osc2.start();
-    setTimeout(()=>{ try{osc1.stop();osc2.stop();}catch{} }, dur);
+  function unlockAudioOnce(){
+    if(audioUnlocked) return;
+    ensureAudio(); if(!audioCtx) return;
+    const t=audioCtx.currentTime;
+    const o=audioCtx.createOscillator(), g=audioCtx.createGain();
+    o.type='square'; o.frequency.value=360;
+    g.gain.setValueAtTime(0.0001,t);
+    g.gain.exponentialRampToValueAtTime(0.18,t+0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001,t+0.12);
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(t); o.stop(t+0.12);
+    audioUnlocked=true;
+  }
+  ['touchstart','mousedown','keydown'].forEach(ev =>
+    document.addEventListener(ev, unlockAudioOnce, { passive:true, once:true })
+  );
+  function beep(freq=440, dur=180){
+    if(muted) return; ensureAudio(); if(!audioCtx) return;
+    const t=audioCtx.currentTime, dt=dur/1000;
+    const o1=audioCtx.createOscillator(), o2=audioCtx.createOscillator(), g=audioCtx.createGain();
+    o1.type='square'; o1.frequency.value=freq;     // mid
+    o2.type='sine';   o2.frequency.value=freq/2;   // body
+    g.gain.setValueAtTime(0.0001,t);
+    g.gain.exponentialRampToValueAtTime(0.18,t+0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001,t+dt);
+    o1.connect(g); o2.connect(g); g.connect(audioCtx.destination);
+    o1.start(t); o2.start(t); o1.stop(t+dt+0.01); o2.stop(t+dt+0.01);
   }
   function vibrate(ms=20){ if(navigator.vibrate) try{ navigator.vibrate(ms); }catch{} }
   const muteBtn=document.getElementById('mute');
   muteBtn.addEventListener('click', ()=>{ ensureAudio(); muted=!muted; muteBtn.textContent=muted?'🔇':'🔈'; });
 
-  // --- Canvas & sizing ---
+  /* ===================== Canvas & sizing ===================== */
   const canvas=document.getElementById('game'), ctx=canvas.getContext('2d');
   const W=canvas.width, H=canvas.height;
   const rand=(a,b)=>a+Math.random()*(b-a);
   function fit(){ const r=W/H; const box=document.getElementById('pond').getBoundingClientRect(); let w=box.width,h=box.height; if(w/h>r)w=h*r; else h=w/r; canvas.style.width=w+'px'; canvas.style.height=h+'px'; }
   addEventListener('resize', fit); fit();
 
-  // --- State ---
+  /* ===================== Game State ===================== */
   function spawn(){ return {
     boat:{ x:W*0.15, y:H*0.5, v:0, a:0, r:0, lamp:false },
     buoys:Array.from({length: cfg.buoy_count || 14}, ()=>({x:rand(W*0.25,W*0.9),y:rand(H*0.1,H*0.9),r:16,hue:rand(0,360)})),
@@ -173,7 +202,7 @@ HTML = r"""
   }; }
   let state=spawn();
 
-  // --- HUD Signal/Lag ---
+  /* ===================== HUD: Signal & Lag ===================== */
   const sigEl = document.getElementById('signal');
   const lagEl = document.getElementById('lag');
   const origin = { x: W*0.15, y: H*0.5 };
@@ -185,10 +214,10 @@ HTML = r"""
     [...sigEl.children].forEach((b, i)=> b.classList.toggle('on', i < bars));
   }
 
-  // --- Input: keyboard + virtual ---
+  /* ===================== Input: keys + virtual ===================== */
   const keys={}; addEventListener('keydown',e=>{ keys[e.code]=true; ensureAudio(); }); addEventListener('keyup',e=>{ keys[e.code]=false; });
 
-  // D-pad builder
+  // D-pad
   function buildDpad(){
     const pad=document.createElement('div');
     pad.className='pad';
@@ -216,7 +245,7 @@ HTML = r"""
     return pad;
   }
 
-  // Joystick builder
+  // Joystick
   let joy={x:0,y:0,active:false};
   function buildStick(){
     const pad=document.createElement('div'); pad.className='stickpad';
@@ -252,7 +281,7 @@ HTML = r"""
   modeBtn.addEventListener('click', ()=>{ mode=(mode==='dpad'?'joystick':'dpad'); renderLeft(); ensureAudio(); beep(420,90); });
   renderLeft();
 
-  // Lamp: tap toggle + press&hold + keyboard 'T'
+  /* ===================== Lamp controls ===================== */
   const lampBtn=document.getElementById('lamp'); let lampHeld=false, touchStartTime=0, lastTouchTime=0;
   function refreshLampButton(){ const on = lampHeld || !!keys['KeyT']; lampBtn.classList.toggle('active', on); lampBtn.textContent = on ? '💡 Lamp ON' : '💡 Lamp'; }
   function setLampHeld(v){ lampHeld=v; refreshLampButton(); }
@@ -272,11 +301,10 @@ HTML = r"""
 
   document.getElementById('reset').addEventListener('click', ()=>{ state=spawn(); vibrate(25); beep(380,160); refreshLampButton(); });
 
-  // Radio latency queue
+  /* ===================== Latency queue ===================== */
   const latencyMs = Number(cfg.latency_ms || 0);
   let controlQueue = [];
   let lastApplied = { thrust:0, brake:0, steer:0 };
-
   function sampleControls(){
     let thrust=0, brake=0, steer=0;
     if (mode==='joystick' && joy.active){ thrust = 100 * Math.max(0, -joy.y); steer = joy.x; }
@@ -284,7 +312,7 @@ HTML = r"""
     return { thrust, brake, steer };
   }
 
-  // Update / Draw / Loop
+  /* ===================== Update / Draw ===================== */
   function update(dt){
     const b=state.boat;
 
