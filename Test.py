@@ -2,11 +2,15 @@
 # 🛩️ VTOL Precision Landing Simulator — eVTOL dataset
 # Digital-green theme • 3D cone • ArUco/AprilTag assist • Kalman filter
 # Landing Success Score + Auto-Tuner • Apply Best Settings (session_state)
-# In-place animations (no stacked graphs)
+# Scenario Presets • In-place animations • Run Log Export (JSON/CSV/ZIP)
 
 import io
+import json
+import uuid
 import math
 import time
+import zipfile
+import datetime as dt
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -27,6 +31,8 @@ try:
 except Exception:
     apriltag = None
     _APRILTAG_OK = False
+
+APP_VERSION = "1.3.0"
 
 # ─────────────────────────────────────────────
 # Page / Theme
@@ -49,17 +55,59 @@ st.markdown(
 )
 
 st.title("🛩️ VTOL Precision Landing Simulator")
-st.caption("RTK • Lidar • EKF-style fusion • ArUco/AprilTag assist • Kalman smoothing • 3D cone • Auto-Tuner")
+st.caption("RTK • Lidar • EKF-style fusion • ArUco/AprilTag assist • Kalman smoothing • 3D cone • Auto-Tuner • Run Log Export")
 
 # ─────────────────────────────────────────────
 # eVTOL Dataset (all VTOL-capable)
 # ─────────────────────────────────────────────
 uav_data = {
+    # Hybrids / tailsitters
     "Quantum Systems Vector": {"type": "Hybrid Fixed-Wing eVTOL", "rtk": True, "lidar": True, "hover_draw_W": 220, "cruise_draw_W": 95},
-    "WingtraOne": {"type": "Tail-sitter eVTOL (mapping)", "rtk": True, "lidar": False, "hover_draw_W": 190, "cruise_draw_W": 70},
-    "DeltaQuad Pro": {"type": "Hybrid Fixed-Wing eVTOL", "rtk": True, "lidar": True, "hover_draw_W": 250, "cruise_draw_W": 110},
+    "Quantum Systems Trinity F90+": {"type": "Hybrid Fixed-Wing eVTOL (mapping)", "rtk": True, "lidar": False, "hover_draw_W": 180, "cruise_draw_W": 80},
+    "WingtraOne Gen II": {"type": "Tail-sitter eVTOL (mapping)", "rtk": True, "lidar": False, "hover_draw_W": 190, "cruise_draw_W": 70},
+    "DeltaQuad Evo": {"type": "Hybrid Fixed-Wing eVTOL", "rtk": True, "lidar": True, "hover_draw_W": 260, "cruise_draw_W": 110},
+    "Censys Sentaero VTOL": {"type": "Hybrid Fixed-Wing eVTOL", "rtk": True, "lidar": True, "hover_draw_W": 240, "cruise_draw_W": 100},
+    "Atmos Marlyn Cobalt": {"type": "Hybrid Fixed-Wing eVTOL", "rtk": True, "lidar": True, "hover_draw_W": 230, "cruise_draw_W": 90},
+    "ALTI Transition": {"type": "Hybrid Fixed-Wing eVTOL", "rtk": True, "lidar": True, "hover_draw_W": 300, "cruise_draw_W": 140},
+    # Multirotors (still eVTOL)
+    "Percepto Air Max": {"type": "Multirotor eVTOL (industrial)", "rtk": True, "lidar": True, "hover_draw_W": 220, "cruise_draw_W": 0},
+    # Custom demo
     "Urban Hawk Tiltrotor (Custom)": {"type": "Hybrid Tiltrotor eVTOL", "rtk": True, "lidar": True, "hover_draw_W": 300, "cruise_draw_W": 120},
 }
+
+# ─────────────────────────────────────────────
+# Scenario Presets (dropdown)
+# ─────────────────────────────────────────────
+PRESETS = {
+    "— None —": {},
+    "Rooftop Urban": {
+        "wind_gust": True, "occlusion_prob": 0.20, "illum": 0.65, "blur": 0.25,
+        "beacon_gain": 0.45, "lock_thresh_px": 30, "lock_dwell_frames": 9
+    },
+    "Ship Deck": {
+        "wind_gust": True, "occlusion_prob": 0.05, "illum": 0.85, "blur": 0.30,
+        "beacon_gain": 0.50, "lock_thresh_px": 32, "lock_dwell_frames": 10
+    },
+    "Forest Clearing": {
+        "wind_gust": False, "occlusion_prob": 0.35, "illum": 0.60, "blur": 0.15,
+        "beacon_gain": 0.40, "lock_thresh_px": 26, "lock_dwell_frames": 8
+    },
+    "Desert Pad": {
+        "wind_gust": True, "occlusion_prob": 0.05, "illum": 0.95, "blur": 0.20,
+        "beacon_gain": 0.38, "lock_thresh_px": 28, "lock_dwell_frames": 7
+    },
+    "Warehouse Doorway": {
+        "wind_gust": False, "occlusion_prob": 0.40, "illum": 0.50, "blur": 0.10,
+        "beacon_gain": 0.48, "lock_thresh_px": 24, "lock_dwell_frames": 12
+    }
+}
+
+def apply_preset(preset_name: str):
+    cfg = PRESETS.get(preset_name, {})
+    if not cfg:
+        return
+    for k, v in cfg.items():
+        st.session_state[k] = v
 
 # ─────────────────────────────────────────────
 # Apply Best Settings from Auto-Tuner (session_state)
@@ -76,11 +124,20 @@ if st.session_state.get("pending_apply"):
     st.session_state["pending_apply"] = False  # clear after apply
 
 # ─────────────────────────────────────────────
-# Sidebar Controls (keys so session_state can update them)
+# Sidebar Controls (keys allow session_state updates)
 # ─────────────────────────────────────────────
 st.sidebar.header("Mission / Sensor Settings")
+
+# UAV dropdown (back & expanded dataset)
 uav = st.sidebar.selectbox("UAV Model", list(uav_data.keys()), key="uav_model")
 specs = uav_data[uav]
+
+# Scenario preset dropdown
+st.sidebar.markdown("### Scenario Preset")
+preset_choice = st.sidebar.selectbox("Preset", list(PRESETS.keys()), index=0, key="preset_choice")
+if st.sidebar.button("Apply Preset ▶️"):
+    apply_preset(preset_choice)
+    st.success(f"Preset applied: {preset_choice}")
 
 rtk_fix = st.sidebar.checkbox("RTK Fix Lock", value=True, key="rtk_fix")
 use_lidar = st.sidebar.checkbox("Use Lidar Altitude Lock", value=specs["lidar"], key="use_lidar")
@@ -104,19 +161,19 @@ illum = st.sidebar.slider("Illumination (0–1)", 0.1, 1.0, 0.85, 0.05, key="ill
 blur = st.sidebar.slider("Motion Blur (0–1)", 0.0, 1.0, 0.2, 0.05, key="blur")
 occlusion_prob = st.sidebar.slider("Occlusion Probability", 0.0, 0.6, 0.1, 0.05, key="occlusion_prob")
 
-# Beacon correction (exposed so tuner can apply)
-beacon_gain = st.sidebar.slider("Beacon Correction Gain (locked)", 0.0, 0.8, 0.35, 0.01, key="beacon_gain")
+# Beacon correction (exposed so tuner & presets can apply)
+beacon_gain = st.sidebar.slider("Beacon Correction Gain (locked)", 0.0, 0.8, st.session_state.get("beacon_gain", 0.35), 0.01, key="beacon_gain")
 
 # Kalman filter tuning
 st.sidebar.markdown("### Kalman Filter (XY)")
-kf_q = st.sidebar.slider("Process Noise q", 1e-5, 5e-2, 5e-3, format="%.5f", key="kf_q")
-kf_r_base = st.sidebar.slider("Meas Noise (GNSS σ, m)", 0.02 if rtk_fix else 0.2, 2.0, 0.03 if rtk_fix else 1.0, 0.01, key="kf_r_base")
+kf_q = st.sidebar.slider("Process Noise q", 1e-5, 5e-2, st.session_state.get("kf_q", 5e-3), format="%.5f", key="kf_q")
+kf_r_base = st.sidebar.slider("Meas Noise (GNSS σ, m)", 0.02 if rtk_fix else 0.2, 2.0, st.session_state.get("kf_r_base", 0.03 if rtk_fix else 1.0), 0.01, key="kf_r_base")
 
 # Playback / environment
 seed = st.sidebar.number_input("Random Seed", value=0, step=1, key="seed")
 steps = st.sidebar.slider("Playback Steps", 30, 500, 160, key="steps")
 play_speed = st.sidebar.slider("Playback Speed (sec/frame)", 0.01, 0.20, 0.05, key="play_speed")
-wind_gust = st.sidebar.checkbox("Inject Wind Gust (XY bias)", value=False, key="wind_gust")
+wind_gust = st.sidebar.checkbox("Inject Wind Gust (XY bias)", value=st.session_state.get("wind_gust", False), key="wind_gust")
 gps_glitch = st.sidebar.checkbox("Inject GPS Glitch (spike)", value=False, key="gps_glitch")
 
 # UAV summary
@@ -165,8 +222,7 @@ def marker_pixels_from_alt(alt_m, marker_size_m, f_px):
     px = (float(f_px) * float(marker_size_m)) / np.maximum(alt, 1e-6)
     return float(px) if px.ndim == 0 else px
 
-def sigmoid(x):
-    return 1.0 / (1.0 + np.exp(-x))
+def sigmoid(x): return 1.0 / (1.0 + np.exp(-x))
 
 # ─────────────────────────────────────────────
 # ArUco / AprilTag panel
@@ -319,15 +375,14 @@ def landing_score(m):
     return float(100.0 * (0.40 * xy_term + 0.20 * vs_term + 0.20 * cone_term + 0.20 * lock_term))
 
 # ─────────────────────────────────────────────
-# Landing Playback (Vision-assisted + Kalman + Scoring)
+# Landing Playback (Vision-assisted + Kalman + Scoring + Export)
 # ─────────────────────────────────────────────
 st.subheader("🎬 Landing Playback (Vision-assisted + Kalman + Score)")
 
 def vision_detect_prob(px, thresh_px, illum, blur, backend):
-    # Baseline curve rises as pixel size exceeds threshold; backend tweaks robustness
     k = 0.25
     base = sigmoid((px - thresh_px) * k)
-    backend_boost = 1.0 if backend.startswith("ArUco") else 1.1  # AprilTag a tad more robust
+    backend_boost = 1.0 if backend.startswith("ArUco") else 1.1  # AprilTag a tad more robust (sim)
     blur_penalty = (1.0 - 0.6 * blur)
     light_boost = 0.6 + 0.4 * illum
     return np.clip(base * blur_penalty * light_boost * backend_boost, 0.0, 1.0)
@@ -338,6 +393,9 @@ def focal_px():
 start = st.button("Run Playback")
 
 if start:
+    run_uuid = str(uuid.uuid4())
+    run_time_utc = dt.datetime.utcnow().isoformat() + "Z"
+
     # XY random walk per-step (GNSS)
     per_step_sigma = 0.03 if rtk_fix else 1.0
     steps_xy = np.random.normal(0, per_step_sigma, size=(steps, 2))
@@ -367,11 +425,13 @@ if start:
     dwell = 0
     locked = False
     det_timeline, px_timeline, locked_timeline = [], [], []
+    z_timeline = []
 
     for i in range(steps):
         # Integrate raw GNSS position
         pos_raw = pos_raw + steps_xy[i]
         z_now = max(z_descent[i], 0.0)
+        z_timeline.append(z_now)
 
         # Camera geometry / pixel model
         radial = np.linalg.norm(pos_raw)
@@ -486,18 +546,71 @@ if start:
         ax_p.grid(True)
         st.pyplot(fig_p)
 
-    # Export CSV of the run
+    # Frame-by-frame CSV
     run_df = pd.DataFrame({
         "t": np.arange(steps),
+        "x_raw": np.array(path_raw)[:, 0],
+        "y_raw": np.array(path_raw)[:, 1],
         "x_kf": np.array(path_kf)[:, 0],
         "y_kf": np.array(path_kf)[:, 1],
-        "z_agl": np.maximum(z_descent, 0.0),
+        "z_agl": np.maximum(np.array(z_timeline), 0.0),
         "detected": det_timeline,
         "locked": locked_timeline,
         "px_est": px_timeline
     })
-    st.download_button("Download Playback CSV", run_df.to_csv(index=False).encode("utf-8"),
-                       file_name="vtol_playback.csv", mime="text/csv")
+
+    # ── Log Export: JSON, CSV, ZIP
+    settings_payload = {
+        "app_version": APP_VERSION,
+        "run_uuid": run_uuid,
+        "run_time_utc": run_time_utc,
+        "uav_model": uav,
+        "uav_specs": specs,
+        "preset": st.session_state.get("preset_choice"),
+        "rtk_fix": bool(rtk_fix),
+        "use_lidar": bool(use_lidar),
+        "vision_backend": vision_backend,
+        "enable_vision": bool(enable_vision),
+        "marker_id": int(marker_id),
+        "marker_size_cm": int(marker_size_cm),
+        "camera": {"width_px": int(cam_res_x), "height_px": int(cam_res_y), "hfov_deg": float(cam_hfov_deg)},
+        "lock_thresh_px": int(lock_thresh_px),
+        "lock_dwell_frames": int(lock_dwell_frames),
+        "illum": float(illum),
+        "blur": float(blur),
+        "occlusion_prob": float(occlusion_prob),
+        "beacon_gain": float(beacon_gain),
+        "kf_q": float(kf_q),
+        "kf_r_base": float(kf_r_base),
+        "seed": int(seed),
+        "steps": int(steps),
+        "play_speed": float(play_speed),
+        "wind_gust": bool(wind_gust),
+        "gps_glitch": bool(gps_glitch),
+    }
+    metrics_payload = {"score": score, **metrics}
+
+    log_json = {
+        "meta": {"app_version": APP_VERSION, "run_uuid": run_uuid, "run_time_utc": run_time_utc},
+        "uav": {"model": uav, "specs": specs},
+        "settings": settings_payload,
+        "metrics": metrics_payload,
+        "trace_columns": list(run_df.columns),
+        "trace_preview_head": run_df.head(5).to_dict(orient="list")  # small preview
+    }
+    json_bytes = json.dumps(log_json, indent=2).encode("utf-8")
+    csv_bytes = run_df.to_csv(index=False).encode("utf-8")
+
+    st.download_button("Download Playback CSV", csv_bytes, file_name=f"vtol_playback_{run_uuid[:8]}.csv", mime="text/csv")
+    st.download_button("Download Run Log (JSON)", json_bytes, file_name=f"vtol_runlog_{run_uuid[:8]}.json", mime="application/json")
+
+    # ZIP with both + full settings
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(f"run_{run_uuid[:8]}/trace.csv", csv_bytes)
+        zf.writestr(f"run_{run_uuid[:8]}/runlog.json", json_bytes)
+        zf.writestr(f"run_{run_uuid[:8]}/settings_only.json", json.dumps(settings_payload, indent=2).encode("utf-8"))
+    st.download_button("Download All (ZIP)", zip_buf.getvalue(), file_name=f"vtol_run_{run_uuid[:8]}.zip", mime="application/zip")
 
 # ─────────────────────────────────────────────
 # Auto-Tuner (experimental) — maximize score
@@ -612,6 +725,10 @@ with st.expander("Open Auto-Tuner"):
         st.markdown("**Top Results**")
         st.dataframe(df.head(10))
 
+        # Export tuner results
+        st.download_button("Download Tuner Results (CSV)", df.to_csv(index=False).encode("utf-8"),
+                           file_name="tuner_results.csv", mime="text/csv")
+
         # Best row dict
         best = df.iloc[0].to_dict()
         c1, c2 = st.columns(2)
@@ -648,4 +765,4 @@ with st.expander("Open Auto-Tuner"):
 # Footer
 with st.expander("UAV Spec Snapshot"):
     st.dataframe(pd.DataFrame(uav_data).T)
-st.caption("Tip: Click **Apply Best Settings** after Auto-Tune, then re-run playback. Aim for XY≤0.2 m, V-speed≤0.5 m/s, high lock stability.")
+st.caption("Tip: Use **Scenario Preset** to configure conditions quickly, then **Auto-Tune** and **Apply Best Settings**. Aim for XY≤0.2 m, V-speed≤0.5 m/s, high lock stability.")
