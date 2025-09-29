@@ -159,12 +159,13 @@ def focal_length_px(hfov_deg: float, width_px: int) -> float:
     hfov = np.radians(hfov_deg)
     return width_px / (2.0 * np.tan(hfov / 2.0))
 
-def marker_pixels_from_alt(alt_m: float, marker_size_m: float, f_px: float) -> float:
-    if alt_m <= 1e-6:
-        return 1e6
-    return (f_px * marker_size_m) / alt_m
+def marker_pixels_from_alt(alt_m, marker_size_m, f_px):
+    """Return estimated marker pixel size. Works with scalars or NumPy arrays."""
+    alt = np.asarray(alt_m, dtype=float)
+    px = (float(f_px) * float(marker_size_m)) / np.maximum(alt, 1e-6)
+    return float(px) if px.ndim == 0 else px
 
-def sigmoid(x): 
+def sigmoid(x):
     return 1.0 / (1.0 + np.exp(-x))
 
 # ─────────────────────────────────────────────
