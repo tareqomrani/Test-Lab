@@ -1,768 +1,378 @@
-# vtol_precision_landing_app.py
-# 🛩️ VTOL Precision Landing Simulator — eVTOL dataset
-# Digital-green theme • 3D cone • ArUco/AprilTag assist • Kalman filter
-# Landing Success Score + Auto-Tuner • Apply Best Settings (session_state)
-# Scenario Presets • In-place animations • Run Log Export (JSON/CSV/ZIP)
+# app.py — Future Tank Lab (expanded)
+# Run:
+#   pip install streamlit numpy pandas
+#   streamlit run app.py
 
-import io
-import json
-import uuid
 import math
-import time
-import zipfile
-import datetime as dt
+from dataclasses import dataclass
+from typing import Tuple, List, Dict
+
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 import streamlit as st
 
-# Optional vision libs (graceful fallback if missing)
-try:
-    import cv2
-    _ARUCO_OK = hasattr(cv2, "aruco")
-except Exception:
-    cv2 = None
-    _ARUCO_OK = False
+# ─────────────────────────────────────────────────────────
+# App shell
+# ─────────────────────────────────────────────────────────
+st.set_page_config(page_title="Future Tank Lab", page_icon="🛡️", layout="wide")
+st.title("🛡️ Future Tank Lab")
+st.caption("Concept demonstrator: APS vs FPVs, soft-kill EW, thermal signature, hybrid/silent ops, UAV teaming + six design pillars")
 
-try:
-    import pupil_apriltags as apriltag  # detector only (no generator)
-    _APRILTAG_OK = True
-except Exception:
-    apriltag = None
-    _APRILTAG_OK = False
+# Small helpers
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
 
-APP_VERSION = "1.3.0"
+def logistic(x, k=1.0, x0=0.0):
+    return 1.0 / (1.0 + math.exp(-k*(x - x0)))
 
-# ─────────────────────────────────────────────
-# Page / Theme
-# ─────────────────────────────────────────────
-st.set_page_config(page_title="🛩️ VTOL Precision Landing", page_icon="🛩️", layout="wide")
-DIGITAL_GREEN = "#00D084"
-BG_DARK = "#0b2a2a"
-FG_LIGHT = "#d7fff0"
-st.markdown(
-    f"""
-    <style>
-      .stApp {{ background:{BG_DARK}; color:{FG_LIGHT}; }}
-      .block-container {{ padding-top:1.5rem; }}
-      h1, h2, h3 {{ color:{DIGITAL_GREEN} !important; }}
-      .stButton>button {{ background:{DIGITAL_GREEN}; color:black; font-weight:600; border:0; }}
-      .metric-box {{ border:1px solid {DIGITAL_GREEN}; border-radius:8px; padding:12px; margin:6px 0; }}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+def stack_pk(pk_single: float, layers: int) -> float:
+    layers = max(1, int(layers))
+    pk_single = clamp(pk_single, 0.0, 0.99)
+    return 1.0 - (1.0 - pk_single) ** layers
 
-st.title("🛩️ VTOL Precision Landing Simulator")
-st.caption("RTK • Lidar • EKF-style fusion • ArUco/AprilTag assist • Kalman smoothing • 3D cone • Auto-Tuner • Run Log Export")
+# ─────────────────────────────────────────────────────────
+# Sidebar controls (grouped by theme)
+# ─────────────────────────────────────────────────────────
+st.sidebar.header("Scenario Controls")
 
-# ─────────────────────────────────────────────
-# eVTOL Dataset (all VTOL-capable)
-# ─────────────────────────────────────────────
-uav_data = {
-    # Hybrids / tailsitters
-    "Quantum Systems Vector": {"type": "Hybrid Fixed-Wing eVTOL", "rtk": True, "lidar": True, "hover_draw_W": 220, "cruise_draw_W": 95},
-    "Quantum Systems Trinity F90+": {"type": "Hybrid Fixed-Wing eVTOL (mapping)", "rtk": True, "lidar": False, "hover_draw_W": 180, "cruise_draw_W": 80},
-    "WingtraOne Gen II": {"type": "Tail-sitter eVTOL (mapping)", "rtk": True, "lidar": False, "hover_draw_W": 190, "cruise_draw_W": 70},
-    "DeltaQuad Evo": {"type": "Hybrid Fixed-Wing eVTOL", "rtk": True, "lidar": True, "hover_draw_W": 260, "cruise_draw_W": 110},
-    "Censys Sentaero VTOL": {"type": "Hybrid Fixed-Wing eVTOL", "rtk": True, "lidar": True, "hover_draw_W": 240, "cruise_draw_W": 100},
-    "Atmos Marlyn Cobalt": {"type": "Hybrid Fixed-Wing eVTOL", "rtk": True, "lidar": True, "hover_draw_W": 230, "cruise_draw_W": 90},
-    "ALTI Transition": {"type": "Hybrid Fixed-Wing eVTOL", "rtk": True, "lidar": True, "hover_draw_W": 300, "cruise_draw_W": 140},
-    # Multirotors (still eVTOL)
-    "Percepto Air Max": {"type": "Multirotor eVTOL (industrial)", "rtk": True, "lidar": True, "hover_draw_W": 220, "cruise_draw_W": 0},
-    # Custom demo
-    "Urban Hawk Tiltrotor (Custom)": {"type": "Hybrid Tiltrotor eVTOL", "rtk": True, "lidar": True, "hover_draw_W": 300, "cruise_draw_W": 120},
-}
+# Threatscape
+st.sidebar.subheader("Threatscape")
+fpv_density = st.sidebar.slider("FPV/loitering threat density (per minute)", 0.0, 10.0, 2.0, 0.1)
+ew_threat = st.sidebar.slider("Adversary EW/jam severity (0–1)", 0.0, 1.0, 0.3, 0.05)
+atgm_rate = st.sidebar.slider("ATGM/rocket salvo rate (per hour)", 0.0, 30.0, 6.0, 1.0)
 
-# ─────────────────────────────────────────────
-# Scenario Presets (dropdown)
-# ─────────────────────────────────────────────
-PRESETS = {
-    "— None —": {},
-    "Rooftop Urban": {
-        "wind_gust": True, "occlusion_prob": 0.20, "illum": 0.65, "blur": 0.25,
-        "beacon_gain": 0.45, "lock_thresh_px": 30, "lock_dwell_frames": 9
-    },
-    "Ship Deck": {
-        "wind_gust": True, "occlusion_prob": 0.05, "illum": 0.85, "blur": 0.30,
-        "beacon_gain": 0.50, "lock_thresh_px": 32, "lock_dwell_frames": 10
-    },
-    "Forest Clearing": {
-        "wind_gust": False, "occlusion_prob": 0.35, "illum": 0.60, "blur": 0.15,
-        "beacon_gain": 0.40, "lock_thresh_px": 26, "lock_dwell_frames": 8
-    },
-    "Desert Pad": {
-        "wind_gust": True, "occlusion_prob": 0.05, "illum": 0.95, "blur": 0.20,
-        "beacon_gain": 0.38, "lock_thresh_px": 28, "lock_dwell_frames": 7
-    },
-    "Warehouse Doorway": {
-        "wind_gust": False, "occlusion_prob": 0.40, "illum": 0.50, "blur": 0.10,
-        "beacon_gain": 0.48, "lock_thresh_px": 24, "lock_dwell_frames": 12
-    }
-}
+# Protection
+st.sidebar.subheader("Protection")
+aps_hardkill_layers = st.sidebar.slider("APS hard-kill layers (interceptor stacks)", 0, 3, 1, 1)
+aps_pk_single = st.sidebar.slider("APS single-shot Pk vs inbound (0–1)", 0.0, 1.0, 0.7, 0.05)
+softkill_effect = st.sidebar.slider("Soft-kill EW/obscurant effectiveness (0–1)", 0.0, 1.0, 0.4, 0.05)
 
-def apply_preset(preset_name: str):
-    cfg = PRESETS.get(preset_name, {})
-    if not cfg:
-        return
-    for k, v in cfg.items():
-        st.session_state[k] = v
+# Mobility / Hybrid
+st.sidebar.subheader("Mobility & Propulsion")
+mass_t = st.sidebar.slider("Combat mass (tonnes)", 20.0, 75.0, 55.0, 0.5)
+hybrid = st.sidebar.checkbox("Hybrid-electric propulsion", value=True)
+battery_kwh = st.sidebar.slider("Battery capacity (kWh)", 0.0, 800.0, 200.0, 10.0)
+fuel_l = st.sidebar.slider("Fuel (liters)", 0.0, 2500.0, 1200.0, 25.0)
+silent_watch_kw = st.sidebar.slider("Silent-watch average draw (kW)", 0.0, 40.0, 8.0, 0.5)
+avg_speed_kph = st.sidebar.slider("Avg cross-country speed (km/h)", 0.0, 60.0, 25.0, 1.0)
 
-# ─────────────────────────────────────────────
-# Apply Best Settings from Auto-Tuner (session_state)
-# ─────────────────────────────────────────────
-APPLY_KEYS = [
-    "beacon_gain", "lock_thresh_px", "lock_dwell_frames", "kf_q", "kf_r_base",
-    "cam_hfov_deg", "cam_res_x", "marker_size_cm", "enable_vision", "rtk_fix", "use_lidar"
-]
-if st.session_state.get("pending_apply"):
-    payload = st.session_state.get("apply_payload", {})
-    for k in APPLY_KEYS:
-        if k in payload:
-            st.session_state[k] = payload[k]
-    st.session_state["pending_apply"] = False  # clear after apply
+# Thermal / Signature
+st.sidebar.subheader("Thermal & Signature")
+ambient_C = st.sidebar.slider("Ambient temperature (°C)", -20.0, 45.0, 20.0, 1.0)
+skin_C = st.sidebar.slider("Hull/engine skin temperature (°C)", -20.0, 90.0, 45.0, 1.0)
+wind_mps = st.sidebar.slider("Wind speed (m/s)", 0.0, 15.0, 3.0, 0.5)
+camo_factor = st.sidebar.slider("Thermal camo / multispectral net (0=none, 1=excellent)", 0.0, 1.0, 0.5, 0.05)
+observer_km = st.sidebar.slider("IR sensor standoff (km)", 0.1, 5.0, 2.0, 0.1)
 
-# ─────────────────────────────────────────────
-# Sidebar Controls (keys allow session_state updates)
-# ─────────────────────────────────────────────
-st.sidebar.header("Mission / Sensor Settings")
+# New category knobs (match the LinkedIn post)
+st.sidebar.subheader("Mobility: Advanced")
+suspension_adaptive = st.sidebar.selectbox("Suspension", ["Conventional", "Adaptive"])
+maglev_hover = st.sidebar.checkbox("Maglev / hover-assist (conceptual)", value=False)
+convoy_mode = st.sidebar.checkbox("Autonomous leader-follower convoy", value=False)
 
-# UAV dropdown (back & expanded dataset)
-uav = st.sidebar.selectbox("UAV Model", list(uav_data.keys()), key="uav_model")
-specs = uav_data[uav]
+st.sidebar.subheader("Armor & Coatings")
+reactive_armor_level = st.sidebar.slider("Adaptive/reactive armor level (0–1)", 0.0, 1.0, 0.6, 0.05)
+em_armor = st.sidebar.checkbox("Electromagnetic armor (conceptual HEAT counter)", value=False)
+stealth_coating = st.sidebar.slider("Stealth coatings quality (0–1)", 0.0, 1.0, 0.5, 0.05)
 
-# Scenario preset dropdown
-st.sidebar.markdown("### Scenario Preset")
-preset_choice = st.sidebar.selectbox("Preset", list(PRESETS.keys()), index=0, key="preset_choice")
-if st.sidebar.button("Apply Preset ▶️"):
-    apply_preset(preset_choice)
-    st.success(f"Preset applied: {preset_choice}")
+st.sidebar.subheader("Weapons")
+railgun_energy_mj = st.sidebar.slider("Railgun muzzle energy (MJ)", 0.0, 40.0, 18.0, 0.5)
+dew_power_kw = st.sidebar.slider("Directed-energy power (kW)", 0.0, 500.0, 120.0, 5.0)
+smart_ammo_mode = st.sidebar.selectbox("Smart ammunition", ["Off", "Airburst", "Trajectory Adjust"])
+swarm_drones = st.sidebar.slider("Swarm drones carried (count)", 0, 24, 6, 1)
 
-rtk_fix = st.sidebar.checkbox("RTK Fix Lock", value=True, key="rtk_fix")
-use_lidar = st.sidebar.checkbox("Use Lidar Altitude Lock", value=specs["lidar"], key="use_lidar")
+st.sidebar.subheader("Sensors & AI")
+sensor_bubble_km = st.sidebar.slider("360° sensor bubble radius (km)", 0.2, 8.0, 3.0, 0.1)
+ar_cockpit = st.sidebar.checkbox("AR cockpit overlays", value=True)
+net_nodes = st.sidebar.slider("Battlefield network peers (nodes)", 0, 40, 8, 1)
+ai_target_quality = st.sidebar.slider("AI-assisted targeting quality (0–1)", 0.0, 1.0, 0.7, 0.05)
 
-# Vision backend (simulated detection model; tags are generated/illustrative)
-st.sidebar.markdown("### Vision Backend")
-vision_backend = st.sidebar.selectbox("Backend", ["ArUco (OpenCV)", "AprilTag (pupil_apriltags)"], index=0, key="vision_backend")
-enable_vision = st.sidebar.checkbox("Enable Vision Assist", value=True, key="enable_vision")
+st.sidebar.subheader("Crew & Modularity")
+crew_size = st.sidebar.slider("Crew size", 0, 4, 2, 1)
+modular_packs = st.sidebar.multiselect("Modular packs", ["Heavy Turret", "Light Turret", "Recon Sensors", "Extra Armor", "EW Suite"], default=["Recon Sensors", "EW Suite"])
+cbrn = st.sidebar.checkbox("CBRN life-support enabled", value=True)
 
-# Marker / camera model (shared)
-marker_id = st.sidebar.number_input("Marker ID (for ArUco)", min_value=0, max_value=999, value=23, step=1, key="marker_id")
-marker_size_cm = st.sidebar.slider("Marker Size (cm)", 10, 80, 40, key="marker_size_cm")
-cam_res_x = st.sidebar.selectbox("Camera Width (px)", [640, 960, 1280, 1920], index=2, key="cam_res_x")
-cam_res_y = st.sidebar.selectbox("Camera Height (px)", [480, 720, 1080], index=2, key="cam_res_y")
-cam_hfov_deg = st.sidebar.slider("Camera HFOV (deg)", 40.0, 110.0, 78.0, 0.5, key="cam_hfov_deg")
+st.sidebar.subheader("Conceptual Futurism")
+shape_shift = st.sidebar.checkbox("Shape-shifting chassis (urban/field)", value=False)
+exo_units = st.sidebar.slider("Robotic exoskeletons carried (units)", 0, 12, 2, 1)
+energy_shield = st.sidebar.checkbox("Energy shield (experimental)", value=False)
 
-lock_thresh_px = st.sidebar.slider("Vision Lock Threshold (min pixels)", 10, 120, 28, key="lock_thresh_px")
-lock_dwell_frames = st.sidebar.slider("Lock Dwell (frames)", 1, 30, 8, key="lock_dwell_frames")
+st.sidebar.markdown("---")
+st.sidebar.caption("Illustrative, not platform-specific. Sliders are conceptual and educational.")
 
-illum = st.sidebar.slider("Illumination (0–1)", 0.1, 1.0, 0.85, 0.05, key="illum")
-blur = st.sidebar.slider("Motion Blur (0–1)", 0.0, 1.0, 0.2, 0.05, key="blur")
-occlusion_prob = st.sidebar.slider("Occlusion Probability", 0.0, 0.6, 0.1, 0.05, key="occlusion_prob")
+# ─────────────────────────────────────────────────────────
+# Derived quantities shared by tabs
+# ─────────────────────────────────────────────────────────
+# Effective soft-kill reduces FPV density and ATGM hit chance; EW increases FPV clutter
+eff_fpv_density = fpv_density * (1.0 - 0.6 * softkill_effect) * (1.0 + 0.5 * ew_threat)
+eff_atgm_rate = atgm_rate * (1.0 - 0.3 * softkill_effect)
 
-# Beacon correction (exposed so tuner & presets can apply)
-beacon_gain = st.sidebar.slider("Beacon Correction Gain (locked)", 0.0, 0.8, st.session_state.get("beacon_gain", 0.35), 0.01, key="beacon_gain")
+pk_stack = stack_pk(aps_pk_single, aps_hardkill_layers)
 
-# Kalman filter tuning
-st.sidebar.markdown("### Kalman Filter (XY)")
-kf_q = st.sidebar.slider("Process Noise q", 1e-5, 5e-2, st.session_state.get("kf_q", 5e-3), format="%.5f", key="kf_q")
-kf_r_base = st.sidebar.slider("Meas Noise (GNSS σ, m)", 0.02 if rtk_fix else 0.2, 2.0, st.session_state.get("kf_r_base", 0.03 if rtk_fix else 1.0), 0.01, key="kf_r_base")
+# FPV/ATGM leakers (toy)
+fpv_hr = eff_fpv_density * 60.0
+p_fpv_through = clamp((1.0 - pk_stack) * (0.7 - 0.5 * softkill_effect), 0.01, 0.95)
+p_atgm_through = clamp((1.0 - pk_stack) * (0.8 - 0.3 * softkill_effect), 0.01, 0.95)
+hits_per_hour = max(0.0, fpv_hr * p_fpv_through * 0.1 + eff_atgm_rate * p_atgm_through * 0.5)
+survivability = 1.0 - logistic(hits_per_hour, k=0.8, x0=1.5)
 
-# Playback / environment
-seed = st.sidebar.number_input("Random Seed", value=0, step=1, key="seed")
-steps = st.sidebar.slider("Playback Steps", 30, 500, 160, key="steps")
-play_speed = st.sidebar.slider("Playback Speed (sec/frame)", 0.01, 0.20, 0.05, key="play_speed")
-wind_gust = st.sidebar.checkbox("Inject Wind Gust (XY bias)", value=st.session_state.get("wind_gust", False), key="wind_gust")
-gps_glitch = st.sidebar.checkbox("Inject GPS Glitch (spike)", value=False, key="gps_glitch")
+# UAV teaming baseline (will be used later)
+tethered_uav = True  # retained from original: default to depicting a scout tether
+uav_uplook_quality = 0.6
+teaming_bonus = 0.15 * (1.0 if tethered_uav else 0.0) * uav_uplook_quality
+mission_success = clamp(0.5 * survivability + 0.3 * (1.0 - ew_threat) + teaming_bonus, 0.0, 1.0)
 
-# UAV summary
-st.markdown(
-    f"**Selected:** {uav}  \n"
-    f"**Type:** {specs['type']}  \n"
-    f"**RTK-capable:** {'✅' if specs['rtk'] else '❌'}  |  "
-    f"**Lidar onboard:** {'✅' if specs['lidar'] else '❌'}  |  "
-    f"**Vision:** {vision_backend} {'✅' if enable_vision else '❌'}"
-)
+# Thermal detectability proxy
+delta_T = max(0.0, skin_C - ambient_C)
+base = delta_T / 20.0
+range_factor = 1.0 / (1.0 + (observer_km / 1.5) ** 2)
+wind_cool = clamp(1.0 - 0.03 * wind_mps, 0.5, 1.0)
+camo = clamp(1.0 - 0.6 * camo_factor, 0.3, 1.0)
+detectability = clamp(base * range_factor * wind_cool * camo, 0.0, 1.0)
 
-# ─────────────────────────────────────────────
-# Helpers (marker image + camera model)
-# ─────────────────────────────────────────────
-def generate_aruco_png_bytes(marker_id: int, size_px: int = 800, border_bits: int = 1) -> bytes:
-    """Return PNG bytes of an ArUco marker (DICT_4X4_1000). Falls back to a simple checker if OpenCV/aruco is unavailable."""
-    from PIL import Image as PImage, ImageOps as PImageOps, ImageDraw
-    if _ARUCO_OK:
-        dict_ = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_1000)
-        img = cv2.aruco.generateImageMarker(dict_, marker_id, size_px)
-        if border_bits > 0:
-            img = cv2.copyMakeBorder(img, border_bits*10, border_bits*10, border_bits*10, border_bits*10,
-                                     cv2.BORDER_CONSTANT, value=255)
-        pil = PImage.fromarray(img)
+# Mobility / energy model (toy)
+kwh_per_km = 0.25 * (mass_t / 50.0)  # illustrative scaling
+mech_efficiency = 0.85 if hybrid else 0.7
+fuel_kwh_gross = fuel_l * 9.7
+usable_fuel_kwh = fuel_kwh_gross * mech_efficiency
+silent_watch_hours = (battery_kwh * 0.9) / max(0.5, silent_watch_kw) if hybrid else 0.0
+traction_kwh = usable_fuel_kwh + (battery_kwh * 0.2 if hybrid else 0.0)
+range_km = traction_kwh / max(0.05, kwh_per_km)
+endurance_h = range_km / max(1.0, avg_speed_kph)
+
+# ─────────────────────────────────────────────────────────
+# TABS
+# ─────────────────────────────────────────────────────────
+tabs = st.tabs([
+    "1) Threatscape", "2) APS Intercept", "3) Thermal Signature", "4) Hybrid & Silent Watch", "5) UAV Teaming",
+    "6) Mobility & Propulsion", "7) Armor & Protection", "8) Weapons & Firepower",
+    "9) Sensors & AI Integration", "10) Crew & Modularity", "11) Concept Futurism", "12) Summary & Export"
+])
+
+# 1) Threatscape
+with tabs[0]:
+    st.subheader("Threatscape: drones/FPVs, ATGMs, and protection layers")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Effective FPVs/hr", f"{fpv_hr:.1f}")
+    c2.metric("Hard-kill net Pk", f"{pk_stack*100:.0f}%")
+    c3.metric("Expected hits/hr (toy)", f"{hits_per_hour:.2f}")
+    c1, c2 = st.columns(2)
+    c1.progress(clamp(survivability, 0.0, 1.0), text=f"Survivability: {survivability*100:.0f}%")
+    c2.progress(clamp(mission_success, 0.0, 1.0), text=f"Mission success: {mission_success*100:.0f}%")
+    st.caption("Illustrative only; outcomes depend on detailed performance, terrain, TTPs, and counter-countermeasures.")
+
+# 2) APS Intercept
+with tabs[1]:
+    st.subheader("APS Intercept Visualizer")
+    salvo = st.slider("Inbound simultaneous threats (salvo size)", 1, 20, 6, 1, key="salvo")
+    reaction = st.slider("Reaction & geometry factor (0=ideal, 1=poor)", 0.0, 1.0, 0.3, 0.05, key="react")
+    pk_eff = clamp(aps_pk_single * (1.0 - 0.4 * reaction), 0.0, 0.99)
+    pk_eff_stack = stack_pk(pk_eff, aps_hardkill_layers)
+    p_leaker = (1.0 - pk_eff_stack) ** salvo
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Eff. single-shot Pk", f"{pk_eff*100:.0f}%")
+    c2.metric("Stacked Pk", f"{pk_eff_stack*100:.0f}%")
+    c3.metric("P(leaker ≥1)", f"{p_leaker*100:.0f}%")
+
+# 3) Thermal Signature
+with tabs[2]:
+    st.subheader("Thermal Signature & Detection Risk (notional)")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("ΔT (skin-ambient)", f"{delta_T:.1f} °C")
+    c2.metric("Observer standoff", f"{observer_km:.1f} km")
+    c3.metric("Wind cooling factor", f"{wind_cool:.2f}")
+    c4.metric("Detectability (toy)", f"{detectability*100:.0f}%")
+    st.caption("Lower ΔT, wind cooling, and good multispectral camo reduce detection risk.")
+
+# 4) Hybrid & Silent Watch
+with tabs[3]:
+    st.subheader("Hybrid-Electric: Range & Silent Watch (illustrative)")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("kWh/km (toy)", f"{kwh_per_km:.2f}")
+    c2.metric("Silent watch (h)", f"{silent_watch_hours:.1f}")
+    c3.metric("Range (km)", f"{range_km:.0f}")
+    c4.metric("Road-march hours", f"{endurance_h:.1f}")
+    st.caption("Hybrid enables silent windows; fuel sustains range. Values are conceptual.")
+
+# 5) UAV Teaming
+with tabs[4]:
+    st.subheader("UAV Teaming: Situational Awareness Boost (sketch)")
+    baseline_route_risk = clamp(0.5 + 0.4 * ew_threat + 0.2 * (fpv_density / 10.0), 0.0, 1.0)
+    uav_bonus = 0.25 * (1.0 if tethered_uav else 0.0) * uav_uplook_quality + 0.01 * swarm_drones
+    route_risk_with_uav = clamp(baseline_route_risk * (1.0 - uav_bonus), 0.0, 1.0)
+    c1, c2 = st.columns(2)
+    c1.progress(1.0 - baseline_route_risk, text=f"Baseline route safety: {(1.0 - baseline_route_risk)*100:.0f}%")
+    c2.progress(1.0 - route_risk_with_uav, text=f"With UAV teaming: {(1.0 - route_risk_with_uav)*100:.0f}%")
+    st.caption("Tethered/scout drones and swarms extend sensing and help avoid ambushes.")
+
+# 6) Mobility & Propulsion (new)
+with tabs[5]:
+    st.subheader("Mobility & Propulsion Enhancements")
+    terrain_penalty = 0.25  # base drag/terrain factor
+    if suspension_adaptive == "Adaptive":
+        terrain_penalty *= 0.8  # smoother travel
+    if maglev_hover:
+        terrain_penalty *= 0.6  # reduced ground pressure benefit
+    convoy_bonus = 0.1 if convoy_mode else 0.0
+    mobility_score = clamp(1.0 - terrain_penalty + convoy_bonus, 0.0, 1.0)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Terrain penalty (↓ better)", f"{terrain_penalty:.2f}")
+    c2.metric("Convoy bonus", f"{convoy_bonus*100:.0f}%")
+    c3.progress(mobility_score, text=f"Mobility score: {mobility_score*100:.0f}%")
+    st.caption("Adaptive suspensions reduce terrain penalties; hover/maglev cuts ground pressure; convoy automation shares risk.")
+
+# 7) Armor & Protection (new)
+with tabs[6]:
+    st.subheader("Armor & Protection Mix")
+    heat_block = 0.35 + 0.35 * reactive_armor_level + (0.2 if em_armor else 0.0)
+    kinetic_block = 0.25 + 0.25 * reactive_armor_level
+    stealth_reduction = 0.2 + 0.6 * stealth_coating  # reduces radar/IR/acoustic signature
+    net_protection = clamp(0.5 * heat_block + 0.5 * kinetic_block, 0.0, 1.0)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("HEAT/CE mitigation", f"{clamp(heat_block,0,1)*100:.0f}%")
+    c2.metric("Kinetic mitigation", f"{clamp(kinetic_block,0,1)*100:.0f}%")
+    c3.metric("Stealth reduction", f"{clamp(stealth_reduction,0,1)*100:.0f}%")
+    st.progress(net_protection, text=f"Net armor effectiveness: {net_protection*100:.0f}%")
+    st.caption("Reactive/adaptive armor tunes response; EM armor is conceptual; stealth coatings cut multi-spectral signatures.")
+
+# 8) Weapons & Firepower (new)
+with tabs[7]:
+    st.subheader("Weapons & Firepower")
+    # Railgun toy ballistic: v = sqrt(2E/m); assume 8 kg dart
+    dart_mass_kg = 8.0
+    if railgun_energy_mj <= 0:
+        v_ms = 0.0
     else:
-        # Simple placeholder if aruco is not available
-        pil = PImage.new("L", (size_px, size_px), 255)
-        draw = ImageDraw.Draw(pil)
-        s = size_px // 8
-        for i in range(8):
-            for j in range(8):
-                if (i + j + marker_id) % 2 == 0:
-                    draw.rectangle([i*s, j*s, (i+1)*s, (j+1)*s], fill=0)
-        pil = PImageOps.expand(pil, border=20, fill=255)
-    buf = io.BytesIO()
-    pil.save(buf, format="PNG")
-    return buf.getvalue()
+        v_ms = math.sqrt(max(0.0, (2.0 * railgun_energy_mj * 1e6) / dart_mass_kg))
+    railgun_range_km = clamp(v_ms / 2.0 / 1000.0, 0.0, 200.0)  # extremely simplified
+    dew_kill_rate = clamp(dew_power_kw / 400.0, 0.0, 1.0)  # 400 kW ~ “1.0” in demo
+    smart_bonus = {"Off": 0.0, "Airburst": 0.12, "Trajectory Adjust": 0.18}[smart_ammo_mode]
+    swarm_effect = 0.02 * swarm_drones
+    firepower_index = clamp(0.5 * (railgun_energy_mj / 40.0) + 0.3 * dew_kill_rate + smart_bonus + swarm_effect, 0.0, 1.0)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Railgun velocity (m/s)", f"{v_ms:.0f}")
+    c2.metric("Notional range (km)", f"{railgun_range_km:.1f}")
+    c3.metric("DEW drone-kill rate", f"{dew_kill_rate*100:.0f}%")
+    c4.progress(firepower_index, text=f"Firepower index: {firepower_index*100:.0f}%")
+    st.caption("Toy physics only. Railgun and DEW values are illustrative to show trade-offs and allocation effects.")
 
-def focal_length_px(hfov_deg: float, width_px: int) -> float:
-    hfov = np.radians(hfov_deg)
-    return width_px / (2.0 * np.tan(hfov / 2.0))
+# 9) Sensors & AI Integration (new)
+with tabs[8]:
+    st.subheader("Sensors & AI Integration")
+    # Detection chance increases with bubble size; networking & AI improve response speed
+    detection_chance = clamp(sensor_bubble_km / 6.0, 0.0, 1.0)
+    net_bonus = clamp(net_nodes / 40.0, 0.0, 1.0) * 0.3
+    ar_bonus = 0.1 if ar_cockpit else 0.0
+    ai_bonus = 0.4 * ai_target_quality
+    situational_awareness = clamp(0.4 * detection_chance + net_bonus + ar_bonus + 0.2 * (1.0 - detectability), 0.0, 1.0)
+    engagement_speed = clamp(0.3 + ai_bonus + net_bonus, 0.0, 1.0)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Detection probability", f"{detection_chance*100:.0f}%")
+    c2.progress(situational_awareness, text=f"Situational awareness: {situational_awareness*100:.0f}%")
+    c3.progress(engagement_speed, text=f"Engagement speed: {engagement_speed*100:.0f}%")
+    st.caption("360° sensing + networking + AR + AI improves detection and decision loops.")
 
-def marker_pixels_from_alt(alt_m, marker_size_m, f_px):
-    """Return estimated marker pixel size. Works with scalars or NumPy arrays."""
-    alt = np.asarray(alt_m, dtype=float)
-    px = (float(f_px) * float(marker_size_m)) / np.maximum(alt, 1e-6)
-    return float(px) if px.ndim == 0 else px
+# 10) Crew & Modularity (new)
+with tabs[9]:
+    st.subheader("Crew & Modularity")
+    # Fewer crew → smaller silhouette but less redundancy; modular packs add capability at weight cost
+    crew_silhouette_bonus = clamp((4 - crew_size) * 0.05, 0.0, 0.2)
+    pack_map = {"Heavy Turret": 0.25, "Light Turret": 0.1, "Recon Sensors": 0.15, "Extra Armor": 0.2, "EW Suite": 0.15}
+    pack_capability = sum(pack_map[p] for p in modular_packs)
+    pack_weight_penalty = 0.03 * len(modular_packs)
+    cbrn_bonus = 0.1 if cbrn else 0.0
+    modularity_score = clamp(0.4 + pack_capability - pack_weight_penalty + crew_silhouette_bonus + cbrn_bonus, 0.0, 1.0)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Capability from modules", f"+{pack_capability*100:.0f} pts")
+    c2.metric("Weight penalty", f"-{pack_weight_penalty*100:.0f} pts")
+    c3.progress(modularity_score, text=f"Modularity score: {modularity_score*100:.0f}%")
+    st.caption("Reduced crew shrinks volume but risks workload; swappable packs tailor missions; CBRN protects in contaminated battlespace.")
 
-def sigmoid(x): return 1.0 / (1.0 + np.exp(-x))
+# 11) Conceptual Futurism (new)
+with tabs[10]:
+    st.subheader("Conceptual Futurism")
+    # Fun, deliberately speculative toggles
+    shape_bonus = 0.12 if shape_shift else 0.0
+    exo_bonus = clamp(exo_units * 0.01, 0.0, 0.12)
+    shield_bonus = 0.2 if energy_shield else 0.0
+    futurism_index = clamp(0.2 + shape_bonus + exo_bonus + shield_bonus, 0.0, 1.0)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Shape-shift bonus", f"{shape_bonus*100:.0f}%")
+    c2.metric("Exoskeleton support", f"{exo_units} units")
+    c3.metric("Energy shield bonus", f"{shield_bonus*100:.0f}%")
+    c4.progress(futurism_index, text=f"Futurism index: {futurism_index*100:.0f}%")
+    st.caption("Blue-sky ideas for concept art & trade-space exploration.")
 
-# ─────────────────────────────────────────────
-# ArUco / AprilTag panel
-# ─────────────────────────────────────────────
-st.subheader("🎯 Vision Target & Camera Model")
-colA, colB = st.columns([1, 1])
-
-with colA:
-    if st.session_state.get("vision_backend", "ArUco (OpenCV)").startswith("ArUco"):
-        marker_png = generate_aruco_png_bytes(st.session_state.get("marker_id", 23), size_px=800)
-        st.image(marker_png, caption=f"ArUco ID {marker_id} — print at {marker_size_cm} cm")
-        st.download_button("Download ArUco PNG", data=marker_png, file_name=f"aruco_{marker_id}.png", mime="image/png")
-        st.markdown(f"_OpenCV/aruco available:_ {'✅' if _ARUCO_OK else '❌ (using placeholder)'}")
-    else:
-        st.markdown("**AprilTag (tag36h11) detector**")
-        st.markdown(f"_pupil_apriltags available:_ {'✅' if _APRILTAG_OK else '❌'}")
-        st.info("This sim estimates detection behavior; for live camera/tag detection add your video pipeline.")
-
-with colB:
-    st.markdown("**Pixel Size vs Altitude (pinhole model, nadir)**")
-    fpx = focal_length_px(cam_hfov_deg, cam_res_x)
-    alts = np.linspace(1.0, 20.0, 100)
-    px = marker_pixels_from_alt(alts, marker_size_cm/100.0, fpx)
-    fig_pix, ax_pix = plt.subplots()
-    ax_pix.plot(alts, px)
-    ax_pix.axhline(lock_thresh_px, linestyle="--")
-    ax_pix.set_xlabel("Altitude AGL (m)")
-    ax_pix.set_ylabel("Estimated Marker Size (px)")
-    ax_pix.set_title("Marker Pixels vs Altitude")
-    ax_pix.grid(True)
-    st.pyplot(fig_pix)
-
-# ─────────────────────────────────────────────
-# Core Modules: XY / Z / EKF summary
-# ─────────────────────────────────────────────
-col1, col2 = st.columns(2)
-
-with col1:
-    st.subheader("📍 Position Accuracy (RTK GNSS)")
-    sigma_xy = 0.03 if rtk_fix else 1.5
-    n_pts = 350
-    xy_noise = np.random.normal(0, sigma_xy, size=(n_pts, 2))
-    if gps_glitch:
-        xy_noise[np.random.randint(0, n_pts)] += np.array([3.0, -2.0])
-    if wind_gust:
-        xy_noise += np.array([0.15, -0.05])
-    fig_xy, ax_xy = plt.subplots()
-    ax_xy.scatter(xy_noise[:, 0], xy_noise[:, 1], alpha=0.35, s=10)
-    ax_xy.set_title("Position Scatter (centered at pad)")
-    ax_xy.set_xlabel("X (m)"); ax_xy.set_ylabel("Y (m)")
-    ax_xy.set_xlim(-2, 2); ax_xy.set_ylim(-2, 2)
-    ax_xy.grid(True)
-    st.pyplot(fig_xy)
-
-with col2:
-    st.subheader("📏 Altitude Accuracy (Lidar vs Barometer)")
-    n = 350
-    baro = np.random.normal(0, 0.25, n).cumsum() / 40.0
-    if use_lidar:
-        lidar = np.random.normal(0, 0.02, n)
-    fig_alt, ax_alt = plt.subplots()
-    ax_alt.plot(baro, label="Barometer (drift)")
-    if use_lidar:
-        ax_alt.plot(lidar, label="Lidar (cm-level)")
-    ax_alt.set_title("Altitude Sensor Error (relative)")
-    ax_alt.set_xlabel("Samples"); ax_alt.set_ylabel("Error (m)")
-    ax_alt.grid(True); ax_alt.legend()
-    st.pyplot(fig_alt)
-
-st.subheader("🧠 Sensor Fusion Summary (EKF-style)")
-st.markdown(
-    "- **GNSS/RTK**: global XY; RTK shrinks CEP to cm-level.\n"
-    "- **Lidar**: constrains Z in final meters (flare), removing baro drift.\n"
-    "- **ArUco/AprilTag**: pad-relative pose; lock when pixel span ≥ threshold for ≥ dwell frames.\n"
-    "- **IMU/Compass**: stabilize attitude/heading during VTOL hover.\n"
-    "- **Kalman Filter**: smooths XY track using a CV (constant velocity) model."
-)
-
-# ─────────────────────────────────────────────
-# 3D Landing Cone (Preview)
-# ─────────────────────────────────────────────
-with st.expander("Show 3D Landing Cone (preview)"):
-    fig3d = plt.figure()
-    ax3d = fig3d.add_subplot(111, projection='3d')
-    z_top = 10.0
-    zs = np.linspace(z_top, 0.0, 24)
-    theta = np.linspace(0, 2*np.pi, 48)
-    Z, TH = np.meshgrid(zs, theta)
-    R = (Z / z_top) * 1.0
-    X = R * np.cos(TH); Y = R * np.sin(TH)
-    ax3d.plot_wireframe(X, Y, Z, linewidth=0.5, alpha=0.6)
-    ax3d.set_xlabel("X (m)"); ax3d.set_ylabel("Y (m)"); ax3d.set_zlabel("Z (m)")
-    ax3d.set_title("3D Landing Cone")
-    ax3d.set_xlim(-1.0, 1.0); ax3d.set_ylim(-1.0, 1.0); ax3d.set_zlim(0, z_top)
-    st.pyplot(fig3d)
-
-# ─────────────────────────────────────────────
-# Kalman Filter (CV model, 2D)
-# ─────────────────────────────────────────────
-def kf_init():
-    x = np.zeros((4, 1))                 # [x, y, vx, vy]
-    P = np.eye(4) * 10.0
-    return x, P
-
-def kf_step(x, P, z, q, r, dt=1.0):
-    A = np.array([[1, 0, dt, 0],
-                  [0, 1, 0, dt],
-                  [0, 0, 1, 0 ],
-                  [0, 0, 0, 1 ]], dtype=float)
-    H = np.array([[1, 0, 0, 0],
-                  [0, 1, 0, 0]], dtype=float)
-    Q = q * np.array([[dt**4/4, 0, dt**3/2, 0],
-                      [0, dt**4/4, 0, dt**3/2],
-                      [dt**3/2, 0, dt**2, 0],
-                      [0, dt**3/2, 0, dt**2]], dtype=float)
-    R = np.eye(2) * (r**2)
-    # Predict
-    x = A @ x
-    P = A @ P @ A.T + Q
-    # Update
-    y = z - (H @ x)
-    S = H @ P @ H.T + R
-    K = P @ H.T @ np.linalg.inv(S)
-    x = x + K @ y
-    P = (np.eye(4) - K @ H) @ P
-    return x, P
-
-# ─────────────────────────────────────────────
-# Landing Success Metrics & Scoring
-# ─────────────────────────────────────────────
-def compute_metrics(path_kf, z_series, locked_series, dt=1.0):
-    arr_kf = np.array(path_kf)
-    z = np.maximum(np.array(z_series), 0.0)
-    radial = np.linalg.norm(arr_kf, axis=1)
-    r_allowed = (z / 10.0) * 1.0
-    cone_viol = (radial > r_allowed).mean() if len(radial) else 1.0
-    xy_err = float(np.linalg.norm(arr_kf[-1])) if len(arr_kf) else 99.0
-    k = min(5, len(z)-1)
-    vs = max(0.0, (z[-k-1] - z[-1]) / (k * dt)) if k >= 1 else 5.0
-    n = len(locked_series)
-    tail = max(1, int(0.3 * n))
-    lock_stability = float(np.mean(locked_series[-tail:])) if n else 0.0
-    return {"xy_error_m": xy_err, "touchdown_vspeed_mps": vs, "cone_violation_rate": float(cone_viol), "lock_stability": lock_stability}
-
-def landing_score(m):
-    xy_term = math.exp(-m["xy_error_m"] / 0.20)                       # ~20 cm scale
-    vs_term = math.exp(-max(0.0, m["touchdown_vspeed_mps"] - 0.5) / 0.5)
-    cone_term = math.exp(-5.0 * m["cone_violation_rate"])
-    lock_term = m["lock_stability"]
-    return float(100.0 * (0.40 * xy_term + 0.20 * vs_term + 0.20 * cone_term + 0.20 * lock_term))
-
-# ─────────────────────────────────────────────
-# Landing Playback (Vision-assisted + Kalman + Scoring + Export)
-# ─────────────────────────────────────────────
-st.subheader("🎬 Landing Playback (Vision-assisted + Kalman + Score)")
-
-def vision_detect_prob(px, thresh_px, illum, blur, backend):
-    k = 0.25
-    base = sigmoid((px - thresh_px) * k)
-    backend_boost = 1.0 if backend.startswith("ArUco") else 1.1  # AprilTag a tad more robust (sim)
-    blur_penalty = (1.0 - 0.6 * blur)
-    light_boost = 0.6 + 0.4 * illum
-    return np.clip(base * blur_penalty * light_boost * backend_boost, 0.0, 1.0)
-
-def focal_px():
-    return focal_length_px(cam_hfov_deg, cam_res_x)
-
-start = st.button("Run Playback")
-
-if start:
-    run_uuid = str(uuid.uuid4())
-    run_time_utc = dt.datetime.utcnow().isoformat() + "Z"
-
-    # XY random walk per-step (GNSS)
-    per_step_sigma = 0.03 if rtk_fix else 1.0
-    steps_xy = np.random.normal(0, per_step_sigma, size=(steps, 2))
-    if wind_gust:
-        steps_xy += np.array([0.01, -0.003])
-
-    # Z descent with lidar noise model
-    z_descent = np.linspace(10.0, 0.0, steps)
-    lidar_sigma = 0.05 if use_lidar else 0.5
-    z_descent = z_descent + np.random.normal(0, lidar_sigma, steps)
-    if gps_glitch and steps > 10:
-        j = np.random.randint(5, steps - 5)
-        steps_xy[j] += np.array([2.5, -1.5])
-
-    fpx = focal_px()
-    hfov_rad = np.radians(cam_hfov_deg)
-
-    # Placeholders to update in-place (no stacked frames)
-    placeholder2d = st.empty()
-    status_box = st.empty()
-    placeholder3d = st.empty()
-
-    # Kalman init
-    x, P = kf_init()
-    pos_raw = np.array([0.0, 0.0])
-    path_kf, path_raw = [], []
-    dwell = 0
-    locked = False
-    det_timeline, px_timeline, locked_timeline = [], [], []
-    z_timeline = []
-
-    for i in range(steps):
-        # Integrate raw GNSS position
-        pos_raw = pos_raw + steps_xy[i]
-        z_now = max(z_descent[i], 0.0)
-        z_timeline.append(z_now)
-
-        # Camera geometry / pixel model
-        radial = np.linalg.norm(pos_raw)
-        in_fov = radial <= max(z_now, 1e-6) * np.tan(hfov_rad / 2.0)
-        px_est = marker_pixels_from_alt(max(z_now, 1e-6), marker_size_cm / 100.0, fpx)
-        px_timeline.append(px_est)
-
-        # Simulated detection
-        detected = False
-        if enable_vision and in_fov:
-            p_det = vision_detect_prob(px_est, lock_thresh_px, illum, blur, vision_backend)
-            if np.random.rand() < (p_det * (1.0 - occlusion_prob)):
-                detected = True
-        else:
-            p_det = 0.0
-
-        # Dwell/lock logic
-        if detected:
-            dwell += 1
-            if dwell >= lock_dwell_frames:
-                locked = True
-        else:
-            dwell = 0
-            if locked and i > steps // 3 and np.random.rand() < 0.05:
-                locked = False
-
-        det_timeline.append(1 if detected else 0)
-        locked_timeline.append(1 if locked else 0)
-
-        # Apply extra beacon-like correction when locked (pull toward pad)
-        if locked and beacon_gain > 0:
-            pos_raw = pos_raw + (-float(beacon_gain) * pos_raw)
-
-        # Kalman update (measurement noise depends on lock)
-        sigma_meas = (max(0.02, min(0.20, 0.8 / max(px_est, 1.0)))) if locked else kf_r_base
-        z_meas = pos_raw.reshape(2, 1)
-        x, P = kf_step(x, P, z_meas, q=kf_q, r=sigma_meas, dt=1.0)
-        pos_kf = x[:2].ravel()
-
-        path_raw.append(pos_raw.copy())
-        path_kf.append(pos_kf.copy())
-
-        # 2D plot (in-place)
-        fig2d, ax2d = plt.subplots()
-        arr_kf = np.array(path_kf); arr_raw = np.array(path_raw)
-        if len(arr_raw) > 1:
-            ax2d.plot(arr_raw[:, 0], arr_raw[:, 1], alpha=0.25, label="Raw (GNSS path)")
-        if len(arr_kf) > 1:
-            ax2d.plot(arr_kf[:, 0], arr_kf[:, 1], label="Kalman-smoothed")
-        ax2d.scatter(pos_kf[0], pos_kf[1], s=40, label="Current (KF)")
-        # Allowed cone radius at this altitude
-        r_allowed = (z_now / 10.0) * 1.0
-        ring = plt.Circle((0, 0), max(r_allowed, 0.05), fill=False, linestyle="--")
-        ax2d.add_artist(ring)
-        ax2d.set_title(f"Descent: {z_now:.2f} m AGL  |  In FOV: {in_fov}  |  Locked: {locked}")
-        ax2d.set_xlabel("X (m)"); ax2d.set_ylabel("Y (m)")
-        lim = 2.0
-        ax2d.set_xlim(-lim, lim); ax2d.set_ylim(-lim, lim)
-        ax2d.grid(True); ax2d.legend(loc="upper right")
-        placeholder2d.pyplot(fig2d)
-
-        # 3D quick trace (lightweight, also in-place)
-        fig3d_step = plt.figure()
-        ax3d_step = fig3d_step.add_subplot(111, projection='3d')
-        zs = np.linspace(10.0, 0.0, 12)
-        thetas = np.linspace(0, 2*np.pi, 24)
-        Zm, THm = np.meshgrid(zs, thetas)
-        Rm = (Zm / 10.0) * 1.0
-        Xm = Rm * np.cos(THm); Ym = Rm * np.sin(THm)
-        ax3d_step.plot_wireframe(Xm, Ym, Zm, linewidth=0.4, alpha=0.35)
-        ax3d_step.plot(arr_kf[:, 0], arr_kf[:, 1], np.maximum(z_descent[:len(arr_kf)], 0), linewidth=1.5)
-        ax3d_step.scatter(pos_kf[0], pos_kf[1], z_now, s=20)
-        ax3d_step.set_xlim(-1.2, 1.2); ax3d_step.set_ylim(-1.2, 1.2); ax3d_step.set_zlim(0, 10.0)
-        ax3d_step.set_xlabel("X (m)"); ax3d_step.set_ylabel("Y (m)"); ax3d_step.set_zlabel("Z (m)")
-        ax3d_step.set_title("3D Cone Trace (KF path)")
-        placeholder3d.pyplot(fig3d_step)
-
-        status_box.markdown(
-            f"**Vision:** {'🟢 LOCKED' if locked else ('🟡 DETECTED' if detected else '🔴 SEEKING')}  "
-            f"| px≈{px_est:.1f}  | p≈{p_det:.2f}  | dwell={dwell}/{lock_dwell_frames}  "
-            f"| σ_meas≈{sigma_meas:.2f} m | beacon_gain={beacon_gain:.2f}"
-        )
-
-        time.sleep(play_speed)
-
-    # Metrics & overall score
-    metrics = compute_metrics(path_kf, z_descent, locked_timeline, dt=1.0)
-    score = landing_score(metrics)
-    st.success(f"✅ Playback complete — touchdown achieved.  **Landing Success Score: {score:.1f}/100**")
-
-    mcol1, mcol2, mcol3, mcol4 = st.columns(4)
-    mcol1.metric("XY Touchdown Error", f"{metrics['xy_error_m']:.3f} m")
-    mcol2.metric("Touchdown V-Speed", f"{metrics['touchdown_vspeed_mps']:.2f} m/s", "target ≤ 0.5")
-    mcol3.metric("Cone Violation Rate", f"{metrics['cone_violation_rate']*100:.1f}%")
-    mcol4.metric("Lock Stability (final 30%)", f"{metrics['lock_stability']*100:.1f}%")
-
-    # Diagnostics
-    d1, d2 = st.columns(2)
-    with d1:
-        st.markdown("**Detection Timeline (1=detected)**")
-        fig_t, ax_t = plt.subplots()
-        ax_t.plot(det_timeline)
-        ax_t.set_xlabel("Frame"); ax_t.set_ylabel("Detected (0/1)")
-        ax_t.grid(True)
-        st.pyplot(fig_t)
-    with d2:
-        st.markdown("**Marker Pixels per Frame**")
-        fig_p, ax_p = plt.subplots()
-        ax_p.plot(px_timeline)
-        ax_p.axhline(lock_thresh_px, linestyle="--")
-        ax_p.set_xlabel("Frame"); ax_p.set_ylabel("Marker Size (px)")
-        ax_p.grid(True)
-        st.pyplot(fig_p)
-
-    # Frame-by-frame CSV
-    run_df = pd.DataFrame({
-        "t": np.arange(steps),
-        "x_raw": np.array(path_raw)[:, 0],
-        "y_raw": np.array(path_raw)[:, 1],
-        "x_kf": np.array(path_kf)[:, 0],
-        "y_kf": np.array(path_kf)[:, 1],
-        "z_agl": np.maximum(np.array(z_timeline), 0.0),
-        "detected": det_timeline,
-        "locked": locked_timeline,
-        "px_est": px_timeline
-    })
-
-    # ── Log Export: JSON, CSV, ZIP
-    settings_payload = {
-        "app_version": APP_VERSION,
-        "run_uuid": run_uuid,
-        "run_time_utc": run_time_utc,
-        "uav_model": uav,
-        "uav_specs": specs,
-        "preset": st.session_state.get("preset_choice"),
-        "rtk_fix": bool(rtk_fix),
-        "use_lidar": bool(use_lidar),
-        "vision_backend": vision_backend,
-        "enable_vision": bool(enable_vision),
-        "marker_id": int(marker_id),
-        "marker_size_cm": int(marker_size_cm),
-        "camera": {"width_px": int(cam_res_x), "height_px": int(cam_res_y), "hfov_deg": float(cam_hfov_deg)},
-        "lock_thresh_px": int(lock_thresh_px),
-        "lock_dwell_frames": int(lock_dwell_frames),
-        "illum": float(illum),
-        "blur": float(blur),
-        "occlusion_prob": float(occlusion_prob),
-        "beacon_gain": float(beacon_gain),
-        "kf_q": float(kf_q),
-        "kf_r_base": float(kf_r_base),
-        "seed": int(seed),
-        "steps": int(steps),
-        "play_speed": float(play_speed),
-        "wind_gust": bool(wind_gust),
-        "gps_glitch": bool(gps_glitch),
+# 12) Summary & Export
+with tabs[11]:
+    st.subheader("Mission Summary & Export")
+    # Aggregate a few headline metrics (weights are arbitrary for pedagogy)
+    headline = {
+        "Survivability": survivability,
+        "MissionSuccess": mission_success,
+        "Detectability(↓better)": 1.0 - detectability,
+        "Mobility": clamp(1.0 - (0.25 if suspension_adaptive == 'Conventional' else 0.2) * (0.6 if maglev_hover else 1.0), 0.0, 1.0),
+        "ArmorEffectiveness": clamp(0.5 * (0.35 + 0.35 * reactive_armor_level + (0.2 if em_armor else 0.0)) + 0.5 * (0.25 + 0.25 * reactive_armor_level), 0.0, 1.0),
+        "Firepower": clamp(0.5 * (railgun_energy_mj / 40.0) + 0.3 * clamp(dew_power_kw / 400.0, 0.0, 1.0) + {"Off":0.0,"Airburst":0.12,"Trajectory Adjust":0.18}[smart_ammo_mode] + 0.02*swarm_drones, 0.0, 1.0),
+        "SA_Engagement": clamp(0.3 + 0.4*ai_target_quality + clamp(net_nodes/40.0,0.0,1.0)*0.3, 0.0, 1.0),
+        "Modularity": clamp(0.4 + sum({"Heavy Turret":0.25,"Light Turret":0.1,"Recon Sensors":0.15,"Extra Armor":0.2,"EW Suite":0.15}[p] for p in modular_packs) - 0.03*len(modular_packs) + clamp((4-crew_size)*0.05,0.0,0.2) + (0.1 if cbrn else 0.0), 0.0, 1.0),
+        "Futurism": clamp(0.2 + (0.12 if shape_shift else 0.0) + clamp(exo_units*0.01,0.0,0.12) + (0.2 if energy_shield else 0.0), 0.0, 1.0)
     }
-    metrics_payload = {"score": score, **metrics}
+    cols = st.columns(len(headline))
+    for (k, v), col in zip(headline.items(), cols):
+        col.progress(clamp(v,0.0,1.0), text=f"{k}: {v*100:.0f}%")
 
-    log_json = {
-        "meta": {"app_version": APP_VERSION, "run_uuid": run_uuid, "run_time_utc": run_time_utc},
-        "uav": {"model": uav, "specs": specs},
-        "settings": settings_payload,
-        "metrics": metrics_payload,
-        "trace_columns": list(run_df.columns),
-        "trace_preview_head": run_df.head(5).to_dict(orient="list")  # small preview
+    # Export scenario as CSV
+    st.markdown("#### Export current scenario")
+    scenario: Dict[str, float] = {
+        "fpv_density_per_min": fpv_density,
+        "ew_threat": ew_threat,
+        "atgm_rate_per_hr": atgm_rate,
+        "aps_layers": aps_hardkill_layers,
+        "aps_pk_single": aps_pk_single,
+        "softkill_effect": softkill_effect,
+        "mass_tonnes": mass_t,
+        "hybrid": int(hybrid),
+        "battery_kwh": battery_kwh,
+        "fuel_l": fuel_l,
+        "silent_watch_kw": silent_watch_kw,
+        "avg_speed_kph": avg_speed_kph,
+        "ambient_C": ambient_C,
+        "skin_C": skin_C,
+        "wind_mps": wind_mps,
+        "camo_factor": camo_factor,
+        "observer_km": observer_km,
+        "suspension_adaptive": int(suspension_adaptive == "Adaptive"),
+        "maglev_hover": int(maglev_hover),
+        "convoy_mode": int(convoy_mode),
+        "reactive_armor_level": reactive_armor_level,
+        "em_armor": int(em_armor),
+        "stealth_coating": stealth_coating,
+        "railgun_energy_mj": railgun_energy_mj,
+        "dew_power_kw": dew_power_kw,
+        "smart_ammo_mode": smart_ammo_mode,
+        "swarm_drones": swarm_drones,
+        "sensor_bubble_km": sensor_bubble_km,
+        "ar_cockpit": int(ar_cockpit),
+        "net_nodes": net_nodes,
+        "ai_target_quality": ai_target_quality,
+        "crew_size": crew_size,
+        "modular_packs": ";".join(modular_packs),
+        "cbrn": int(cbrn),
+        "shape_shift": int(shape_shift),
+        "exo_units": exo_units,
+        "energy_shield": int(energy_shield),
+        # Headline outputs
+        "survivability": survivability,
+        "mission_success": mission_success,
+        "detectability": detectability,
+        "range_km": range_km,
+        "silent_watch_hours": silent_watch_hours
     }
-    json_bytes = json.dumps(log_json, indent=2).encode("utf-8")
-    csv_bytes = run_df.to_csv(index=False).encode("utf-8")
+    df = pd.DataFrame([scenario])
+    csv = df.to_csv(index=False).encode("utf-8")
+    st.download_button("⬇️ Download scenario CSV", csv, file_name="future_tank_scenario.csv", mime="text/csv")
+    st.caption("CSV contains all inputs + key computed outputs for documentation or comparison runs.")
 
-    st.download_button("Download Playback CSV", csv_bytes, file_name=f"vtol_playback_{run_uuid[:8]}.csv", mime="text/csv")
-    st.download_button("Download Run Log (JSON)", json_bytes, file_name=f"vtol_runlog_{run_uuid[:8]}.json", mime="application/json")
-
-    # ZIP with both + full settings
-    zip_buf = io.BytesIO()
-    with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr(f"run_{run_uuid[:8]}/trace.csv", csv_bytes)
-        zf.writestr(f"run_{run_uuid[:8]}/runlog.json", json_bytes)
-        zf.writestr(f"run_{run_uuid[:8]}/settings_only.json", json.dumps(settings_payload, indent=2).encode("utf-8"))
-    st.download_button("Download All (ZIP)", zip_buf.getvalue(), file_name=f"vtol_run_{run_uuid[:8]}.zip", mime="application/zip")
-
-# ─────────────────────────────────────────────
-# Auto-Tuner (experimental) — maximize score
-# ─────────────────────────────────────────────
-st.subheader("🧪 Auto-Tuner (experimental)")
-
-with st.expander("Open Auto-Tuner"):
-    n_trials = st.number_input("Trials", min_value=5, max_value=200, value=30, step=5, key="trials")
-    seeds_per_trial = st.slider("Seeds per Trial (averaged)", 1, 10, 3, key="seeds_per_trial")
-    steps_tune = st.slider("Sim Steps (tuner)", 40, 240, min(st.session_state.get("steps", 160), 120), 10, key="steps_tune")
-    run_tuner = st.button("Run Auto-Tune")
-
-    def kf_fast_once(params, seed_val):
-        np.random.seed(seed_val)
-        per_step_sigma = 0.03 if params["rtk_fix"] else 1.0
-        steps_xy = np.random.normal(0, per_step_sigma, size=(steps_tune, 2))
-        if params["wind_gust"]:
-            steps_xy += np.array([0.01, -0.003])
-        if params["gps_glitch"] and steps_tune > 10:
-            j = np.random.randint(5, steps_tune - 5)
-            steps_xy[j] += np.array([2.5, -1.5])
-
-        z_descent = np.linspace(10.0, 0.0, steps_tune)
-        lidar_sigma = 0.05 if params["use_lidar"] else 0.5
-        z_descent = z_descent + np.random.normal(0, lidar_sigma, steps_tune)
-
-        fpx_local = focal_length_px(params["cam_hfov_deg"], params["cam_res_x"])
-        hfov_rad = np.radians(params["cam_hfov_deg"])
-
-        x, P = kf_init()
-        pos_raw = np.array([0.0, 0.0])
-        path_kf, locked_series = [], []
-        dwell, locked = 0, False
-
-        for i in range(steps_tune):
-            pos_raw = pos_raw + steps_xy[i]
-            z_now = max(z_descent[i], 0.0)
-
-            radial = np.linalg.norm(pos_raw)
-            in_fov = radial <= max(z_now, 1e-6) * np.tan(hfov_rad / 2.0)
-            px_est = marker_pixels_from_alt(max(z_now, 1e-6), params["marker_size_cm"]/100.0, fpx_local)
-
-            # Detection probability (same shape as UI model)
-            k = 0.25
-            base = sigmoid((px_est - params["lock_thresh_px"]) * k)
-            blur_penalty = (1.0 - 0.6 * params["blur"])
-            light_boost = 0.6 + 0.4 * params["illum"]
-            p_det = np.clip(base * blur_penalty * light_boost, 0.0, 1.0)
-
-            detected = params["enable_vision"] and in_fov and (np.random.rand() < (p_det * (1.0 - params["occlusion_prob"])))
-            if detected:
-                dwell += 1
-                if dwell >= params["lock_dwell_frames"]:
-                    locked = True
-            else:
-                dwell = 0
-                if locked and i > steps_tune // 3 and np.random.rand() < 0.05:
-                    locked = False
-
-            # Apply correction when locked (same as main loop)
-            if locked and params["beacon_gain"] > 0:
-                pos_raw = pos_raw + (-params["beacon_gain"] * pos_raw)
-
-            sigma_meas = max(0.02, min(0.20, 0.8 / max(px_est, 1.0))) if locked else params["kf_r_base"]
-            z_meas = pos_raw.reshape(2, 1)
-            x, P = kf_step(x, P, z_meas, q=params["kf_q"], r=sigma_meas, dt=1.0)
-            pos_kf = x[:2].ravel()
-            path_kf.append(pos_kf.copy()); locked_series.append(1 if locked else 0)
-
-        m = compute_metrics(path_kf, z_descent, locked_series, dt=1.0)
-        return landing_score(m), m
-
-    def simulate_mean_score(params, seeds_list):
-        scores = []
-        for s in seeds_list:
-            sc, _ = kf_fast_once(params, s)
-            scores.append(sc)
-        return float(np.mean(scores))
-
-    if run_tuner:
-        results = []
-        base = dict(
-            rtk_fix=rtk_fix, use_lidar=use_lidar, enable_vision=enable_vision,
-            cam_hfov_deg=cam_hfov_deg, cam_res_x=cam_res_x,
-            marker_size_cm=marker_size_cm, blur=blur, illum=illum,
-            occlusion_prob=occlusion_prob, wind_gust=wind_gust, gps_glitch=gps_glitch
-        )
-
-        rng = np.random.default_rng(42)
-        seeds_list = list(rng.integers(0, 10_000, size=int(seeds_per_trial)))
-
-        for t in range(int(n_trials)):
-            trial = base.copy()
-            trial["beacon_gain"] = float(rng.uniform(0.15, 0.60))
-            trial["lock_thresh_px"] = int(rng.integers(18, 48))
-            trial["lock_dwell_frames"] = int(rng.integers(4, 14))
-            trial["kf_q"] = float(10 ** rng.uniform(-4.5, -1.9))      # ~3e-5 .. 1e-2
-            trial["kf_r_base"] = float(rng.uniform(0.02, 0.60))       # meters
-
-            mean_score = simulate_mean_score(trial, seeds_list)
-            results.append({
-                "trial": t+1,
-                "score_mean": mean_score,
-                "beacon_gain": trial["beacon_gain"],
-                "lock_thresh_px": trial["lock_thresh_px"],
-                "lock_dwell_frames": trial["lock_dwell_frames"],
-                "kf_q": trial["kf_q"],
-                "kf_r_base": trial["kf_r_base"],
-            })
-
-        df = pd.DataFrame(results).sort_values("score_mean", ascending=False).reset_index(drop=True)
-        st.markdown("**Top Results**")
-        st.dataframe(df.head(10))
-
-        # Export tuner results
-        st.download_button("Download Tuner Results (CSV)", df.to_csv(index=False).encode("utf-8"),
-                           file_name="tuner_results.csv", mime="text/csv")
-
-        # Best row dict
-        best = df.iloc[0].to_dict()
-        c1, c2 = st.columns(2)
-        with c1:
-            st.success(
-                "🏆 **Recommended Settings**\n\n"
-                f"- Beacon Gain ≈ **{best['beacon_gain']:.2f}**\n"
-                f"- Vision Lock Threshold ≈ **{int(best['lock_thresh_px'])} px**\n"
-                f"- Lock Dwell ≈ **{int(best['lock_dwell_frames'])} frames**\n"
-                f"- Kalman q ≈ **{best['kf_q']:.4g}**\n"
-                f"- Kalman R (GNSS σ) ≈ **{best['kf_r_base']:.2f} m**\n"
-                f"- Mean Score ≈ **{best['score_mean']:.1f}/100**"
-            )
-        with c2:
-            # One-click Apply Best Settings
-            if st.button("Apply Best Settings ▶️"):
-                st.session_state["apply_payload"] = {
-                    "beacon_gain": float(best["beacon_gain"]),
-                    "lock_thresh_px": int(best["lock_thresh_px"]),
-                    "lock_dwell_frames": int(best["lock_dwell_frames"]),
-                    "kf_q": float(best["kf_q"]),
-                    "kf_r_base": float(best["kf_r_base"]),
-                    # Keep current camera & toggles, but include for completeness
-                    "cam_hfov_deg": float(cam_hfov_deg),
-                    "cam_res_x": int(cam_res_x),
-                    "marker_size_cm": int(marker_size_cm),
-                    "enable_vision": bool(enable_vision),
-                    "rtk_fix": bool(rtk_fix),
-                    "use_lidar": bool(use_lidar),
-                }
-                st.session_state["pending_apply"] = True
-                st.rerun()
-
-# Footer
-with st.expander("UAV Spec Snapshot"):
-    st.dataframe(pd.DataFrame(uav_data).T)
-st.caption("Tip: Use **Scenario Preset** to configure conditions quickly, then **Auto-Tune** and **Apply Best Settings**. Aim for XY≤0.2 m, V-speed≤0.5 m/s, high lock stability.")
+st.markdown("---")
+st.caption("Educational demo. Parameters are not tied to any specific vehicle; for conceptual illustration only.")
