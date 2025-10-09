@@ -510,7 +510,7 @@ def _build_pdf(ain, sim_steps, step_dt, mean_soc, mean_drift, mean_power, mean_r
         f"UAVs: {len(ain.uavs)}   |   Steps: {sim_steps}   |   dt: {step_dt:.2f}s",
         f"Platform: Quantum-Systems Vector (m={M_UAV} kg, S={S_WING} m², AR={AR:.2f})",
         f"Prop Eff η_chain≈{ETA_CHAIN:.2f} | Battery {BATTERY_WH:.0f} Wh",
-        f"Orbital Layers: " + ", ".join([f\"{o.name} ({o.latency_ms:.0f} ms)\" for o in ain.orbitals]),
+        f"Orbital Layers: " + ", ".join([f"{o.name} ({o.latency_ms:.0f} ms)" for o in ain.orbitals]),
         f"Mean SOC {mean_soc:.1f} Wh | Drift {mean_drift:.3f} m | Power {mean_power:.1f} W",
         f"Mean Reward (last 20 steps): {mean_reward:.3f}"
     ]
