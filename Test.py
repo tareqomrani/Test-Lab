@@ -1,578 +1,573 @@
-# ================================================================
-#  AIN Simulator (Quantum Systems Vector) – High Fidelity Edition
-#  app.py  (Part 1 of 4)
-#  SI units: m, s, kg, W, Wh
-# ================================================================
+# AIN UAV Networks – Survey-to-App MVP (Streamlit) + 3D Orbit View
+# Maps to: Sarkar & Gul (2023), "Artificial Intelligence-Based Autonomous UAV Networks: A Survey" (Drones 7(5):322)
+# Features: autonomous waypointing, MAC/routing (TDMA/NOMA/RSMA), power/energy, jammer/eavesdropper, analytics
+# New: 3D "orbit" visualization with planet sphere and LEO/MEO/GEO rings (purely visual)
 
-import streamlit as st
+import math
+import random
+from dataclasses import dataclass, field
+from typing import List, Dict, Tuple, Optional
+
 import numpy as np
 import pandas as pd
+import networkx as nx
+from scipy.spatial.distance import cdist
+
+import streamlit as st
 import plotly.graph_objects as go
-import matplotlib.pyplot as plt
-from dataclasses import dataclass
+from plotly.subplots import make_subplots
 
-# ------------------------------------------------
-#  PAGE CONFIG
-# ------------------------------------------------
-st.set_page_config(
-    page_title="AIN Simulator – Quantum Systems Vector",
-    layout="wide",
-    page_icon="🛰️"
-)
+# -----------------------------
+# Utility / Models
+# -----------------------------
 
-# ------------------------------------------------
-#  CONSTANTS & PLATFORM SPECIFICATIONS
-# ------------------------------------------------
-g0 = 9.80665             # gravity (m/s²)
-R = 287.05287            # gas constant (J/kg·K)
-T0 = 288.15              # sea-level temperature (K)
-p0 = 101325.0            # sea-level pressure (Pa)
-L = 0.0065               # lapse rate (K/m)
-
-# Quantum Systems Vector UAV specs (verified public domain)
-M_UAV = 7.4              # kg (MTOW)
-S_WING = 0.84            # m²
-B_SPAN = 2.8             # m
-AR = B_SPAN**2 / S_WING  # aspect ratio
-CD0 = 0.025              # parasitic drag coefficient
-E_OSWALD = 0.85          # Oswald efficiency factor
-ETA_PROP = 0.80
-ETA_MOTOR = 0.95
-ETA_ESC = 0.97
-ETA_CHAIN = ETA_PROP * ETA_MOTOR * ETA_ESC
-BATTERY_WH = 480.0
-DISCH_EFF = 0.95
-VTOL_DISK_AREA = 0.35    # total rotor disk area (m²)
-
-# ------------------------------------------------
-#  ISA ATMOSPHERE MODEL (0–11 km)
-# ------------------------------------------------
-def isa_troposphere(h_m: float):
-    """Return (T[K], p[Pa], rho[kg/m³]) for altitude h_m."""
-    if h_m < 0:
-        h_m = 0
-    T = T0 - L * h_m
-    p = p0 * (1.0 - (L * h_m) / T0) ** (g0 / (R * L))
-    rho = p / (R * T)
-    return T, p, rho
-
-# ------------------------------------------------
-#  FIXED-WING POWER MODEL
-# ------------------------------------------------
-def fixed_wing_power_required(weight_N, rho, V, S, CD0, AR, e, eta_prop=0.8):
-    """Compute shaft power required for level flight (W)."""
-    V = max(V, 5.0)
-    CL = 2.0 * weight_N / (rho * V**2 * S)
-    k = 1.0 / (np.pi * e * AR)
-    CD = CD0 + k * CL**2
-    D = 0.5 * rho * V**2 * S * CD
-    P_req = D * V / max(eta_prop, 0.5)
-    return P_req, CL, CD, D
-
-# ------------------------------------------------
-#  MULTIROTOR HOVER POWER MODEL
-# ------------------------------------------------
-def multirotor_power_hover(weight_N, rho, disk_area_total, k_ind=1.15, P_profile_frac=0.1):
-    """Estimate induced + profile power for hover (W)."""
-    disk_area_total = max(disk_area_total, 1e-3)
-    P_ind_ideal = weight_N**1.5 / np.sqrt(2.0 * rho * disk_area_total)
-    P_ind = k_ind * P_ind_ideal
-    P_profile = P_profile_frac * P_ind
-    return P_ind + P_profile
-
-# ------------------------------------------------
-#  BATTERY STATE UPDATE
-# ------------------------------------------------
-def soc_update(Wh_remaining, P_elec_W, dt_s, discharge_eff=0.95):
-    """Update battery state-of-charge."""
-    Wh_draw = (P_elec_W / max(discharge_eff, 0.5)) * (dt_s / 3600.0)
-    return max(Wh_remaining - Wh_draw, 0.0)
-
-# ------------------------------------------------
-#  SENSOR DRIFT MODEL
-# ------------------------------------------------
-def imu_drift_update(prev_err, dt, sigma_a=0.02, sigma_g=0.01):
-    """Simple bias random walk + noise (m)."""
-    bias_rw = np.random.normal(0, sigma_a*np.sqrt(dt))
-    noise = np.random.normal(0, sigma_g)
-    return prev_err + bias_rw + noise
-
-# ------------------------------------------------
-#  REWARD FUNCTION
-# ------------------------------------------------
-def reward_function(pos_err_m, vel_err_mps, P_W, w_pos=0.6, w_vel=0.2, w_pow=0.2):
-    """Reward penalizes error and power draw (kW scaled)."""
-    return - (w_pos * abs(pos_err_m) + w_vel * abs(vel_err_mps) + w_pow * (P_W / 1000.0))
-
-# ------------------------------------------------
-#  UAV CLASS
-# ------------------------------------------------
 @dataclass
 class UAV:
-    id: int
-    altitude_m: float
-    velocity_mps: float
-    battery_Wh: float = BATTERY_WH
-    soc_Wh: float = BATTERY_WH
-    drift_err_m: float = 0.0
-    pos_err_m: float = 0.0
-    vel_err_mps: float = 0.0
-    power_W: float = 0.0
-    reward: float = 0.0
-    mode: str = "cruise"   # hover below ~50 m
+    uid: int
+    role: str  # 'relay', 'source', 'sink'
+    pos: np.ndarray  # [x, y] meters
+    v_max: float = 12.0  # m/s
+    battery_Wh: float = 150.0
+    payload_kg: float = 0.5
+    tx_power_W: float = 1.0
+    rx_noise_W: float = 1e-9
+    buffer_bits: float = 0.0
+    energy_used_Wh: float = 0.0
+    # Autonomy knobs:
+    risk_aversion: float = 0.4   # 0..1 (avoid jammer/eavesdropper)
+    energy_aversion: float = 0.4 # 0..1 (prefer energy saving)
+    throughput_preference: float = 0.2 # 0..1 (prefer capacity)
 
-    def update_flight(self, dt_s, rho):
-        """Compute power draw based on mode and update SOC."""
-        W = M_UAV * g0
-        if self.mode == "hover":
-            P_req = multirotor_power_hover(W, rho, VTOL_DISK_AREA)
-        else:
-            P_req, CL, CD, D = fixed_wing_power_required(
-                W, rho, self.velocity_mps, S_WING, CD0, AR, E_OSWALD, ETA_PROP
-            )
-        P_elec = P_req / max(ETA_CHAIN, 0.5)
-        self.power_W = P_elec
-        self.soc_Wh = soc_update(self.soc_Wh, P_elec, dt_s, DISCH_EFF)
-        return self.power_W
+    def move_toward(self, target: np.ndarray, dt: float, keep_in_bounds: Tuple[float,float]=(1000,1000)):
+        vec = target - self.pos
+        dist = np.linalg.norm(vec)
+        if dist < 1e-6:
+            return
+        step = min(self.v_max * dt, dist)
+        self.pos = self.pos + (vec / dist) * step
+        # Boundaries
+        self.pos[0] = np.clip(self.pos[0], 0, keep_in_bounds[0])
+        self.pos[1] = np.clip(self.pos[1], 0, keep_in_bounds[1])
 
-    def update_errors(self, dt_s):
-        """Propagate IMU/VIO drift errors."""
-        self.drift_err_m = imu_drift_update(self.drift_err_m, dt_s)
-        self.pos_err_m += self.drift_err_m * dt_s
-        self.vel_err_mps = np.clip(np.random.normal(0, 0.3), -2.0, 2.0)
-
-    def compute_reward(self):
-        self.reward = reward_function(self.pos_err_m, self.vel_err_mps, self.power_W)
-        return self.reward
-
-# ================================================================
-#  app.py  (Part 2 of 4)
-#  AIN NETWORK CONTROLLER + ORBITAL MODEL + POLICY
-# ================================================================
-
-# ------------------------------------------------
-#  ORBITAL NETWORK MODEL
-# ------------------------------------------------
 @dataclass
-class OrbitalNode:
-    name: str
-    altitude_km: float
-    latency_ms: float
-    correction_bias_m: float = 0.0
+class Adversary:
+    kind: str  # 'jammer' or 'eaves'
+    pos: np.ndarray
+    power_W: float = 2.0  # jammer power
+    radius_m: float = 250.0  # effective region
 
-def generate_orbital_layers():
-    """Create orbital communication layers."""
-    LEO = OrbitalNode("LEO", 1200, 15)
-    MEO = OrbitalNode("MEO", 20200, 45)
-    GEO = OrbitalNode("GEO", 35786, 120)
-    return [LEO, MEO, GEO]
+@dataclass
+class ChannelModel:
+    # Simple log-distance + optional shadowing
+    f_GHz: float = 2.4
+    pl0_dB: float = 40.0
+    d0_m: float = 1.0
+    n: float = 2.2
+    shadowing_std_dB: float = 2.0
+    rng: random.Random = field(default_factory=random.Random)
 
-# ------------------------------------------------
-#  SIMPLE NEURAL POLICY (REINFORCEMENT CORRECTION)
-# ------------------------------------------------
-class NeuralPolicy:
-    def __init__(self, input_dim=3, hidden_dim=5):
-        self.W1 = np.random.uniform(-0.5, 0.5, (hidden_dim, input_dim))
-        self.W2 = np.random.uniform(-0.5, 0.5, (1, hidden_dim))
+    def pathloss_linear(self, d_m: float, shadow: bool=True):
+        if d_m < 1e-3:
+            d_m = 1e-3
+        pl_dB = self.pl0_dB + 10.0*self.n*math.log10(d_m/self.d0_m)
+        if shadow:
+            pl_dB += self.rng.gauss(0.0, self.shadowing_std_dB)
+        return 10.0**(-pl_dB/10.0)
 
-    def forward(self, x_vec):
-        """Single hidden layer network with tanh activation."""
-        h = np.tanh(self.W1 @ x_vec)
-        out = 1.0 / (1.0 + np.exp(-(self.W2 @ h)))
-        return float(out), h
+def capacity_bps(tx_power_W: float, gain_linear: float, noise_W: float, mac_share: float=1.0):
+    # Shannon-ish with MAC time/resource share
+    sinr = (tx_power_W * gain_linear) / max(noise_W, 1e-15)
+    return mac_share * math.log2(1.0 + sinr)
 
-    def update(self, reward_mean):
-        """Stochastic weight update to mimic reinforcement learning."""
-        grad = reward_mean * np.random.normal(0.02, 0.01, self.W2.shape)
-        self.W2 += grad
-        self.W2 = np.clip(self.W2, -2.0, 2.0)
+def comm_energy_Wh(tx_power_W: float, seconds: float):
+    return (tx_power_W * seconds) / 3600.0
 
-# ------------------------------------------------
-#  AIN NETWORK CONTROLLER (MULTI-UAV + ORBITAL FEEDBACK)
-# ------------------------------------------------
-class AINNetwork:
-    def __init__(self, n_uav=5):
-        self.n_uav = n_uav
-        self.uavs = [
-            UAV(
-                i + 1,
-                altitude_m=float(np.random.uniform(150, 900)),
-                velocity_mps=float(np.random.uniform(18, 25))
-            )
-            for i in range(n_uav)
-        ]
-        self.policy = NeuralPolicy()
-        self.orbitals = generate_orbital_layers()
-        self.latency_factor = 1.0
-        self.bias_strength = 1.0
-        self.global_reward = []
-        self.mean_soc_trace = []
-        self.mean_power_trace = []
-        self.mean_drift_trace = []
+def motion_energy_Wh(distance_m: float, mass_factor: float=0.25):
+    # Toy model: energy grows with distance and payload
+    # mass_factor approximates Wh/m per kg-equivalent
+    return distance_m * mass_factor / 1000.0
 
-    # --------------------------
-    #  ORBITAL BIAS UPDATE
-    # --------------------------
-    def orbital_bias_update(self):
-        """Inject orbital bias corrections to all UAVs based on LEO/MEO/GEO latency."""
-        total_bias = 0.0
-        for layer in self.orbitals:
-            bias = np.random.normal(0, 0.2) / (max(layer.latency_ms, 1) / 10.0)
-            layer.correction_bias_m = bias
-            total_bias += bias
-        self.bias_strength = float(np.clip(1.0 - abs(total_bias)*0.05, 0.7, 1.2))
-        self.latency_factor = 1.0 + (np.mean([n.latency_ms for n in self.orbitals]) / 1000.0)
+# -----------------------------
+# MAC & Routing
+# -----------------------------
 
-    # --------------------------
-    #  SIMULATION STEP
-    # --------------------------
-    def step(self, dt_s):
-        """Run one timestep across all UAVs."""
-        rewards = []
-        self.orbital_bias_update()
-        rho = isa_troposphere(np.mean([u.altitude_m for u in self.uavs]))[2]
+def mac_share(num_links: int, scheme: str):
+    if num_links <= 0:
+        return 0.0
+    scheme = scheme.lower()
+    if scheme == "tdma (orthogonal)":
+        return 1.0 / num_links
+    if scheme == "noma (superposition)":
+        # crude gain over orthogonal
+        return min(1.0, 0.65 + 0.5/num_links)
+    if scheme == "rate-splitting (rsma)":
+        return min(1.0, 0.75 + 0.6/num_links)
+    return 1.0 / num_links
 
-        for u in self.uavs:
-            u.mode = "hover" if u.altitude_m < 50.0 else "cruise"
-            u.update_flight(dt_s, rho)
-            u.update_errors(dt_s)
+def build_graph(uavs: List[UAV], ch: ChannelModel, jammer: Optional[Adversary], noise_W: float, link_thresh_bps: float, mac_scheme: str):
+    N = len(uavs)
+    G = nx.DiGraph()
+    for u in uavs:
+        G.add_node(u.uid, pos=(u.pos[0], u.pos[1]), role=u.role)
+    # All-pairs link capacity
+    positions = np.vstack([u.pos for u in uavs])
+    dists = cdist(positions, positions)
+    for i in range(N):
+        for j in range(N):
+            if i == j:
+                continue
+            g = ch.pathloss_linear(dists[i, j], shadow=True)
+            # jammer effect as additive noise inside a radius
+            extra_noise = 0.0
+            if jammer is not None and jammer.kind == "jammer":
+                # if either endpoint inside jammer radius, worsen noise
+                if np.linalg.norm(uavs[i].pos - jammer.pos) <= jammer.radius_m or np.linalg.norm(uavs[j].pos - jammer.pos) <= jammer.radius_m:
+                    extra_noise += jammer.power_W * ch.pathloss_linear(np.linalg.norm(uavs[j].pos - jammer.pos), shadow=False)
+            mac = mac_share(num_links=N-1, scheme=mac_scheme)
+            cap = capacity_bps(uavs[i].tx_power_W, g, noise_W + extra_noise, mac_share=mac)
+            if cap >= link_thresh_bps:
+                G.add_edge(uavs[i].uid, uavs[j].uid, capacity_bps=cap, distance_m=dists[i, j], gain=g)
+    return G
 
-            soc_frac = u.soc_Wh / BATTERY_WH
-            x_vec = np.array([u.altitude_m / 1000.0, soc_frac, self.bias_strength])
-            gain, _ = self.policy.forward(x_vec)
-
-            # Apply correction to drift and position error
-            corr = (1.0 - 0.3 * gain) / self.latency_factor
-            u.drift_err_m *= corr
-            u.pos_err_m *= corr
-
-            r = u.compute_reward()
-            rewards.append(r)
-
-        mean_R = float(np.mean(rewards))
-        self.global_reward.append(mean_R)
-        self.policy.update(mean_R)
-
-        # record traces
-        msoc, mdrift, mpower, _ = self.fleet_metrics()
-        self.mean_soc_trace.append(msoc)
-        self.mean_drift_trace.append(mdrift)
-        self.mean_power_trace.append(mpower)
-
-    # --------------------------
-    #  FLEET METRICS
-    # --------------------------
-    def fleet_metrics(self):
-        mean_soc = float(np.mean([u.soc_Wh for u in self.uavs]))
-        mean_drift = float(np.mean([u.drift_err_m for u in self.uavs]))
-        mean_power = float(np.mean([u.power_W for u in self.uavs]))
-        mean_reward = float(np.mean(self.global_reward[-20:])) if self.global_reward else 0.0
-        return mean_soc, mean_drift, mean_power, mean_reward
-
-# ================================================================
-#  app.py (Part 3 of 4)
-#  STREAMLIT UI + SIMULATION LOOP + VISUALIZATION
-# ================================================================
-
-# ------------------------------------------------
-#  PAGE HEADER
-# ------------------------------------------------
-st.markdown(
-    "<h1 style='text-align:center; color:#00FFAA;'>Quantum Systems Vector AIN Simulator 🛰️</h1>",
-    unsafe_allow_html=True
-)
-st.markdown(
-    "<h4 style='text-align:center; color:#00FFAA;'>High-Fidelity Multi-UAV Mesh with Orbital AIN Correction</h4>",
-    unsafe_allow_html=True
-)
-st.write("---")
-
-# ------------------------------------------------
-#  USER CONTROLS
-# ------------------------------------------------
-col1, col2, col3 = st.columns(3)
-with col1:
-    n_uav = st.slider("Number of UAVs", 1, 12, 5)
-with col2:
-    sim_steps = st.slider("Simulation Steps", 100, 1500, 600, step=50)
-with col3:
-    step_dt = st.selectbox("Timestep (s)", [0.5, 1.0, 2.0], index=1)
-
-st.caption("Physics: ISA air density, fixed-wing drag/lift, VTOL hover power, Wh-accurate SOC. "
-           "AIN: neural policy gain + orbital bias/latency corrections.")
-
-# ------------------------------------------------
-#  RUN SIMULATION
-# ------------------------------------------------
-ain = AINNetwork(n_uav=n_uav)
-progress_bar = st.progress(0)
-for i in range(sim_steps):
-    ain.step(dt_s=float(step_dt))
-    if (i+1) % max(1, sim_steps//100) == 0:
-        progress_bar.progress((i+1)/sim_steps)
-progress_bar.empty()
-
-mean_soc, mean_drift, mean_power, mean_reward = ain.fleet_metrics()
-
-# ------------------------------------------------
-#  3D VISUALIZATION — EARTH + ORBITAL LAYERS + UAVs
-# ------------------------------------------------
-st.markdown("### 🌍 Orbital AIN Mesh Visualization")
-fig = go.Figure()
-
-# Earth sphere
-u, v = np.mgrid[0:2*np.pi:60j, 0:np.pi:30j]
-x = np.cos(u)*np.sin(v)
-y = np.sin(u)*np.sin(v)
-z = np.cos(v)
-fig.add_trace(go.Surface(x=x, y=y, z=z,
-    colorscale=[[0,"#001a1a"],[1,"#003333"]],
-    showscale=False, opacity=0.7, name="Earth"))
-
-# Orbits
-for orb in ain.orbitals:
-    r = 1.0 + orb.altitude_km/40000.0
-    t = np.linspace(0, 2*np.pi, 160)
-    fig.add_trace(go.Scatter3d(x=r*np.cos(t), y=r*np.sin(t), z=np.zeros_like(t),
-        mode="lines", line=dict(color="#00FFAA", width=2),
-        name=f"{orb.name} Orbit"))
-
-# UAV positions
-for uav in ain.uavs:
-    color = "#00FF00" if uav.soc_Wh > 100 else "#FF3333"
-    fig.add_trace(go.Scatter3d(
-        x=[np.random.uniform(-0.35,0.35)],
-        y=[np.random.uniform(-0.35,0.35)],
-        z=[0.1 + uav.altitude_m/10000.0],
-        mode="markers+text",
-        marker=dict(size=6, color=color),
-        text=f"UAV {uav.id}",
-        textposition="top center"
-    ))
-
-fig.update_layout(
-    scene=dict(
-        xaxis=dict(visible=False),
-        yaxis=dict(visible=False),
-        zaxis=dict(visible=False),
-        aspectmode="data"
-    ),
-    margin=dict(l=0,r=0,b=0,t=0),
-    height=700,
-    paper_bgcolor="black"
-)
-st.plotly_chart(fig, use_container_width=True)
-
-# ------------------------------------------------
-#  PERFORMANCE PLOTS
-# ------------------------------------------------
-st.markdown("### 📈 Fleet Performance")
-plt.style.use("dark_background")
-fig2, ax2 = plt.subplots()
-ax2.plot(ain.global_reward, color="#00FFAA", label="Mean Reward")
-ax2.set_xlabel("Step")
-ax2.set_ylabel("Reward")
-ax2.grid(alpha=0.2)
-ax3 = ax2.twinx()
-ax3.plot(ain.mean_soc_trace, color="#FFD700", alpha=0.9, label="Mean SOC (Wh)")
-ax3.set_ylabel("Wh")
-lns = ax2.get_lines() + ax3.get_lines()
-labs = [l.get_label() for l in lns]
-ax2.legend(lns, labs, loc="upper left")
-st.pyplot(fig2)
-
-st.markdown("### 📉 Drift & Power Traces")
-fig3, ax4 = plt.subplots()
-ax4.plot(ain.mean_drift_trace, color="#FF6F61", label="Mean Drift (m)")
-ax4.set_xlabel("Step")
-ax4.set_ylabel("Drift (m)", color="#FF6F61")
-ax4.tick_params(axis='y', colors="#FF6F61")
-ax5 = ax4.twinx()
-ax5.plot(ain.mean_power_trace, color="#66CCFF", label="Mean Power (W)")
-ax5.set_ylabel("Power (W)", color="#66CCFF")
-ax5.tick_params(axis='y', colors="#66CCFF")
-ax4.grid(alpha=0.2)
-st.pyplot(fig3)
-
-# ------------------------------------------------
-#  METRICS SUMMARY
-# ------------------------------------------------
-st.markdown("### 📊 Fleet Metrics Summary")
-colA, colB, colC, colD = st.columns(4)
-colA.metric("Mean SOC (Wh)", f"{mean_soc:.1f}")
-colB.metric("Mean Drift (m)", f"{mean_drift:.3f}")
-colC.metric("Mean Power (W)", f"{mean_power:.1f}")
-colD.metric("Mean Reward", f"{mean_reward:.3f}")
-
-# ================================================================
-#  app.py (Part 4 of 4)
-#  PDF MISSION REPORT EXPORTER + COMMENTARY
-# ================================================================
-import io
-from datetime import datetime
-
-# ------------------------------------------------
-#  PDF REPORT BUILDER
-# ------------------------------------------------
-def _render_reward_soc_fig(ain):
-    import matplotlib.pyplot as plt
-    plt.style.use("dark_background")
-    fig, ax = plt.subplots()
-    ax.plot(ain.global_reward, color="#00FFAA", label="Mean Reward")
-    ax.set_xlabel("Step"); ax.set_ylabel("Reward"); ax.grid(alpha=0.2)
-    ax2 = ax.twinx()
-    ax2.plot(ain.mean_soc_trace, color="#FFD700", alpha=0.9, label="Mean SOC (Wh)")
-    ax2.set_ylabel("Wh")
-    lns = ax.get_lines() + ax2.get_lines()
-    labs = [l.get_label() for l in lns]
-    ax.legend(lns, labs, loc="upper left")
-    buf = io.BytesIO(); fig.set_size_inches(7.5, 4)
-    fig.tight_layout(); fig.savefig(buf, format="png", dpi=180)
-    plt.close(fig); buf.seek(0)
-    return buf
-
-def _render_drift_power_fig(ain):
-    import matplotlib.pyplot as plt
-    plt.style.use("dark_background")
-    fig, ax = plt.subplots()
-    ax.plot(ain.mean_drift_trace, color="#FF6F61", label="Mean Drift (m)")
-    ax.set_xlabel("Step"); ax.set_ylabel("Drift (m)", color="#FF6F61")
-    ax.tick_params(axis='y', colors="#FF6F61")
-    ax2 = ax.twinx()
-    ax2.plot(ain.mean_power_trace, color="#66CCFF", label="Mean Power (W)")
-    ax2.set_ylabel("Power (W)", color="#66CCFF")
-    ax2.tick_params(axis='y', colors="#66CCFF")
-    ax.grid(alpha=0.2)
-    buf = io.BytesIO(); fig.set_size_inches(7.5, 4)
-    fig.tight_layout(); fig.savefig(buf, format="png", dpi=180)
-    plt.close(fig); buf.seek(0)
-    return buf
-
-def _render_orbital_snapshot():
-    import plotly.graph_objects as go
-    u, v = np.mgrid[0:2*np.pi:60j, 0:np.pi:30j]
-    x = np.cos(u)*np.sin(v); y = np.sin(u)*np.sin(v); z = np.cos(v)
-    f = go.Figure()
-    f.add_trace(go.Surface(x=x, y=y, z=z,
-        colorscale=[[0,"#001a1a"],[1,"#003333"]],
-        showscale=False, opacity=0.7))
-    t = np.linspace(0, 2*np.pi, 160)
-    for name, alt_km in [("LEO",1200),("MEO",20200),("GEO",35786)]:
-        r = 1.0 + alt_km/40000.0
-        f.add_trace(go.Scatter3d(x=r*np.cos(t), y=r*np.sin(t), z=np.zeros_like(t),
-            mode="lines", line=dict(color="#00FFAA", width=2), name=name))
+def route(G: nx.DiGraph, src: int, dst: int):
+    # Edge weight = 1/capacity for "fastest" path (maximize capacity)
+    if src not in G.nodes or dst not in G.nodes:
+        return None
+    for u, v, d in G.edges(data=True):
+        d["w"] = 1.0 / max(d.get("capacity_bps", 1e-9), 1e-9)
     try:
-        import plotly.io as pio
-        buf = io.BytesIO()
-        f.update_layout(width=900, height=500, margin=dict(l=0,r=0,b=0,t=0), paper_bgcolor="black")
-        pio.write_image(f, buf, format="png", scale=2)  # requires kaleido
-        buf.seek(0)
-        return buf
+        return nx.shortest_path(G, source=src, target=dst, weight="w")
     except Exception:
-        import matplotlib.pyplot as plt
-        plt.style.use("dark_background")
-        fig, ax = plt.subplots()
-        ax.text(0.5,0.6,"Orbital AIN Mesh Snapshot",ha="center",va="center",fontsize=16,color="#00FFAA")
-        ax.text(0.5,0.45,"(Install 'kaleido' for Plotly export)",ha="center",va="center",fontsize=10,color="#CCCCCC")
-        ax.axis("off")
-        buf = io.BytesIO()
-        fig.set_size_inches(7.5,4)
-        fig.savefig(buf,format="png",dpi=180)
-        plt.close(fig); buf.seek(0)
-        return buf
-
-def _build_pdf(ain, sim_steps, step_dt, mean_soc, mean_drift, mean_power, mean_reward):
-    try:
-        from reportlab.lib.pagesizes import letter
-        from reportlab.pdfgen import canvas
-        from reportlab.lib.utils import ImageReader
-    except Exception:
-        st.error("Install ReportLab with: pip install reportlab")
         return None
 
-    reward_soc_png = _render_reward_soc_fig(ain)
-    drift_power_png = _render_drift_power_fig(ain)
-    orbital_png = _render_orbital_snapshot()
+# -----------------------------
+# Eavesdrop Detection (toy)
+# -----------------------------
 
-    pdf_buf = io.BytesIO()
-    c = canvas.Canvas(pdf_buf, pagesize=letter)
-    W, H = letter
+def eaves_risk(link_mid: np.ndarray, eaves: Optional[Adversary]):
+    if eaves is None or eaves.kind != "eaves":
+        return 0.0
+    d = np.linalg.norm(link_mid - eaves.pos)
+    # closer to eavesdropper -> higher risk (bounded 0..1)
+    return float(np.clip(1.0 - d / eaves.radius_m, 0.0, 1.0))
 
-    # Cover
-    c.setFillColorRGB(0,1,0); c.setFont("Helvetica-Bold",18)
-    c.drawCentredString(W/2, H-60, "AIN Mission Report – Quantum Systems Vector Fleet")
-    c.setFont("Helvetica",10)
-    c.drawCentredString(W/2, H-80, f"Generated {datetime.now():%Y-%m-%d %H:%M:%S}")
+# -----------------------------
+# Autonomy: waypoint & power heuristics
+# -----------------------------
 
-    c.setFillColorRGB(0.6,1,0.8); c.setFont("Helvetica",11)
-    y = H-120
-    lines = [
-        f"UAVs: {len(ain.uavs)}   |   Steps: {sim_steps}   |   dt: {step_dt:.2f}s",
-        f"Platform: Quantum-Systems Vector (m={M_UAV} kg, S={S_WING} m², AR={AR:.2f})",
-        f"Prop Eff η_chain≈{ETA_CHAIN:.2f} | Battery {BATTERY_WH:.0f} Wh",
-        f"Orbital Layers: " + ", ".join([f"{o.name} ({o.latency_ms:.0f} ms)" for o in ain.orbitals]),
-        f"Mean SOC {mean_soc:.1f} Wh | Drift {mean_drift:.3f} m | Power {mean_power:.1f} W",
-        f"Mean Reward (last 20 steps): {mean_reward:.3f}"
-    ]
-    for ln in lines:
-        c.drawString(40,y,ln); y-=16
+def pick_waypoint(uav: UAV, targets: Dict[str, np.ndarray], jammer: Optional[Adversary], eaves: Optional[Adversary], bounds=(1000,1000)):
+    # Blend of: go toward role target; avoid adversary regions; keep center for connectivity
+    goal = targets.get(uav.role, np.array([bounds[0]/2, bounds[1]/2], dtype=float))
+    candidate = goal.copy()
 
-    c.drawImage(ImageReader(reward_soc_png),40,420,width=532,height=180,mask='auto')
-    c.drawImage(ImageReader(drift_power_png),40,220,width=532,height=180,mask='auto')
-    c.showPage()
+    # Avoid jammer/eaves "hot zones" by nudging outward
+    def nudge_away(p, adv: Optional[Adversary], strength=120.0):
+        if adv is None:
+            return p
+        d = np.linalg.norm(p - adv.pos)
+        if d < adv.radius_m:
+            vec = p - adv.pos
+            if np.linalg.norm(vec) < 1e-6:
+                vec = np.array([1.0, 0.0])
+            return p + (vec/np.linalg.norm(vec)) * strength
+        return p
 
-    # Page 2 – Orbital snapshot + mini table
-    c.setFillColorRGB(0,1,0); c.setFont("Helvetica-Bold",16)
-    c.drawString(40,H-60,"Orbital AIN Mesh & Fleet Status")
-    c.drawImage(ImageReader(orbital_png),40,H-360,width=532,height=260,mask='auto')
+    candidate = nudge_away(candidate, jammer)
+    candidate = nudge_away(candidate, eaves)
 
-    c.setFont("Helvetica",10); c.setFillColorRGB(0.6,1,0.8)
-    header=["UAV","Alt (m)","Vel (m/s)","SOC (Wh)","Drift (m)","Power (W)"]
-    x0,y0=40,250; colw=[40,70,70,80,80,80]
-    for i,h in enumerate(header):
-        c.drawString(x0+sum(colw[:i]),y0,h)
-    y=y0-14
-    for u in ain.uavs[:8]:
-        row=[str(u.id),f"{u.altitude_m:.0f}",f"{u.velocity_mps:.1f}",f"{u.soc_Wh:.1f}",
-             f"{u.drift_err_m:.3f}",f"{u.power_W:.0f}"]
-        for i,val in enumerate(row):
-            c.drawString(x0+sum(colw[:i]),y,val)
-        y-=14
+    # Energy aversion: prefer smaller moves (bias toward center)
+    center = np.array([bounds[0]/2, bounds[1]/2], dtype=float)
+    bias = (center - uav.pos) * (0.1 * uav.energy_aversion)
+    candidate = candidate + bias
+    return np.clip(candidate, [0, 0], list(bounds))
 
-    c.setFont("Helvetica-Oblique",9); c.setFillColorRGB(0.7,1,0.8)
-    c.drawString(40,40,"AIN Simulator – ISA atmosphere, aero power (CD=CD0+kCL²), VTOL hover model, Wh-accurate SOC, orbital bias corrections.")
-    c.save(); pdf_buf.seek(0)
-    return pdf_buf
+def choose_tx_power(uav: UAV, base_power_W: float, energy_aversion: float, throughput_pref: float):
+    low = 0.3 * base_power_W
+    high = 1.5 * base_power_W
+    # If user prefers throughput, bias higher; if energy averse, bias lower.
+    alpha = np.clip(throughput_pref - energy_aversion + 0.5, 0.0, 1.0)
+    return low + alpha*(high - low)
 
-# ------------------------------------------------
-#  UI BUTTON
-# ------------------------------------------------
-st.markdown("### 📄 Export Mission Report (PDF)")
-if st.button("Generate PDF Report"):
-    pdf_bytes=_build_pdf(ain,sim_steps,float(step_dt),mean_soc,mean_drift,mean_power,mean_reward)
-    if pdf_bytes:
-        st.download_button(
-            "⬇️ Download Mission Report (PDF)",
-            data=pdf_bytes.getvalue(),
-            file_name=f"AIN_Mission_Report_{datetime.now():%Y%m%d_%H%M%S}.pdf",
-            mime="application/pdf"
+# -----------------------------
+# Simulation
+# -----------------------------
+
+def run_sim(
+    seed: int,
+    num_uav: int,
+    area_xy: Tuple[int,int],
+    steps: int,
+    dt: float,
+    src_count: int,
+    sink_count: int,
+    mac_scheme: str,
+    link_thresh_bps: float,
+    jammer_cfg: Optional[dict],
+    eaves_cfg: Optional[dict],
+    ch_params: dict,
+):
+    rng = np.random.RandomState(seed)
+    random.seed(seed)
+
+    # Initialize UAVs
+    roles = ["source"]*src_count + ["sink"]*sink_count
+    roles += ["relay"] * (num_uav - len(roles))
+    rng.shuffle(roles)
+
+    uavs: List[UAV] = []
+    for uid in range(num_uav):
+        pos = rng.rand(2) * np.array(area_xy)
+        u = UAV(
+            uid=uid,
+            role=roles[uid],
+            pos=pos.astype(float),
+            v_max=12.0 if roles[uid]!="relay" else 10.0,
+            battery_Wh=150 if roles[uid]!="relay" else 180,
+            payload_kg=0.6 if roles[uid]=="source" else (0.4 if roles[uid]=="relay" else 0.8),
+            tx_power_W=1.0,
+            rx_noise_W=1e-9,
+            risk_aversion=0.45,
+            energy_aversion=0.4,
+            throughput_preference=0.3 if roles[uid]=="relay" else 0.5
         )
+        uavs.append(u)
 
-st.caption("Tip → Install `kaleido` for 3-D image embedding: `pip install -U kaleido`")
+    # Adversaries
+    jammer = None
+    eaves = None
+    if jammer_cfg and jammer_cfg.get("enabled", False):
+        jammer = Adversary(kind="jammer", pos=np.array(jammer_cfg["pos"], dtype=float),
+                           power_W=jammer_cfg["power_W"], radius_m=jammer_cfg["radius_m"])
+    if eaves_cfg and eaves_cfg.get("enabled", False):
+        eaves = Adversary(kind="eaves", pos=np.array(eaves_cfg["pos"], dtype=float),
+                          power_W=0.0, radius_m=eaves_cfg["radius_m"])
 
-# ------------------------------------------------
-#  COMMENTARY
-# ------------------------------------------------
-st.write("---")
-st.subheader("🧠 AIN Network Commentary")
-if mean_drift < 0.1:
-    st.success("Fleet stabilized within tight drift limits. Orbital correction bias nominal.")
-elif mean_drift < 0.3:
-    st.warning("Moderate sensor drift observed – AIN correction loop active.")
+    # Channel
+    ch = ChannelModel(**ch_params, rng=random.Random(seed))
+
+    # Targets for roles
+    targets = {
+        "source": np.array([0.15*area_xy[0], 0.85*area_xy[1]]),
+        "sink":   np.array([0.85*area_xy[0], 0.15*area_xy[1]]),
+        "relay":  np.array([0.5*area_xy[0], 0.5*area_xy[1]]),
+    }
+
+    metrics_rows = []
+    paths_snapshots = []
+    for t in range(steps):
+        # Build connectivity graph for this step
+        G = build_graph(uavs, ch, jammer, noise_W=1e-9, link_thresh_bps=link_thresh_bps, mac_scheme=mac_scheme)
+
+        # Simple traffic model: every source sends to a (random) sink
+        sinks = [u.uid for u in uavs if u.role=="sink"]
+        sources = [u.uid for u in uavs if u.role=="source"]
+
+        total_throughput = 0.0
+        avg_eaves_risk = 0.0
+        used_links = 0
+        total_comm_energy = 0.0
+
+        for s in sources:
+            if not sinks:
+                continue
+            d = random.choice(sinks)
+            p = route(G, s, d)
+            if p is None or len(p) < 2:
+                continue
+            # Aggregate min-capacity along path as bottleneck (bps)
+            caps = []
+            e_risks = []
+            for i in range(len(p)-1):
+                u = p[i]; v = p[i+1]
+                cap = G.edges[u, v]['capacity_bps']
+                # risk evaluated at link midpoint
+                u_pos = next(U for U in uavs if U.uid==u).pos
+                v_pos = next(U for U in uavs if U.uid==v).pos
+                mid = 0.5*(u_pos + v_pos)
+                e_risks.append(eaves_risk(mid, eaves))
+                caps.append(cap)
+            path_cap = min(caps) if caps else 0.0
+            total_throughput += path_cap
+            avg_eaves_risk += np.mean(e_risks) if e_risks else 0.0
+            used_links += len(caps)
+
+            # Energy for communication for nodes on path
+            # Assume each hop transmits for dt seconds at chosen tx power
+            for i in range(len(p)-1):
+                node = next(U for U in uavs if U.uid==p[i])
+                chosen_tx = choose_tx_power(node, base_power_W=node.tx_power_W,
+                                            energy_aversion=node.energy_aversion,
+                                            throughput_pref=node.throughput_preference)
+                e_Wh = comm_energy_Wh(chosen_tx, dt)
+                node.energy_used_Wh += e_Wh
+                total_comm_energy += e_Wh
+
+        if len(sources) > 0:
+            avg_eaves_risk /= len(sources)
+
+        # Motion decisions: waypoints, then move
+        for u in uavs:
+            wp = pick_waypoint(u, targets, jammer, eaves, bounds=area_xy)
+            pre = u.pos.copy()
+            u.move_toward(wp, dt, keep_in_bounds=area_xy)
+            dist = float(np.linalg.norm(u.pos - pre))
+            u.energy_used_Wh += motion_energy_Wh(dist, mass_factor=0.25 + 0.15*u.payload_kg)
+
+        # Snapshot for plotting
+        paths_snapshots.append({
+            "t": t,
+            "positions": np.vstack([u.pos for u in uavs]),
+            "roles": [u.role for u in uavs]
+        })
+
+        # Metrics
+        avg_batt = np.mean([max(u.battery_Wh - u.energy_used_Wh, 0.0) for u in uavs])
+        metrics_rows.append({
+            "t": t,
+            "throughput_bps": total_throughput,
+            "avg_eaves_risk_0to1": avg_eaves_risk,
+            "used_links": used_links,
+            "avg_remaining_battery_Wh": avg_batt,
+            "total_comm_energy_Wh": total_comm_energy
+        })
+
+    metrics = pd.DataFrame(metrics_rows)
+    return uavs, metrics, paths_snapshots, G, jammer, eaves, area_xy
+
+# -----------------------------
+# 3D Orbit helpers (visual only)
+# -----------------------------
+
+def _orbit_ring_xyz(radius: float, tilt_deg: float = 0.0, n: int = 360):
+    """Return a tilted circular ring around the Z axis (tilt about X)."""
+    t = np.linspace(0, 2*np.pi, n)
+    x = radius * np.cos(t)
+    y = radius * np.sin(t)
+    z = np.zeros_like(t)
+    tilt = np.deg2rad(tilt_deg)
+    Ry = y*np.cos(tilt) - z*np.sin(tilt)
+    Rz = y*np.sin(tilt) + z*np.cos(tilt)
+    return x, Ry, Rz
+
+def _sphere_mesh(R=400, nu=64, nv=32):
+    """Unit sphere mesh scaled by R."""
+    u = np.linspace(0, 2*np.pi, nu)
+    v = np.linspace(0, np.pi, nv)
+    uu, vv = np.meshgrid(u, v)
+    xs = R*np.cos(uu)*np.sin(vv)
+    ys = R*np.sin(uu)*np.sin(vv)
+    zs = R*np.cos(vv)
+    return xs, ys, zs
+
+def make_orbit_figure(uavs, area_xy, R_planet=400, ring_leo=520, ring_meo=700, ring_geo=880,
+                      tilt_deg=0.0, sphere_opacity=0.2):
+    """Build a Plotly 3D scene with a sphere, LEO/MEO/GEO rings, and UAV markers."""
+    xs, ys, zs = _sphere_mesh(R=R_planet)
+    fig = go.Figure()
+
+    # Planet
+    fig.add_surface(x=xs, y=ys, z=zs, showscale=False, opacity=sphere_opacity)
+
+    # Rings
+    for r, name in [(ring_leo, "LEO Orbit"), (ring_meo, "MEO Orbit"), (ring_geo, "GEO Orbit")]:
+        rx, ry, rz = _orbit_ring_xyz(r, tilt_deg=tilt_deg)
+        fig.add_trace(go.Scatter3d(x=rx, y=ry, z=rz, mode="lines", name=name, line=dict(width=2)))
+
+    # UAVs: map 2D sim area into a centered square inside the sphere (z≈0 plane)
+    scale = 0.7 * R_planet
+    ax, ay = float(area_xy[0]), float(area_xy[1])
+    pts_x, pts_y, pts_z, labels = [], [], [], []
+    for u in uavs:
+        nx = (u.pos[0]/ax) - 0.5
+        ny = (u.pos[1]/ay) - 0.5
+        pts_x.append(nx * 2 * scale)
+        pts_y.append(ny * 2 * scale)
+        pts_z.append(0.0)  # equatorial plane for now
+        labels.append(f"UAV {u.uid}")
+
+    fig.add_trace(go.Scatter3d(
+        x=pts_x, y=pts_y, z=pts_z,
+        mode="markers+text",
+        marker=dict(size=5),
+        text=labels,
+        textposition="top center",
+        name="UAVs"
+    ))
+
+    fig.update_scenes(xaxis_visible=False, yaxis_visible=False, zaxis_visible=False)
+    fig.update_layout(
+        height=700,
+        scene=dict(aspectmode="data", bgcolor="black"),
+        paper_bgcolor="black",
+        plot_bgcolor="black",
+        legend=dict(font=dict(color="white")),
+        margin=dict(l=0, r=0, t=0, b=0)
+    )
+    return fig
+
+# -----------------------------
+# Streamlit UI
+# -----------------------------
+
+st.set_page_config(page_title="AIN UAV Networks – Survey-to-App MVP", layout="wide")
+
+st.title("AIN UAV Networks – Survey-to-App MVP")
+st.caption("Implements core ideas from Sarkar & Gul (2023) on AI-based autonomous UAV networks: autonomy, MAC/routing, power/energy, and security adversaries.")
+
+with st.sidebar:
+    st.header("Scenario")
+    seed = st.number_input("Random Seed", 0, 999999, value=42)
+    area_x = st.slider("Area X (m)", 300, 2000, 1000, 50)
+    area_y = st.slider("Area Y (m)", 300, 2000, 1000, 50)
+    num = st.slider("Number of UAVs", 3, 40, 12, 1)
+    srcs = st.slider("Sources", 1, 10, 3, 1)
+    sinks = st.slider("Sinks", 1, 10, 3, 1)
+    steps = st.slider("Simulation Steps", 5, 300, 120, 5)
+    dt = st.slider("Δt per step (s)", 0.5, 5.0, 1.0, 0.5)
+
+    st.header("Comm / MAC")
+    mac = st.selectbox("MAC Scheme", ["TDMA (Orthogonal)", "NOMA (Superposition)", "Rate-Splitting (RSMA)"])
+    link_thresh = st.slider("Link Capacity Threshold (bps)", 0.1, 10.0, 1.0, 0.1)
+
+    st.header("Channel")
+    f = st.slider("Carrier f (GHz)", 0.9, 6.0, 2.4, 0.1)
+    pl0 = st.slider("PL(d0) dB @1m", 30, 60, 40, 1)
+    n = st.slider("Pathloss exponent n", 1.6, 3.5, 2.2, 0.1)
+    sh = st.slider("Shadowing σ (dB)", 0.0, 6.0, 2.0, 0.5)
+
+    st.header("Adversaries")
+    jam_on = st.checkbox("Enable Jammer", value=True)
+    jam_x = st.slider("Jammer X", 0, area_x, int(0.35*area_x), 10)
+    jam_y = st.slider("Jammer Y", 0, area_y, int(0.65*area_y), 10)
+    jam_pow = st.slider("Jammer Power (W)", 0.1, 10.0, 2.0, 0.1)
+    jam_r = st.slider("Jammer Radius (m)", 50, 600, 250, 10)
+
+    eav_on = st.checkbox("Enable Eavesdropper", value=True)
+    eav_x = st.slider("Eaves X", 0, area_x, int(0.65*area_x), 10)
+    eav_y = st.slider("Eaves Y", 0, area_y, int(0.35*area_y), 10)
+    eav_r = st.slider("Eaves Radius (m)", 50, 600, 250, 10)
+
+    # ----- 3D Orbit Controls -----
+    st.header("3D Orbit View")
+    show_3d = st.checkbox("Enable 3D Orbit Scene", value=True)
+    orbit_tilt = st.slider("Ring Tilt (deg)", -40, 40, 0, 1)
+    planet_R = st.slider("Planet Radius (vis)", 200, 800, 400, 20)
+    leo_r = st.slider("LEO Radius", 320, 900, 520, 10)
+    meo_r = st.slider("MEO Radius", 500, 1200, 700, 10)
+    geo_r = st.slider("GEO Radius", 700, 1600, 880, 10)
+    sphere_alpha = st.slider("Sphere Opacity", 0.0, 1.0, 0.20, 0.05)
+
+    run = st.button("Run Simulation", type="primary")
+
+if run:
+    jammer_cfg = dict(enabled=jam_on, pos=[jam_x, jam_y], power_W=jam_pow, radius_m=jam_r)
+    eaves_cfg  = dict(enabled=eav_on, pos=[eav_x, eav_y], radius_m=eav_r)
+    ch_params  = dict(f_GHz=f, pl0_dB=pl0, n=n, shadowing_std_dB=sh)
+
+    uavs, metrics, snaps, G, jammer, eaves, area_xy = run_sim(
+        seed=seed,
+        num_uav=num,
+        area_xy=(area_x, area_y),
+        steps=steps,
+        dt=dt,
+        src_count=srcs,
+        sink_count=sinks,
+        mac_scheme=mac,
+        link_thresh_bps=link_thresh,
+        jammer_cfg=jammer_cfg,
+        eaves_cfg=eaves_cfg,
+        ch_params=ch_params
+    )
+
+    col1, col2 = st.columns([1.1, 0.9])
+
+    with col1:
+        st.subheader("Map & Roles (final step)")
+        fig = go.Figure()
+        xs = [u.pos[0] for u in uavs]
+        ys = [u.pos[1] for u in uavs]
+        roles = [u.role for u in uavs]
+        colors = ["#1f77b4" if r=="source" else "#2ca02c" if r=="relay" else "#d62728" for r in roles]
+        fig.add_trace(go.Scatter(x=xs, y=ys, mode="markers+text",
+                                 marker=dict(size=12, color=colors),
+                                 text=[f"{u.uid}:{u.role[0].upper()}" for u in uavs],
+                                 textposition="top center", name="UAVs"))
+        # Adversaries zones (dotted circles)
+        def add_circle(center, radius, name):
+            theta = np.linspace(0, 2*np.pi, 120)
+            cx = center[0] + radius*np.cos(theta)
+            cy = center[1] + radius*np.sin(theta)
+            fig.add_trace(go.Scatter(x=cx, y=cy, mode="lines", line=dict(dash="dot"),
+                                     name=name, showlegend=True))
+            fig.add_trace(go.Scatter(x=[center[0]], y=[center[1]], mode="markers",
+                                     marker=dict(symbol="x", size=10),
+                                     name=f"{name} center"))
+        if jammer:
+            add_circle(jammer.pos, jammer.radius_m, "Jammer Zone")
+        if eaves:
+            add_circle(eaves.pos, eaves.radius_m, "Eaves Zone")
+        fig.update_layout(height=520, xaxis_range=[0, area_xy[0]], yaxis_range=[0, area_xy[1]],
+                          xaxis_title="X (m)", yaxis_title="Y (m)")
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.subheader("Connectivity (final step)")
+        edge_x, edge_y = [], []
+        for u,v,d in G.edges(data=True):
+            up = next(U for U in uavs if U.uid==u).pos
+            vp = next(U for U in uavs if U.uid==v).pos
+            edge_x += [up[0], vp[0], None]
+            edge_y += [up[1], vp[1], None]
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=edge_x, y=edge_y, mode='lines', name='Links', opacity=0.4))
+        fig2.add_trace(go.Scatter(x=xs, y=ys, mode='markers',
+                                  marker=dict(size=10, color=colors), name='UAVs'))
+        fig2.update_layout(height=420, xaxis_range=[0, area_xy[0]], yaxis_range=[0, area_xy[1]],
+                           xaxis_title="X (m)", yaxis_title="Y (m)")
+        st.plotly_chart(fig2, use_container_width=True)
+
+        # ---- 3D Orbits
+        if show_3d:
+            st.subheader("3D Orbits (visual)")
+            fig3d = make_orbit_figure(
+                uavs=uavs,
+                area_xy=area_xy,
+                R_planet=planet_R,
+                ring_leo=leo_r,
+                ring_meo=meo_r,
+                ring_geo=geo_r,
+                tilt_deg=orbit_tilt,
+                sphere_opacity=sphere_alpha
+            )
+            st.plotly_chart(fig3d, use_container_width=True)
+
+    with col2:
+        st.subheader("Key Metrics")
+        m1 = metrics.copy()
+        m1["throughput_Mbps"] = m1["throughput_bps"]/1e6
+        figm = make_subplots(rows=3, cols=1, shared_xaxes=True,
+                             subplot_titles=("Throughput (Mb/s)",
+                                             "Avg Remaining Battery (Wh)",
+                                             "Eavesdropping Risk (0..1)"))
+        figm.add_trace(go.Scatter(x=m1["t"], y=m1["throughput_Mbps"], mode="lines"), 1, 1)
+        figm.add_trace(go.Scatter(x=m1["t"], y=m1["avg_remaining_battery_Wh"], mode="lines"), 2, 1)
+        figm.add_trace(go.Scatter(x=m1["t"], y=m1["avg_eaves_risk_0to1"], mode="lines"), 3, 1)
+        figm.update_layout(height=720, showlegend=False, xaxis_title="t (step)")
+        st.plotly_chart(figm, use_container_width=True)
+
+        st.subheader("Scenario Summary")
+        st.dataframe(m1[["t","throughput_Mbps","avg_remaining_battery_Wh","avg_eaves_risk_0to1","used_links","total_comm_energy_Wh"]])
+
+    # Explainability panel
+    with st.expander("How this maps to the survey (click)"):
+        st.markdown("""
+- **Autonomous features & planning**: Each UAV picks waypoints that *balance goals, risk zones, and energy*; then moves with limits.
+- **Multiple access**: Switch **TDMA / NOMA / RSMA** to change the per-link share used in capacity (toy abstraction).
+- **Routing**: Shortest path on **1/capacity** gives a high-capacity route; rebuilt each step for mobility (**trajectory–communication coupling**).
+- **Power/Energy**: Per-hop **Tx energy** + **motion energy**. Sliders affect trade-offs; analytics track remaining battery & comm energy.
+- **Security**: Add **jammer** (noise inflation) and **eavesdropper** (risk metric by proximity). Waypoint logic nudges away from threats.
+- **3D Orbit View**: Planet sphere + LEO/MEO/GEO rings as a cinematic, educational overlay; UAVs plotted on the equatorial plane.
+""")
+
+    st.success("Simulation complete. Tweak sliders and re-run to explore trade-offs.")
 else:
-    st.error("High drift variance – check orbital latency or IMU noise profile.")
-
-st.info(
-    "This simulation models ISA air density, fixed-wing drag/lift, VTOL hover power, Wh-accurate SOC, and orbital latency bias influence on AIN correction for the Quantum Systems Vector fleet."
-)
-st.caption("AIN Simulator v1.0 – Full-Stack Aerospace-Accurate Edition © 2025 Tareq Omrani")
+    st.info("Configure the scenario in the left sidebar, then press **Run Simulation**.")
