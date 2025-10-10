@@ -337,4 +337,114 @@ with st.sidebar:
     steps=st.slider("Steps",5,300,120,5)
     dt=st.slider("Δt (s)",0.5,5.0,1.0,0.5)
     mac=st.selectbox("MAC Scheme",["TDMA (Orthogonal)","NOMA (Superposition)","Rate-Splitting (RSMA)"])
-    link_thresh=st.slider("Link Threshold (bps)",0.1,10.0,1.0,
+        link_thresh = st.slider("Link Threshold (bps)", 0.1, 10.0, 1.0, 0.1)
+
+    st.header("Channel")
+    f = st.slider("Carrier f (GHz)", 0.9, 6.0, 2.4, 0.1)
+    pl0 = st.slider("PL(d0) dB @1m", 30, 60, 40, 1)
+    n = st.slider("Pathloss exponent n", 1.6, 3.5, 2.2, 0.1)
+    sh = st.slider("Shadowing σ (dB)", 0.0, 6.0, 2.0, 0.5)
+
+    st.header("Adversaries")
+    jam_on = st.checkbox("Enable Jammer", True)
+    jam_x = st.slider("Jammer X", 0, area_x, int(0.35 * area_x), 10)
+    jam_y = st.slider("Jammer Y", 0, area_y, int(0.65 * area_y), 10)
+    jam_pow = st.slider("Jammer Power (W)", 0.1, 10.0, 2.0, 0.1)
+    jam_r = st.slider("Jammer Radius (m)", 50, 600, 250, 10)
+    eav_on = st.checkbox("Enable Eavesdropper", True)
+    eav_x = st.slider("Eaves X", 0, area_x, int(0.65 * area_x), 10)
+    eav_y = st.slider("Eaves Y", 0, area_y, int(0.35 * area_y), 10)
+    eav_r = st.slider("Eaves Radius (m)", 50, 600, 250, 10)
+
+    st.header("3D Orbit View")
+    show_3d = st.checkbox("Enable 3D Orbit Scene", True)
+    orbit_tilt = st.slider("Ring Tilt (deg)", -40, 40, 0, 1)
+    planet_R = st.slider("Planet Radius", 200, 800, 400, 20)
+    leo_r = st.slider("LEO Radius", 320, 900, 520, 10)
+    meo_r = st.slider("MEO Radius", 500, 1200, 700, 10)
+    geo_r = st.slider("GEO Radius", 700, 1600, 880, 10)
+    sphere_alpha = st.slider("Sphere Opacity", 0.0, 1.0, 0.20, 0.05)
+
+    run = st.button("Run Simulation", type="primary")
+
+# === Run ===
+if run:
+    jammer_cfg = dict(enabled=jam_on, pos=[jam_x, jam_y], power_W=jam_pow, radius_m=jam_r)
+    eaves_cfg = dict(enabled=eav_on, pos=[eav_x, eav_y], radius_m=eav_r)
+    ch_params = dict(f_GHz=f, pl0_dB=pl0, n=n, shadowing_std_dB=sh)
+
+    uavs, metrics, area_xy, jammer, eaves = run_sim(
+        seed, num, (area_x, area_y), steps, dt, srcs, sinks,
+        mac, link_thresh, jammer_cfg, eaves_cfg, ch_params
+    )
+
+    # --- Figures ---
+    xs, ys = [u.pos[0] for u in uavs], [u.pos[1] for u in uavs]
+    roles = [u.role for u in uavs]
+    colors = ["#1f77b4" if r=="source" else "#2ca02c" if r=="relay" else "#d62728" for r in roles]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=xs, y=ys, mode="markers+text",
+                             marker=dict(size=12, color=colors),
+                             text=[f"{u.uid}:{u.role[0].upper()}" for u in uavs],
+                             textposition="top center"))
+    fig.update_layout(height=500, title="Final UAV Positions")
+
+    G = build_graph(uavs, ChannelModel(**ch_params), jammer, 1e-9, link_thresh, mac)
+    edge_x, edge_y = [], []
+    for u, v in G.edges():
+        up = [U for U in uavs if U.uid == u][0].pos
+        vp = [U for U in uavs if U.uid == v][0].pos
+        edge_x += [up[0], vp[0], None]
+        edge_y += [up[1], vp[1], None]
+    fig2 = go.Figure()
+    fig2.add_trace(go.Scatter(x=edge_x, y=edge_y, mode="lines", opacity=0.4))
+    fig2.add_trace(go.Scatter(x=xs, y=ys, mode="markers", marker=dict(size=10, color=colors)))
+    fig2.update_layout(height=420, title="Connectivity Graph")
+
+    metrics["throughput_Mbps"] = metrics["throughput_bps"] / 1e6
+    figm = make_subplots(rows=3, cols=1, shared_xaxes=True,
+                         subplot_titles=("Throughput (Mb/s)", "Battery (Wh)", "Eaves Risk"))
+    figm.add_trace(go.Scatter(x=metrics["t"], y=metrics["throughput_Mbps"]), 1, 1)
+    figm.add_trace(go.Scatter(x=metrics["t"], y=metrics["avg_remaining_battery_Wh"]), 2, 1)
+    figm.add_trace(go.Scatter(x=metrics["t"], y=metrics["avg_eaves_risk_0to1"]), 3, 1)
+    figm.update_layout(height=700, showlegend=False)
+
+    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig2, use_container_width=True)
+    if show_3d:
+        fig3d = make_orbit_figure(uavs, (area_x, area_y),
+                                  Rp=planet_R, LEO=leo_r, MEO=meo_r, GEO=geo_r,
+                                  tilt=orbit_tilt, alpha=sphere_alpha)
+        st.plotly_chart(fig3d, use_container_width=True)
+    st.plotly_chart(figm, use_container_width=True)
+
+    # === Export Section ===
+    params_dict = {
+        "num_uavs": num, "sources": srcs, "sinks": sinks,
+        "steps": steps, "dt": dt, "MAC_scheme": mac,
+        "jammer_enabled": jam_on, "eavesdropper_enabled": eav_on,
+        "area_m": (area_x, area_y), "pathloss_exponent": n,
+        "shadowing_std_dB": sh, "frequency_GHz": f
+    }
+    csv_bytes, json_bytes = export_data(metrics, uavs, params_dict)
+    st.download_button("📄 Download CSV", csv_bytes, "uav_metrics.csv", "text/csv")
+    st.download_button("🧠 Download JSON", json_bytes, "uav_full_export.json", "application/json")
+
+    # === PDF Report ===
+    try:
+        map_png = fig.to_image(format="png", scale=2)
+        links_png = fig2.to_image(format="png", scale=2)
+        metrics_png = figm.to_image(format="png", scale=2)
+        orbits_png = fig3d.to_image(format="png", scale=2) if show_3d else None
+        pdf_bytes = build_pdf_report(params_dict, metrics,
+                                     {"map": map_png, "links": links_png,
+                                      "metrics": metrics_png, "orbits": orbits_png})
+        st.download_button("🗂️ Download PDF Mission Report", pdf_bytes,
+                           "uav_mission_report.pdf", "application/pdf")
+    except Exception as e:
+        st.warning(f"PDF export unavailable: {e} (check kaleido install)")
+
+    st.success("Simulation complete ✅ — tweak sliders and rerun!")
+else:
+    st.info("Set parameters in the sidebar and click **Run Simulation**.")
