@@ -1,17 +1,6 @@
-# === Core App Dependencies ===
-streamlit==1.39.0
-plotly==5.24.1
-matplotlib==3.9.2
-numpy==1.26.4
-pandas==2.2.3
-reportlab==4.2.5
-kaleido==0.2.1
-
-# === Development Tools (optional but recommended) ===
-pyflakes==3.2.0      # for syntax validation
-black==24.8.0        # for auto-formatting
-
-# === Notes ===
-# Tested on Python 3.10–3.12
-# Run: pip install -r requirements.txt
-# Then: streamlit run app_corrected.py
+streamlit
+numpy
+pandas
+networkx
+scipy
+plotly
