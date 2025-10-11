@@ -1,6 +1,4 @@
 streamlit
 numpy
 pandas
-networkx
-scipy
-plotly
+matplotlib
