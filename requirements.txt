@@ -1,7 +1,13 @@
+# Core app
 streamlit>=1.32
 matplotlib>=3.8
-numpy>=1.26
 pandas>=2.2
-opencv-contrib-python-headless==4.9.0.80
-pupil-apriltags>=1.0.4
+numpy>=2.0          # keep NumPy 2.x so OpenCV wheels match
 Pillow>=10.0
+
+# Vision
+# Must be the *contrib* build to include cv2.aruco, and >=4.10 so it's compiled for NumPy 2.x
+opencv-contrib-python-headless>=4.11.0.86
+
+# AprilTag detector (runtime)
+pupil-apriltags>=1.0.4
