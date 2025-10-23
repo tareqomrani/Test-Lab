@@ -2,6 +2,6 @@ streamlit>=1.32
 matplotlib>=3.8
 numpy>=1.26
 pandas>=2.2
-opencv-contrib-python>=4.9
+opencv-contrib-python-headless==4.9.0.80
 pupil-apriltags>=1.0.4
 Pillow>=10.0
