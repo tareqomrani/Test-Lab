@@ -19,12 +19,12 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 import streamlit as st
 
 # ─────────────────────────────────────────────
-# Optional vision libs (robust import for aruco to avoid checkerboard)
+# Optional vision libs (robust aruco import to avoid false negatives)
 # ─────────────────────────────────────────────
 try:
     import cv2
     try:
-        import cv2.aruco as cv2_aruco  # robust: import the submodule explicitly
+        import cv2.aruco as cv2_aruco  # explicit submodule import works even if cv2 lacks attribute
         _ARUCO_OK = True
     except Exception:
         cv2_aruco = None
@@ -202,14 +202,13 @@ st.markdown(
 # Helpers (marker image + camera model)
 # ─────────────────────────────────────────────
 def _pil_border(pil_img, border_bits: int):
-    """PIL border as reliable fallback."""
     from PIL import ImageOps as PImageOps
     if border_bits > 0:
         return PImageOps.expand(pil_img, border=border_bits*10, fill=255)
     return pil_img
 
 def generate_aruco_png_bytes(marker_id: int, size_px: int = 800, border_bits: int = 1) -> bytes:
-    """Return PNG bytes of an ArUco marker (DICT_4X4_1000) using cv2.aruco if available; fallback to checker."""
+    """Return PNG bytes of an ArUco marker (DICT_4X4_1000). Falls back to checker if OpenCV/aruco is unavailable."""
     from PIL import Image as PImage, ImageDraw
     pil = None
     if _ARUCO_OK and hasattr(cv2_aruco, "getPredefinedDictionary"):
@@ -220,8 +219,10 @@ def generate_aruco_png_bytes(marker_id: int, size_px: int = 800, border_bits: in
         elif hasattr(cv2_aruco, "drawMarker"):
             img = cv2_aruco.drawMarker(dict_, marker_id, size_px)
         if img is not None:
+            if border_bits > 0:
+                img = cv2.copyMakeBorder(img, border_bits*10, border_bits*10, border_bits*10, border_bits*10,
+                                         cv2.BORDER_CONSTANT, value=255)
             pil = PImage.fromarray(img)
-            pil = _pil_border(pil, border_bits)
     if pil is None:
         pil = PImage.new("L", (size_px, size_px), 255)
         draw = ImageDraw.Draw(pil)
@@ -236,7 +237,7 @@ def generate_aruco_png_bytes(marker_id: int, size_px: int = 800, border_bits: in
     return buf.getvalue()
 
 def generate_apriltag_png_bytes(tag_id: int, size_px: int = 800, border_bits: int = 1) -> bytes:
-    """Return PNG bytes of an AprilTag (tag36h11) via cv2.aruco; fallback to checker."""
+    """Return PNG bytes of an AprilTag (tag36h11) via OpenCV/aruco; fallback to checker if unavailable."""
     from PIL import Image as PImage, ImageDraw
     pil = None
     if _ARUCO_OK and hasattr(cv2_aruco, "getPredefinedDictionary") and hasattr(cv2_aruco, "DICT_APRILTAG_36h11"):
@@ -247,8 +248,10 @@ def generate_apriltag_png_bytes(tag_id: int, size_px: int = 800, border_bits: in
         elif hasattr(cv2_aruco, "drawMarker"):
             img = cv2_aruco.drawMarker(dict_, tag_id, size_px)
         if img is not None:
+            if border_bits > 0:
+                img = cv2.copyMakeBorder(img, border_bits*10, border_bits*10, border_bits*10, border_bits*10,
+                                         cv2.BORDER_CONSTANT, value=255)
             pil = PImage.fromarray(img)
-            pil = _pil_border(pil, border_bits)
     if pil is None:
         pil = PImage.new("L", (size_px, size_px), 255)
         draw = ImageDraw.Draw(pil)
@@ -286,10 +289,10 @@ with colA:
         st.download_button("Download ArUco PNG", data=marker_png, file_name=f"aruco_{marker_id}.png", mime="image/png")
         st.markdown(f"_OpenCV/aruco available:_ {'✅' if _ARUCO_OK else '❌ (using placeholder)'}")
     else:
-        tag_png = generate_apriltag_png_bytes(st.session_state.get("marker_id", 23), size_px=800)
+        tag_png = generate_apriltag_png_bytes(st.session_state.get('marker_id', 23), size_px=800)
         st.image(tag_png, caption=f"AprilTag-36h11 ID {marker_id} — print at {marker_size_cm} cm")
         st.download_button("Download AprilTag PNG", data=tag_png, file_name=f"apriltag36h11_{marker_id}.png", mime="image/png")
-        st.markdown(f"_AprilTag via OpenCV/aruco:_ {'✅' if (_ARUCO_OK and hasattr(cv2_aruco, 'DICT_APRILTAG_36h11')) else '❌ (using placeholder)'}")
+        st.markdown(f"_AprilTag generation via OpenCV/aruco:_ {'✅' if _ARUCO_OK and hasattr(cv2_aruco, 'DICT_APRILTAG_36h11') else '❌ (using placeholder)'}")
         st.markdown(f"_pupil_apriltags detector available:_ {'✅' if _APRILTAG_OK else '❌'}")
 
     # Runtime status to diagnose environment quickly
