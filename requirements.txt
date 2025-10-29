@@ -1,8 +1,7 @@
-streamlit==1.50.0
-numpy>=2.0,<3
-opencv-contrib-python-headless>=4.10.0.84
-pupil-apriltags==1.0.4.post11
-matplotlib>=3.8,<3.11
-pandas>=2.2,<2.4
-pillow>=10.3,<12
-altair>=5.2,<6
+streamlit>=1.38
+numpy>=1.26
+matplotlib>=3.9
+plotly>=5.23
+pandas>=2.2
+Pillow>=10.4
+kaleido>=0.2.1
