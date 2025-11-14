@@ -1,387 +1,1548 @@
-# 🛩️ AoA & Flight Path Visualizer — v3.1 (Royal Blue)
-# Pitch–Flight Path–AoA Trainer | Bank + Sideslip + PID Autopilot + Export Suite
+# Final_Full_App.py
+# UAV Battery Efficiency Estimator — Aerospace-grade physics + LLM + Swarm + Stealth + Playback + CSV/JSON Export
+# Full UAV profiles included. Individual UAV Detailed Results panel replaces the Quick Look table.
 # Author: Tareq Omrani | 2025
 
-import math, io, time, zipfile
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import plotly.graph_objects as go
-import plotly.io as pio
-from PIL import Image  # used implicitly by Matplotlib PNG export; safe to keep
+import os, time, math, random, json, io
+from dataclasses import dataclass, asdict
+from typing import List, Dict, Any, Optional, Tuple
+
 import streamlit as st
+import matplotlib.pyplot as plt
+import pandas as pd
 
-g = 9.80665  # m/s²
-
-# ─────────────────────────── Visual Theme (Royal Blue) ───────────────────────────
-ROYAL   = "#4169E1"   # royal blue
-NAVY_D  = "#0B0C10"   # page bg (match .streamlit/config.toml)
-NAVY_M  = "#1B1F2F"   # panel bg
-INK_L   = "#E6ECF5"   # light ink for text/lines on dark
-INK_M   = "#95A3B3"   # mid ink for grids/ticks
-GOLD    = "#F2C94C"   # pitch bar accent
-EARTH   = "#5B4636"   # muted earth (ground)
-SKY     = "#1F3D7A"   # deep sky so ROYAL pops
-LIME    = "#8EF18F"   # status/OK
-
-# Matplotlib: dark + royal accents
-plt.rcParams.update({
-    "figure.facecolor": NAVY_D,
-    "axes.facecolor": NAVY_M,
-    "axes.edgecolor": INK_M,
-    "axes.labelcolor": INK_L,
-    "xtick.color": INK_L,
-    "ytick.color": INK_L,
-    "text.color": INK_L,
-    "grid.color": INK_M,
-    "axes.prop_cycle": plt.cycler(color=[ROYAL, GOLD, LIME, INK_L]),
-})
-
-# Plotly: dark + royal template
-royal_tpl = go.layout.Template(
-    layout=go.Layout(
-        paper_bgcolor=NAVY_D, plot_bgcolor=NAVY_M,
-        font=dict(color=INK_L),
-        scene=dict(
-            xaxis=dict(showgrid=True, gridcolor=INK_M, zerolinecolor=INK_M, color=INK_L),
-            yaxis=dict(showgrid=True, gridcolor=INK_M, zerolinecolor=INK_M, color=INK_L),
-            zaxis=dict(showgrid=True, gridcolor=INK_M, zerolinecolor=INK_M, color=INK_L),
-            bgcolor=NAVY_M,
-        ),
-        legend=dict(bgcolor="rgba(0,0,0,0)", bordercolor="rgba(0,0,0,0)"),
-        colorway=[ROYAL, GOLD, LIME, INK_L],
-    )
-)
-pio.templates["royal_dark"] = royal_tpl
-pio.templates.default = "royal_dark"
-
-# ─────────────────────────── Atmosphere / helpers ───────────────────────────
-def isa_density(alt_m: float) -> float:
-    """ISA troposphere density model (0–11 km)."""
-    T0, p0, L, R = 288.15, 101325.0, -0.0065, 287.058
-    alt_m = max(0.0, alt_m)
-    T = T0 + L * alt_m
-    p = p0 * (T / T0) ** (-g / (L * R))
-    return p / (R * T)
-
-def deg(x): return x * 180.0 / math.pi
-def rad(x): return x * math.pi / 180.0
-def clamp(x, a, b): return max(a, min(b, x))
-
-def fpa_from_roc(roc_fpm: float, tas_ms: float) -> float:
-    """Flight-path angle γ from rate-of-climb and airspeed."""
-    roc_ms = roc_fpm * 0.00508  # ft/min → m/s
-    return math.asin(clamp(roc_ms / max(tas_ms, 1e-6), -0.999, 0.999))
-
-def aero_solve_alpha_pitch(mass_kg, tas_ms, alt_m, gamma_rad,
-                           CL0, CL_alpha_per_rad, CD0, k, S_m2, thrust_N, i_deg):
-    """Solve AoA and pitch for steady-state balance (L≈W·cosγ, T−D−W·sinγ≈0)."""
-    rho = isa_density(alt_m)
-    q = 0.5 * rho * tas_ms**2
-    W = mass_kg * g
-    CL_req = (W * math.cos(gamma_rad)) / max(q * S_m2, 1e-9)
-    alpha_rad = (CL_req - CL0) / max(CL_alpha_per_rad, 1e-9)
-    CD = CD0 + k * CL_req**2
-    D = q * S_m2 * CD
-    margin_N = thrust_N - D - W * math.sin(gamma_rad)
-    pitch_deg = deg(alpha_rad) + deg(gamma_rad) + i_deg
-    return alpha_rad, CL_req, D, margin_N, pitch_deg
-
-# ─────────────────────────── Streamlit shell ───────────────────────────
-st.set_page_config(page_title="AoA & Flight Path Visualizer", page_icon="🛩️", layout="wide")
-st.title("🛩️ AoA & Flight Path Visualizer — v3.1 (Royal Blue)")
-
-L, M, R = st.columns([1.05, 1.35, 1.1])
-
-# ─────────────────────────── Inputs: Aircraft / Env ───────────────────────────
-with L:
-    st.subheader("Aircraft / Environment")
-    mass_kg = st.slider("Mass (kg)", 400.0, 1600.0, 900.0, 10.0)
-    S = st.slider("Wing Area S (m²)", 10.0, 25.0, 16.2, 0.1)
-    CL0_base = st.slider("CL₀ (clean)", 0.0, 0.6, 0.30, 0.01)
-    CLalpha_per_deg = st.slider("CLα (per deg)", 0.04, 0.12, 0.085, 0.001)
-    CLalpha = CLalpha_per_deg * (180.0 / math.pi)  # → per rad
-    CD0 = st.slider("CD₀", 0.015, 0.045, 0.028, 0.001)
-    k = st.slider("Induced k", 0.04, 0.12, 0.08, 0.001)
-    i_deg = st.slider("Wing Incidence i (°)", -2.0, 4.0, 1.5, 0.1)
-    alt_ft = st.slider("Altitude (ft)", 0, 12000, 3000, 100)
-    alt_m = alt_ft * 0.3048
-    st.metric("ρ (kg/m³)", f"{isa_density(alt_m):.3f}")
-
-    st.subheader("Flap Config")
-    flap = st.selectbox("Flaps", ["Clean", "Takeoff", "Landing"])
-    if flap == "Clean":
-        dCL0, stall_alpha_deg = 0.00, 16.0
-    elif flap == "Takeoff":
-        dCL0, stall_alpha_deg = 0.20, 14.0
-    else:
-        dCL0, stall_alpha_deg = 0.40, 12.0
-    CL0 = CL0_base + dCL0
-
-# ─────────────────────────── Controls & Modes ───────────────────────────
-with M:
-    st.subheader("Controls")
-    tas_kt = st.slider("True Airspeed (kt)", 50.0, 160.0, 100.0, 1.0)
-    tas_ms = tas_kt * 0.514444
-    thrust_max_N = st.slider("Max Thrust (N)", 1500, 6000, 3500, 50)
-    throttle = st.slider("Throttle (%)", 0, 100, 55, 1)
-    thrust = thrust_max_N * (throttle / 100)
-
-    phi_deg = st.slider("Bank φ (°)", -45.0, 45.0, 0.0, 0.5)
-    beta_deg = st.slider("Sideslip β (°)", -10.0, 10.0, 0.0, 0.5)
-    phi, beta = rad(phi_deg), rad(beta_deg)
-
-    mode = st.radio("Flight-Path Source", ["Manual ROC", "Physics solve γ"], horizontal=True)
-
-    # PID Autopilot
-    st.subheader("Autopilot (PID)")
-    ap_enable = st.checkbox("Enable PID", False)
-    ap_target_kind = st.selectbox("Hold target", ["AoA α (°)", "Flight Path γ (°)"])
-    target_val = st.slider("Target Value", -5.0, 15.0, 5.0, 0.1)
-    Kp = st.slider("Kp", 0.0, 2.0, 0.7, 0.05)
-    Ki = st.slider("Ki", 0.0, 1.0, 0.15, 0.01)
-    Kd = st.slider("Kd", 0.0, 1.0, 0.10, 0.01)
-
-    # Session init
-    if "history" not in st.session_state:
-        st.session_state.history = {k: [] for k in
-            ["t","alpha","gamma","pitch","roc","phi","beta","throttle"]}
-        st.session_state.t0 = time.time()
-        st.session_state.pid_int = 0.0
-        st.session_state.prev_err = 0.0
-
-    # Compute γ
-    if mode == "Manual ROC":
-        roc_fpm = st.slider("Rate of Climb (ft/min)", -1500, 1500, 500, 10)
-        gamma = fpa_from_roc(roc_fpm, tas_ms)
-    else:
-        gammas = np.radians(np.linspace(-10, 10, 401))
-        margins = []
-        for gtry in gammas:
-            _,_,_,marginN,_ = aero_solve_alpha_pitch(
-                mass_kg, tas_ms, alt_m, gtry, CL0, CLalpha, CD0, k, S, thrust, i_deg)
-            margins.append(marginN)
-        gamma = float(gammas[int(np.argmin(np.abs(margins)))])
-        roc_fpm = (tas_ms * math.sin(gamma)) / 0.00508
-
-    # Solve α, θ
-    alpha_rad, CL_req, D, margin_N, pitch_deg = aero_solve_alpha_pitch(
-        mass_kg, tas_ms, alt_m, gamma, CL0, CLalpha, CD0, k, S, thrust, i_deg)
-    alpha_deg, gamma_deg = deg(alpha_rad), deg(gamma)
-
-    # Load factor / effective stall
-    n = 1.0 / max(math.cos(phi), 1e-6)
-    eff_stall_alpha = stall_alpha_deg / n
-
-    # PID control
-    if ap_enable:
-        meas = alpha_deg if ap_target_kind.startswith("AoA") else gamma_deg
-        err = target_val - meas
-        dt = 0.1
-        st.session_state.pid_int += err * dt
-        deriv = (err - st.session_state.prev_err) / dt
-        u = Kp * err + Ki * st.session_state.pid_int + Kd * deriv
-        st.session_state.prev_err = err
-        if ap_target_kind.startswith("AoA"):
-            throttle = clamp(throttle + u * 5.0, 0, 100)
-            thrust = thrust_max_N * (throttle / 100)
-        else:
-            if mode == "Manual ROC":
-                roc_fpm = int(clamp(roc_fpm + u * 100.0, -2000, 2000))
-                gamma = fpa_from_roc(roc_fpm, tas_ms)
-            else:
-                throttle = clamp(throttle + u * 5.0, 0, 100)
-                thrust = thrust_max_N * (throttle / 100)
-        alpha_rad, CL_req, D, margin_N, pitch_deg = aero_solve_alpha_pitch(
-            mass_kg, tas_ms, alt_m, gamma, CL0, CLalpha, CD0, k, S, thrust, i_deg)
-        alpha_deg, gamma_deg = deg(alpha_rad), deg(gamma)
-
-    # Warnings
-    warn = ""
-    if alpha_deg >= eff_stall_alpha:
-        warn = f"⚠️ STALL α={alpha_deg:.1f}° ≥ αₛ {eff_stall_alpha:.1f}° (n={n:.2f})"
-    elif eff_stall_alpha - alpha_deg < 3:
-        warn = f"⚠️ Low stall margin {eff_stall_alpha - alpha_deg:.1f}° (n={n:.2f})"
-    if abs(beta_deg) > 6:
-        warn += " • High sideslip β"
-
-    # History
-    t = time.time() - st.session_state.t0
-    h = st.session_state.history
-    for k, v in [("t", t), ("alpha", alpha_deg), ("gamma", gamma_deg),
-                 ("pitch", pitch_deg), ("roc", roc_fpm),
-                 ("phi", phi_deg), ("beta", beta_deg), ("throttle", throttle)]:
-        h[k].append(v)
-        if len(h[k]) > 500:
-            h[k] = h[k][-500:]
-
-    # Readouts
-    st.subheader("Readouts")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("AoA α (°)", f"{alpha_deg:.2f}")
-    c2.metric("FPA γ (°)", f"{gamma_deg:.2f}")
-    c3.metric("Pitch θ (°)", f"{pitch_deg:.2f}")
-    c4.metric("ROC (ft/min)", f"{roc_fpm:.0f}")
-    st.caption(
-        f"n={n:.2f}  CL={CL_req:.3f}  D={D:,.0f} N  Margin={margin_N:,.0f} N  Throttle={throttle:.0f}%"
-    )
-    st.error(warn) if warn else st.success("Within normal envelope.")
-
-# ─────────────────────────── HUD (Royal Blue) ───────────────────────────
-with R:
-    st.subheader("HUD")
-    fig, ax = plt.subplots(figsize=(3.8, 3.8))
-    # sky / ground
-    ax.axhspan(0, 1, color=SKY)
-    ax.axhspan(-1, 0, color=EARTH)
-    # horizon
-    ax.plot([-1, 1], [0, 0], color=INK_L, lw=2)
-
-    # pitch ladder
-    for p in range(-20, 25, 5):
-        y = math.tan(rad(p)) / math.tan(rad(45))
-        if -1 < y < 1:
-            ax.plot([-0.25, 0.25], [y, y], color=INK_L, lw=2, alpha=0.9)
-            ax.text(0.3, y, f"{p}°", color=INK_L, fontsize=8, va="center")
-
-    # FPV (γ) — royal accent
-    y_fp = math.tan(rad(gamma_deg)) / math.tan(rad(45))
-    ax.plot(0, y_fp, marker="o", ms=9, mfc="none", mec=ROYAL, mew=2)
-    ax.text(0.02, y_fp + 0.04, "FPV", color=ROYAL, fontsize=9, va="bottom")
-
-    # Pitch bar (θ) — gold
-    y_pitch = math.tan(rad(pitch_deg)) / math.tan(rad(45))
-    ax.plot([-0.18, 0.18], [y_pitch, y_pitch], color=GOLD, lw=3)
-    ax.text(-0.35, y_pitch, "Pitch", color=GOLD, fontsize=9, va="center")
-
-    # AoA bracket — light ink
-    ax.plot([0.22, 0.22], [y_fp, y_pitch], color=INK_L, lw=2)
-    ax.text(0.24, (y_fp + y_pitch) / 2, f"α {alpha_deg:.1f}°", color=INK_L, fontsize=9, va="center")
-
-    # bank ticks + pointer
-    for b in [-30, -20, -10, 10, 20, 30]:
-        xb, yb = math.sin(rad(b)) * 0.7, math.cos(rad(b)) * 0.7
-        ax.plot([xb * 0.95, xb * 1.05], [yb * 0.95, yb * 1.05], color=INK_L, lw=2, alpha=0.9)
-    xb, yb = math.sin(phi) * 0.7, math.cos(phi) * 0.7
-    ax.plot([0, xb], [0, yb], color=INK_L, lw=2)
-
-    ax.set_xlim(-1, 1); ax.set_ylim(-1, 1); ax.axis("off")
-    st.pyplot(fig, clear_figure=True)
-
-# ─────────────────────────── Charts (Royal Blue) ───────────────────────────
-st.markdown("---")
-st.subheader("Dynamics (last 500 samples)")
-fig2, ax2 = plt.subplots(figsize=(8, 2.8))
-ax2.plot(h["t"], h["alpha"], label="α (°)")
-ax2.plot(h["t"], h["gamma"], label="γ (°)")
-ax2.plot(h["t"], h["pitch"], label="θ (°)")
-ax2.grid(True, alpha=0.35)
-ax2.legend(loc="upper right")
-st.pyplot(fig2, clear_figure=True)
-
-fig3, ax3 = plt.subplots(figsize=(8, 2.4))
-ax3.plot(h["t"], h["roc"], label="ROC (ft/min)")
-ax3.plot(h["t"], h["phi"], label="φ (°)")
-ax3.plot(h["t"], h["beta"], label="β (°)")
-ax3.grid(True, alpha=0.35)
-ax3.legend(loc="upper right")
-st.pyplot(fig3, clear_figure=True)
-
-# 3D Vectors (template already royal)
-st.subheader("3D Vectors (Body vs Flight Path)")
-theta, gamma = rad(pitch_deg), rad(gamma_deg)
-v_path = np.array([math.cos(gamma) * math.cos(beta), math.sin(beta), math.sin(gamma)])
-v_body = np.array([math.cos(theta), 0, math.sin(theta)])
-R_roll = np.array([[1, 0, 0],
-                   [0, math.cos(phi), -math.sin(phi)],
-                   [0, math.sin(phi),  math.cos(phi)]])
-v_body = R_roll @ v_body
-fig3d = go.Figure()
-fig3d.add_trace(go.Scatter3d(
-    x=[0, v_body[0]], y=[0, v_body[1]], z=[0, v_body[2]],
-    mode='lines+markers', name='Body Axis (θ, φ)',
-    line=dict(width=6, color=GOLD), marker=dict(size=4)
-))
-fig3d.add_trace(go.Scatter3d(
-    x=[0, v_path[0]], y=[0, v_path[1]], z=[0, v_path[2]],
-    mode='lines+markers', name='Flight Path (γ, β)',
-    line=dict(width=6, color=ROYAL), marker=dict(size=4)
-))
-fig3d.update_layout(
-    height=380, margin=dict(l=10, r=10, t=10, b=10),
-    scene=dict(xaxis_title='Forward', yaxis_title='Right', zaxis_title='Up')
-)
-st.plotly_chart(fig3d, use_container_width=True)
-
-# ─────────────────────────── Export Utilities ───────────────────────────
-st.markdown("---")
-st.subheader("📦 Export Utilities")
-
-def fig_to_png_bytes(figure):
-    buf = io.BytesIO()
-    figure.savefig(buf, format="png", dpi=300, bbox_inches="tight")
-    return buf.getvalue()
-
-# Matplotlib → PNG
-hud_png = fig_to_png_bytes(fig)
-dyn_png = fig_to_png_bytes(fig2)
-roc_png = fig_to_png_bytes(fig3)
-
-# CSV timeline
-df = pd.DataFrame({
-    "t_s": h["t"], "alpha_deg": h["alpha"], "gamma_deg": h["gamma"],
-    "pitch_deg": h["pitch"], "roc_fpm": h["roc"],
-    "bank_phi_deg": h["phi"], "sideslip_beta_deg": h["beta"],
-    "throttle_pct": h["throttle"]
-})
-csv_bytes = df.to_csv(index=False).encode("utf-8")
-
-# Plotly 3D exports (PNG/SVG require kaleido; HTML always works)
-plotly_png = None
-plotly_svg = None
+# ─────────────────────────────────────────────────────────
+# Optional LLM client (graceful fallback if no key present)
+# ─────────────────────────────────────────────────────────
+OPENAI_AVAILABLE = False
 try:
-    plotly_png = fig3d.to_image(format="png", scale=2)  # ↑resolution via scale
-    plotly_svg = fig3d.to_image(format="svg")
+    from openai import OpenAI
+    _client = OpenAI()  # requires env var OPENAI_API_KEY
+    OPENAI_AVAILABLE = True
 except Exception:
-    st.info("Kaleido not available: 3D PNG/SVG export disabled. (HTML export still available.)")
+    _client = None
+    OPENAI_AVAILABLE = False
 
-plotly_html = pio.to_html(fig3d, include_plotlyjs="cdn", full_html=True).encode("utf-8")
+# ─────────────────────────────────────────────────────────
+# NEW: Paper‑aligned helpers inlined (LLMAgent, CommsChannel, Safety Supervisor)
+# These are additive; original app logic is preserved intact below.
+# ─────────────────────────────────────────────────────────
+# (A) LLM agent and cost profile
+@dataclass
+class _CostProfile:
+    infer_power_W: float
+    extra_latency_ms: int
+    uplink_kbps: int
+    security_overhead_pct: float
 
-# Individual downloads
-c1, c2, c3 = st.columns(3)
-c1.download_button("📷 HUD (PNG)", hud_png, "hud_display.png", "image/png")
-c2.download_button("📉 Dynamics (PNG)", dyn_png, "angle_dynamics.png", "image/png")
-c3.download_button("📊 ROC/Bank (PNG)", roc_png, "roc_bank_chart.png", "image/png")
+def _llm_cost_profile(mode: str, secure: bool) -> _CostProfile:
+    if mode.startswith("Onboard"):
+        base = _CostProfile(infer_power_W=6.0, extra_latency_ms=90, uplink_kbps=32, security_overhead_pct=0.0)
+    elif mode == "Edge":
+        base = _CostProfile(infer_power_W=2.5, extra_latency_ms=140, uplink_kbps=256, security_overhead_pct=0.0)
+    else:  # Cloud
+        base = _CostProfile(infer_power_W=1.5, extra_latency_ms=220, uplink_kbps=384, security_overhead_pct=0.0)
+    if secure:
+        base.uplink_kbps = int(base.uplink_kbps * 1.12)
+        base.infer_power_W += 0.5
+    return base
 
-c4, c5, c6 = st.columns(3)
-c4.download_button("🌐 3D View (HTML, interactive)", plotly_html, "3d_vectors.html", "text/html")
-if plotly_png is not None:
-    c5.download_button("🖼️ 3D View (PNG)", plotly_png, "3d_vectors.png", "image/png")
-    c6.download_button("🖨️ 3D View (SVG)", plotly_svg, "3d_vectors.svg", "image/svg+xml")
+class _LLMAgent:
+    """Local stub tools that complement your existing advisor."""
+    def __init__(self, openai_client=None):
+        self.client = openai_client
+        self.memory = []
+
+    def redact(self, text: str) -> str:
+        return text.replace("(", "[").replace(")", "]")
+
+    def recommend_band(self, spectrum_summary: dict) -> str:
+        candidates = []
+        for band, st in spectrum_summary.items():
+            score = st["rate_mbps"] - 20.0*st["occ"] + (5.0 if st["snr_db"]>8 else 0.0)
+            candidates.append((score, band))
+        candidates.sort(reverse=True)
+        return candidates[0][1] if candidates else "2.4GHz"
+
+    def amend_route(self, waypoints):
+        if not waypoints: return waypoints
+        wps = waypoints[:]
+        if len(wps) >= 2:
+            x0,y0 = wps[0]; x1,y1 = wps[1]
+            wps[1] = ((x0+x1)/2.0, (y0+y1)/2.0)
+        return wps
+
+    def advise(self, params, telemetry, spectrum_state, secure=False):
+        band_hint = self.recommend_band(spectrum_state) if spectrum_state else None
+        note = f"Recommend band {band_hint}; smooth first leg; hold ΔT under 15°C if possible."
+        if secure: note = self.redact(note)
+        out = {"actions":[{"type":"BAND_SELECT","band":band_hint},
+                          {"type":"ROUTE_UPDATE","waypoints":"amended"}],
+               "note": note}
+        self.memory.append({"t": time.time(), "params": params, "telemetry": telemetry,
+                            "spectrum": spectrum_state, "out": out})
+        return out
+
+# (B) Spectrum sensing / sharing mini‑sim
+@dataclass
+class _BandState:
+    name: str
+    noise_bw_db: float
+    occupancy: float = 0.0
+    snr_db: float = 0.0
+    rate_mbps: float = 0.0
+
+class _CommsChannel:
+    """Simple per‑band occupancy + SNR + throughput model with optional jamming."""
+    def __init__(self, bands=("900MHz","2.4GHz","5.8GHz")):
+        base_noise = {"900MHz": -6.0, "2.4GHz": -3.0, "5.8GHz": 0.0}
+        self.bands = {b: _BandState(b, base_noise.get(b, -3.0)) for b in bands}
+        self.last_choice = None
+        self.loss_pct = 0.0
+
+    def step(self, ew_jam_db=0, traffic_mix=None, rho_ratio=1.0):
+        if traffic_mix is None:
+            traffic_mix = {"UAV":0.15, "Civ":0.35, "Other":0.20}
+        total_load = sum(traffic_mix.values())
+        for band, st in self.bands.items():
+            occ = max(0.0, min(1.0, st.occupancy + random.uniform(-0.05, 0.08) + 0.4*total_load))
+            st.occupancy = 0.7*st.occupancy + 0.3*occ
+            snr = 18.0 + st.noise_bw_db - 10.0*st.occupancy - 0.5*ew_jam_db + random.uniform(-1.0,1.0) + 0.5*(1.0-rho_ratio)*10
+            st.snr_db = snr
+            eff = max(0.2, 1.0 - 0.6*st.occupancy)
+            st.rate_mbps = max(0.0, eff * 2.5 * math.log2(1.0 + 10**(snr/10.0)))
+        self.loss_pct = 0.0
+        if self.last_choice and self.last_choice in self.bands:
+            b = self.bands[self.last_choice]
+            self.loss_pct = max(0.0, 35.0 - b.snr_db) * 0.6 + 40.0*b.occupancy
+
+    def pick_band(self, policy="greedy", hint=None):
+        if policy == "llm" and isinstance(hint, str) and hint in self.bands:
+            self.last_choice = hint
+            return hint
+        best = None; score_best = -1e9
+        for name, st in self.bands.items():
+            stick = 0.5 if name == self.last_choice else 0.0
+            score = st.rate_mbps - 0.2*(100.0*st.occupancy) + stick
+            if score > score_best:
+                best, score_best = name, score
+        self.last_choice = best
+        return best
+
+    def summary(self):
+        return {name: dict(occ=round(st.occupancy,2), snr_db=round(st.snr_db,1),
+                           rate_mbps=round(st.rate_mbps,2)) for name, st in self.bands.items()}
+
+# (C) Safety supervisor
+def _check_actions(actions, vehicle_state, rules):
+    approved, rejected = [], []
+    min_reserve = rules.get("min_reserve_min", 6.0)
+    max_alt = rules.get("max_alt_m", 120)
+    require_link = rules.get("require_link", True)
+    link_ok = vehicle_state.get("link_ok", True)
+
+    for a in actions or []:
+        reason = None
+        if a.get("type") == "ALTITUDE_CHANGE":
+            target = vehicle_state.get("altitude_m", 0) + int(a.get("delta_m",0))
+            if target > max_alt: reason = f"Altitude {target} m exceeds {max_alt} m."
+        if a.get("type") == "BAND_SELECT" and require_link and not link_ok:
+            reason = "Comms link unstable—band switch deferred."
+        if a.get("type") == "WAYPOINT_PUSH" and vehicle_state.get("endurance_min",0) < min_reserve:
+            reason = "Below endurance reserve; reject new leg."
+        (rejected if reason else approved).append({**a, **({"rejected_because":reason} if reason else {})})
+    return approved, rejected
+
+# ─────────────────────────────────────────────────────────
+# Streamlit header / UX helpers
+# ─────────────────────────────────────────────────────────
+st.set_page_config(page_title='UAV Battery Efficiency Estimator', layout='centered')
+
+# Mobile-friendly: auto-select input text on focus for quick edits
+st.markdown("""
+    <script>
+    const inputs = window.parent.document.querySelectorAll('input');
+    inputs.forEach(el => el.addEventListener('focus', function(){ this.select(); }));
+    </script>
+""", unsafe_allow_html=True)
+
+# Title (digital green)
+st.markdown("<h1 style='color:#00FF00;'>UAV Battery Efficiency Estimator</h1>", unsafe_allow_html=True)
+st.caption("GPT-UAV Planner | Built by Tareq Omrani | 2025")
+
+def numeric_input(label: str, default: float) -> float:
+    """Mobile-friendly numeric input with default fallback and validation."""
+    val_str = st.text_input(label, value=str(default))
+    if val_str.strip() == "":
+        return default
+    try:
+        return float(val_str)
+    except ValueError:
+        st.error(f"Please enter a valid number for {label}. Using default {default}.")
+        return default
+
+# ─────────────────────────────────────────────────────────
+# NEW: Paper‑aligned sidebar toggles
+# ─────────────────────────────────────────────────────────
+with st.sidebar:
+    st.header("LLM & Comms")
+    enable_llm_agent = st.checkbox("Enable LLM Agent Layer", value=True)
+    compute_mode = st.radio("Compute Mode", ["Onboard (tiny)", "Edge", "Cloud"], index=0,
+                            help="Where inference runs and its power/latency/bandwidth costs.")
+    enable_spectrum = st.checkbox("Enable Spectrum Sensing/Sharing", value=True)
+    ew_jam_db = st.slider("EW/Jam Level (dB)", 0, 40, 8,
+                          help="Adds interference into selected bands, reducing SNR and rate.")
+    secure_telemetry = st.checkbox("Secure Telemetry (Encrypt+Redact)", value=False,
+                                   help="Adds bitrate/power overhead and scrubs PII in LLM outputs.")
+    enable_supervisor = st.checkbox("Enable Safety Supervisor", value=True,
+                                    help="Gates LLM/swarm actions against envelopes, reserves, geofences.")
+    st.caption("These toggles add spectrum sharing, edge/cloud tradeoffs, a safety supervisor, "
+               "and an LLM agent layer—matching the paper’s focus areas.")
+
+# ─────────────────────────────────────────────────────────
+# NEW: Detectability model (AI/IR) helpers
+# ─────────────────────────────────────────────────────────
+def _clamp01(x: float) -> float:
+    return max(0.0, min(1.0, x))
+
+def _risk_bucket(score: float):
+    if score < 33:
+        return ("Low", "success", "#0f9d58")
+    elif score < 67:
+        return ("Moderate", "warning", "#f4b400")
+    else:
+        return ("High", "error", "#db4437")
+
+def _badge(label: str, score: float, bg: str) -> str:
+    return (
+        f"<span style='display:inline-block;padding:6px 10px;margin-right:8px;"
+        f"border-radius:8px;background:{bg};color:#fff;font-weight:600;"
+        f"font-size:13px;white-space:nowrap;'>{label}: {score:.0f}/100</span>"
+    )
+
+def compute_ai_ir_scores(delta_T: float, altitude_m: float, cloud_cover: int,
+                         speed_kmh: float, gustiness: int, stealth_factor: float,
+                         drone_type: str, power_system: str) -> Tuple[float, float]:
+    # AI visual detectability
+    alt_term = 1.0 - min(0.80, altitude_m / 800.0)
+    speed_term = min(1.0, speed_kmh / 60.0) * 0.25
+    type_bonus = 0.15 if drone_type == "rotor" else 0.07
+    gust_term = min(0.15, (gustiness / 10.0) * 0.15)
+    cloud_factor = 1.0 - 0.25 * (cloud_cover / 100.0)
+    stealth_k = 1.0 - max(0.0, (stealth_factor - 1.0) * 0.15)
+    ai_raw = (0.55 * alt_term) + (0.15 * type_bonus) + (0.10 * speed_term) + (0.05 * gust_term)
+    ai_score = 100.0 * _clamp01(ai_raw * cloud_factor * stealth_k)
+
+    # IR thermal detectability
+    delta_norm = _clamp01(delta_T / 22.0)
+    alt_atten = 1.0 - min(0.60, (altitude_m / 1200.0) * 0.60)
+    cloud_attn = 1.0 - 0.30 * (cloud_cover / 100.0)
+    ice_bias = 0.10 if power_system == "ICE" else 0.00
+    stealth_k2 = 1.0 - max(0.0, (stealth_factor - 1.0) * 0.10)
+    ir_raw = (0.70 * delta_norm) + ice_bias
+    ir_score = 100.0 * _clamp01(ir_raw * alt_atten * cloud_attn * stealth_k2)
+
+    return ai_score, ir_score
+
+def render_detectability_alert(ai_score: float, ir_score: float) -> Tuple[str, str]:
+    ai_label, _, ai_bg = _risk_bucket(ai_score)
+    ir_label, _, ir_bg = _risk_bucket(ir_score)
+    overall_kind = "error" if "High" in (ai_label, ir_label) else ("warning" if "Moderate" in (ai_label, ir_label) else "success")
+    badges = (
+        "<div style='margin:6px 0;'>"
+        f"{_badge(f'AI Visual • {ai_label}', ai_score, ai_bg)}"
+        f"{_badge(f'IR Thermal • {ir_label}', ir_score, ir_bg)}"
+        "</div>"
+    )
+    return overall_kind, badges
+
+# ─────────────────────────────────────────────────────────
+# Physics helpers (aerospace-grade)
+# ─────────────────────────────────────────────────────────
+RHO0 = 1.225       # kg/m^3 sea-level
+P0   = 101325.0    # Pa
+T0K  = 288.15      # K
+LAPSE= 0.0065      # K/m
+R_AIR= 287.05
+G0   = 9.80665
+SIGMA= 5.670374419e-8  # W/m^2K^4
+
+# Global realism constants
+USABLE_BATT_FRAC  = 0.85
+USABLE_FUEL_FRAC  = 0.90
+DISPATCH_RESERVE  = 0.30  # 30% reserve on time/energy
+HOTEL_W_DEFAULT   = 15.0  # avionics/radio/CPU baseline
+INSTALL_FRAC_DEF  = 0.15  # installation/trim losses on aero polar
+
+def air_density(alt_m: float, sea_level_temp_C: float = 15.0) -> float:
+    """ISA troposphere density (up to ~11 km)."""
+    T0 = sea_level_temp_C + 273.15
+    if alt_m < 0: alt_m = 0.0
+    T  = max(1.0, T0 - LAPSE * alt_m)
+    p  = P0 * (1.0 - (LAPSE*alt_m)/T0) ** (G0/(R_AIR*LAPSE))
+    return p/(R_AIR*T)
+
+def density_ratio(alt_m: float, sea_level_temp_C: float = 15.0) -> Tuple[float, float]:
+    rho = air_density(alt_m, sea_level_temp_C)
+    return rho, rho / RHO0
+
+def rotorcraft_density_scale(rho_ratio: float) -> float:
+    """Ideal induced-power scaling for rotors: P_induced ∝ 1/sqrt(ρ)."""
+    return 1.0 / max(0.3, math.sqrt(max(1e-4, rho_ratio)))
+
+def drag_polar_cd(cd0: float, cl: float, e: float, aspect_ratio: float) -> float:
+    k = 1.0 / (math.pi * max(0.3, e) * max(2.0, aspect_ratio))
+    return cd0 + k * (cl ** 2)
+
+def aero_power_required_W(weight_N: float, rho: float, V_ms: float,
+                          wing_area_m2: float, cd0: float, e: float,
+                          wingspan_m: float, prop_eff: float) -> float:
+    """Shaft power required using drag polar + dynamic pressure."""
+    V_ms = max(1.0, V_ms)
+    q = 0.5 * rho * V_ms * V_ms
+    cl = weight_N / (q * max(1e-6, wing_area_m2))
+    AR = (wingspan_m ** 2) / max(1e-6, wing_area_m2)
+    cd = drag_polar_cd(cd0, cl, e, AR)
+    D = q * wing_area_m2 * cd
+    return (D * V_ms) / max(0.3, prop_eff)
+
+def realistic_fixedwing_power(weight_N, rho, V_ms,
+                              wing_area_m2, wingspan_m,
+                              cd0, e, prop_eff,
+                              hotel_W=HOTEL_W_DEFAULT, install_frac=INSTALL_FRAC_DEF,
+                              payload_drag_delta=0.0) -> float:
+    """Bounded aero + hotel + installation/trim losses for fixed-wing battery draw."""
+    CD0   = max(0.05, cd0 + max(0.0, payload_drag_delta))
+    E_OSW = min(0.70, e)
+    ETA_P = min(0.65, max(0.55, prop_eff))
+    P_polar = aero_power_required_W(weight_N, rho, V_ms, wing_area_m2, CD0, E_OSW, wingspan_m, ETA_P)
+    return hotel_W + (1.0 + install_frac) * P_polar
+
+def gust_penalty_fraction(gustiness_index: int,
+                          wind_kmh: float,
+                          V_ms: float,
+                          wing_loading_Nm2: float) -> float:
+    """
+    Nonlinear gust penalty. Heavier penalty for low wing-loading and strong gusts.
+    Returns fractional increase in power draw (0.0 .. 0.35).
+    """
+    gust_ms = max(0.0, 0.6 * float(gustiness_index))  # 0..6 m/s from slider 0..10
+    V_ms = max(3.0, V_ms)
+    WL = max(25.0, wing_loading_Nm2)
+    WL_ref = 70.0  # typical small fixed-wing WL
+    base = 1.5 * (gust_ms / V_ms) ** 2 * (WL_ref / WL) ** 0.7
+    wind_ms = max(0.0, wind_kmh / 3.6)
+    bias = 0.03 * (wind_ms / 8.0)
+    frac = max(0.0, min(0.35, base + bias))
+    return frac
+
+def heading_range_km(V_air_ms: float, W_ms: float, t_min: float) -> Tuple[float,float]:
+    """Return (best_km, worst_km). Worst=0 if upwind infeasible (W ≥ V_air)."""
+    t_h = max(0.0, t_min) / 60.0
+    if V_air_ms <= 0.1:
+        return (0.0, 0.0)
+    if W_ms >= V_air_ms:
+        return ((V_air_ms + W_ms) * t_h / 1000.0, 0.0)
+    worst = (V_air_ms - W_ms) * t_h / 1000.0
+    best  = (V_air_ms + W_ms) * t_h / 1000.0
+    return (best, worst)
+
+SIGMA  # keep symbol for readability (already defined)
+
+def convective_radiative_deltaT(Q_w: float, surface_area_m2: float, emissivity: float,
+                                ambient_C: float, rho: float, V_ms: float) -> float:
+    """
+    Robust thermal model:
+    - Q_w is waste heat in watts (all electrical + avionics eventually → heat).
+    - Convection: conservative floor; scales with ρ and V.
+    - Radiation: linearized effective sink near ambient.
+    """
+    if Q_w <= 0.0 or surface_area_m2 <= 0.0 or emissivity <= 0.0:
+        return 0.0
+    V_ms = max(0.5, V_ms)
+    h = max(6.0, 10.45 - V_ms + 10 * math.sqrt(V_ms)) * (rho / RHO0)  # W/m²K
+    T_ambK = ambient_C + 273.15
+    rad_coeff = 4.0 * emissivity * SIGMA * (T_ambK ** 3)  # W/m²K
+    sink_W_per_K = (h + rad_coeff) * surface_area_m2
+    dT = Q_w / max(1.0, sink_W_per_K)
+    return max(0.2, dT)
+
+def climb_energy_wh(total_mass_kg: float, climb_m: float) -> float:
+    """Battery: m g h converted to Wh (1 Wh = 3600 J)."""
+    if climb_m <= 0: return 0.0
+    return (total_mass_kg * 9.81 * climb_m) / 3600.0
+
+def bsfc_fuel_burn_lph(power_W: float, bsfc_gpkwh: float, fuel_density_kgpl: float) -> float:
+    """ICE: fuel burn (L/h) from shaft power and BSFC."""
+    fuel_kg_per_h = (bsfc_gpkwh / 1000.0) * (power_W / 1000.0)
+    return fuel_kg_per_h / max(0.5, fuel_density_kgpl)
+
+def climb_fuel_liters(total_mass_kg: float, climb_m: float,
+                      bsfc_gpkwh: float, fuel_density_kgpl: float) -> float:
+    """ICE: convert m g h to required fuel via BSFC (kWh)."""
+    if climb_m <= 0: return 0.0
+    E_kWh = (total_mass_kg * 9.81 * climb_m) / 3_600_000.0
+    fuel_kg = (bsfc_gpkwh / 1000.0) * E_kWh
+    return fuel_kg / max(0.5, fuel_density_kgpl)
+
+# ─────────────────────────────────────────────────────────
+# UAV profiles (FULL SET)
+# ─────────────────────────────────────────────────────────
+UAV_PROFILES: Dict[str, Dict[str, Any]] = {
+    # ——— Small multirotors / COTS ———
+    "Generic Quad": {
+        "type": "rotor",
+        "max_payload_g": 800, "base_weight_kg": 1.2,
+        "power_system": "Battery", "draw_watt": 150, "battery_wh": 60,
+        "rotor_WL_proxy": 45.0,
+        "ai_capabilities": "Basic flight stabilization, waypoint navigation",
+        "crash_risk": False
+    },
+    "DJI Phantom": {
+        "type": "rotor",
+        "max_payload_g": 500, "base_weight_kg": 1.4,
+        "power_system": "Battery", "draw_watt": 120, "battery_wh": 68,
+        "rotor_WL_proxy": 50.0,
+        "ai_capabilities": "Visual object tracking, return-to-home, autonomous mapping",
+        "crash_risk": False
+    },
+    "Skydio 2+": {
+        "type": "rotor",
+        "max_payload_g": 150, "base_weight_kg": 0.8,
+        "power_system": "Battery", "draw_watt": 90, "battery_wh": 45,
+        "rotor_WL_proxy": 40.0,
+        "ai_capabilities": "Full obstacle avoidance, visual SLAM, autonomous following",
+        "crash_risk": False
+    },
+    "Freefly Alta 8": {
+        "type": "rotor",
+        "max_payload_g": 9000, "base_weight_kg": 6.2,
+        "power_system": "Battery", "draw_watt": 400, "battery_wh": 710,
+        "rotor_WL_proxy": 60.0,
+        "ai_capabilities": "Autonomous camera coordination, precision loitering",
+        "crash_risk": False
+    },
+
+    # ——— Small tactical / fixed-wing ———
+    "RQ-11 Raven": {
+        "type": "fixed",
+        "max_payload_g": 0, "base_weight_kg": 1.9,
+        "power_system": "Battery", "draw_watt": 90, "battery_wh": 400,
+        "wing_area_m2": 0.24, "wingspan_m": 1.4,
+        "cd0": 0.035, "oswald_e": 0.75, "prop_eff": 0.72,
+        "ai_capabilities": "Auto-stabilized flight, limited route autonomy",
+        "crash_risk": False
+    },
+    "RQ-20 Puma": {
+        "type": "fixed",
+        "max_payload_g": 600, "base_weight_kg": 6.3,
+        "power_system": "Battery", "draw_watt": 180, "battery_wh": 600,
+        "wing_area_m2": 0.55, "wingspan_m": 2.8,
+        "cd0": 0.040, "oswald_e": 0.75, "prop_eff": 0.72,
+        "ai_capabilities": "AI-enhanced ISR mission planning, autonomous loitering",
+        "crash_risk": False
+    },
+    "Teal Golden Eagle": {
+        "type": "fixed",
+        "max_payload_g": 2000, "base_weight_kg": 2.2,
+        "power_system": "Battery", "draw_watt": 220, "battery_wh": 100,
+        "wing_area_m2": 0.30, "wingspan_m": 2.1,
+        "cd0": 0.045, "oswald_e": 0.74, "prop_eff": 0.70,
+        "ai_capabilities": "AI-driven ISR, edge-based visual classification, GPS-denied flight",
+        "crash_risk": True
+    },
+    "Quantum Systems Vector": {
+        "type": "fixed",
+        "max_payload_g": 1500, "base_weight_kg": 2.3,
+        "power_system": "Battery", "draw_watt": 160, "battery_wh": 150,
+        "wing_area_m2": 0.55, "wingspan_m": 2.8,
+        "cd0": 0.038, "oswald_e": 0.80, "prop_eff": 0.78,
+        "ai_capabilities": "Modular AI sensor pods, onboard geospatial intelligence, autonomous route learning",
+        "crash_risk": False
+    },
+
+    # ——— MALE class (ICE) ———
+    "MQ-1 Predator": {
+        "type": "fixed",
+        "max_payload_g": 204000, "base_weight_kg": 512,
+        "power_system": "ICE", "draw_watt": 650, "battery_wh": 150,
+        "wing_area_m2": 11.5, "wingspan_m": 14.8,
+        "cd0": 0.025, "oswald_e": 0.80, "prop_eff": 0.80,
+        "bsfc_gpkwh": 260.0, "fuel_density_kgpl": 0.72, "fuel_tank_l": 300.0,
+        "ai_capabilities": "Semi-autonomous surveillance, pattern-of-life analysis",
+        "crash_risk": True
+    },
+    "MQ-9 Reaper": {
+        "type": "fixed",
+        "max_payload_g": 1700000, "base_weight_kg": 2223,
+        "power_system": "ICE", "draw_watt": 800, "battery_wh": 200,
+        "wing_area_m2": 24.0, "wingspan_m": 20.0,
+        "cd0": 0.030, "oswald_e": 0.85, "prop_eff": 0.82,
+        "bsfc_gpkwh": 330.0, "fuel_density_kgpl": 0.80, "fuel_tank_l": 900.0,
+        "ai_capabilities": "Real-time threat detection, sensor fusion, autonomous target tracking",
+        "crash_risk": True
+    },
+
+    # ——— Sandbox / Custom ———
+    "Custom Build": {
+        "type": "rotor",
+        "max_payload_g": 1500, "base_weight_kg": 2.0,
+        "power_system": "Battery", "draw_watt": 180, "battery_wh": 150,
+        "rotor_WL_proxy": 50.0,
+        "ai_capabilities": "User-defined platform with configurable components",
+        "crash_risk": False
+    }
+}
+
+# ─────────────────────────────────────────────────────────
+# Debug toggles & model selection
+# ─────────────────────────────────────────────────────────
+debug_mode = st.checkbox("Enable Debug Mode")
+allow_pack_override = st.checkbox("Allow Battery Override (debug)", value=False) if debug_mode else False
+
+drone_model = st.selectbox("Drone Model", list(UAV_PROFILES.keys()))
+profile = UAV_PROFILES[drone_model]
+
+st.info(f"**AI Capabilities:** {profile.get('ai_capabilities','—')}")
+st.caption(f"Base weight: {profile['base_weight_kg']} kg — Max payload: {profile['max_payload_g']} g")
+st.caption(f"Power system: `{profile['power_system']}` | Type: `{profile['type']}`")
+
+# Dynamic flight modes:
+# - Fixed-wing: Forward Flight, Loiter, Waypoint Mission (no Hover)
+# - Rotor/VTOL: Hover, Forward Flight, Loiter, Waypoint Mission
+if profile["type"] == "fixed":
+    flight_mode_options = ["Forward Flight", "Loiter", "Waypoint Mission"]
 else:
-    c5.write(" "); c6.write(" ")
+    flight_mode_options = ["Hover", "Forward Flight", "Loiter", "Waypoint Mission"]
 
-# ZIP bundle of all exports
-zip_buf = io.BytesIO()
-with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-    zf.writestr("aoa_visualizer_timeline.csv", csv_bytes)
-    zf.writestr("hud_display.png", hud_png)
-    zf.writestr("angle_dynamics.png", dyn_png)
-    zf.writestr("roc_bank_chart.png", roc_png)
-    zf.writestr("3d_vectors.html", plotly_html)
-    if plotly_png is not None:
-        zf.writestr("3d_vectors.png", plotly_png)
-        zf.writestr("3d_vectors.svg", plotly_svg)
+# ─────────────────────────────────────────────────────────
+# Main form
+# ─────────────────────────────────────────────────────────
+with st.form("uav_form"):
+    st.subheader("Flight Parameters")
+    battery_capacity_wh = numeric_input("Battery Capacity (Wh)", float(profile.get("battery_wh", 100.0)))
+    payload_weight_g    = int(numeric_input("Payload (g)", min( max(0, int(profile["max_payload_g"]*0.5)), profile["max_payload_g"] )))
+    flight_speed_kmh    = numeric_input("Speed (km/h)", 30.0)
+    wind_speed_kmh      = numeric_input("Wind (km/h)", 10.0)
+    temperature_c       = numeric_input("Temperature (°C)", 25.0)
+    altitude_m          = int(numeric_input("Altitude (m)", 0))
+    elevation_gain_m    = int(numeric_input("Elevation Gain (m)", 0))
+    flight_mode         = st.selectbox("Flight Mode", flight_mode_options)
+    cloud_cover         = st.slider("Cloud Cover (%)", 0, 100, 50)
+    gustiness           = st.slider("Gust Factor", 0, 10, 2)
+    terrain_penalty     = st.slider("Terrain Complexity", 1.0, 1.5, 1.1)
+    stealth_drag_penalty= st.slider("Stealth Drag Factor", 1.0, 1.5, 1.0)
+    simulate_failure    = st.checkbox("Enable Failure Simulation")
 
-st.download_button("⬇️ Download ZIP (Charts + 3D + CSV)",
-                   data=zip_buf.getvalue(),
-                   file_name="aoa_visualizer_exports.zip",
-                   mime="application/zip")
+    # ICE panel (only for MQ-1 / MQ-9 classes)
+    ice_params = None
+    if profile["power_system"] == "ICE":
+        st.markdown("### Aerospace Model (ICE-only)")
+        fuel_tank_l       = numeric_input("Fuel Tank (L)", float(profile.get("fuel_tank_l", 300.0)))
+        cd0               = numeric_input("C_D0 (parasite)", float(profile.get("cd0", 0.025)))
+        wing_area_m2      = numeric_input("Wing Area S (m²)", float(profile.get("wing_area_m2", 11.5)))
+        wingspan_m        = numeric_input("Wingspan b (m)", float(profile.get("wingspan_m", 14.8)))
+        oswald_e          = numeric_input("Oswald e", float(profile.get("oswald_e", 0.80)))
+        prop_eff          = numeric_input("Propulsive η_p", float(profile.get("prop_eff", 0.80)))
+        bsfc_gpkwh        = numeric_input("BSFC (g/kWh)", float(profile.get("bsfc_gpkwh", 260.0)))
+        fuel_density_kgpl = numeric_input("Fuel Density (kg/L)", float(profile.get("fuel_density_kgpl", 0.72)))
+        hybrid_assist     = st.checkbox("Enable Hybrid Assist (experimental)")
+        assist_fraction   = st.slider("Assist Fraction", 0.05, 0.30, 0.10, step=0.01)
+        assist_duration_min = st.slider("Assist Duration (minutes)", 1, 30, 10)
 
-# ─────────────────────────── Notes ───────────────────────────
-st.caption("""
-**Model:** γ = asin(ROC/V). α ≈ θ − γ − i. In Physics mode, γ solves (T − D − W·sinγ) ≈ 0
-with L ≈ W·cosγ. Bank adds load factor n = 1/cosφ, reducing effective stall α. Sideslip β is visualized
-(for training) but not coupled into forces (to keep concepts clear). PID trims throttle or ROC to hold α or γ.
-All plots export as PNG; 3D exports as HTML universally, and PNG/SVG when Kaleido is present.
-""")
+        ice_params = dict(
+            fuel_tank_l=fuel_tank_l, wing_area_m2=wing_area_m2, wingspan_m=wingspan_m,
+            cd0=cd0, oswald_e=oswald_e, prop_eff=prop_eff,
+            bsfc_gpkwh=bsfc_gpkwh, fuel_density_kgpl=fuel_density_kgpl,
+            hybrid_assist=hybrid_assist, assist_fraction=assist_fraction,
+            assist_duration_min=assist_duration_min
+        )
+
+    submitted = st.form_submit_button("Estimate")
+
+# ─────────────────────────────────────────────────────────
+# Swarm & Stealth controls + Waypoints
+# ─────────────────────────────────────────────────────────
+st.markdown("### Swarm & Stealth")
+swarm_enable      = st.checkbox("Enable Swarm Advisor", value=True)
+swarm_size        = st.slider("Swarm Size", 2, 8, 3)
+swarm_steps       = st.slider("Swarm Conversation Rounds", 1, 5, 2)
+stealth_ingress   = st.checkbox("Enable Stealth Ingress Mode", value=True)
+threat_zone_km    = st.slider("Threat Zone Radius (km)", 1.0, 20.0, 5.0)
+
+with st.expander("Mission Waypoints"):
+    st.caption("Enter waypoints as (x,y) km coordinates relative to origin.")
+    waypoint_str = st.text_area("Waypoints (e.g., 2,2; 5,0; 8,-3)", "2,2; 5,0; 8,-3")
+
+waypoints = []
+try:
+    for pair in waypoint_str.split(";"):
+        x_str, y_str = pair.split(",")
+        waypoints.append((float(x_str.strip()), float(y_str.strip())))
+except Exception:
+    st.error("Invalid waypoint format. Using (0,0).")
+    waypoints = [(0.0, 0.0)]
+
+# ─────────────────────────────────────────────────────────
+# LLM Mission Advisor
+# ─────────────────────────────────────────────────────────
+def generate_llm_advice(params):
+    if not OPENAI_AVAILABLE:
+        return ("LLM unavailable — heuristic advice:\n"
+                "- Reduce payload for longer endurance.\n"
+                "- Lower altitude or speed in gusty winds.\n"
+                "- Use hybrid assist during ingress to cut IR.\n"
+                "- Loiter under cloud where possible.")
+    prompt = f"""
+You are an aerospace UAV mission planner. Provide 3–5 short recommendations.
+
+Parameters:
+- Drone: {params['drone']}
+- Payload: {params['payload_g']} g
+- Mode: {params['mode']}
+- Speed: {params['speed_kmh']} km/h
+- Altitude: {params['alt_m']} m
+- Wind: {params['wind_kmh']} km/h (gust {params['gust']})
+- Dispatchable Endurance: {params['endurance_min']:.1f} min
+- Thermal ΔT: {params['delta_T']:.1f} °C
+- Fuel context: {params['fuel_l']}
+- Hybrid assist: {params.get('hybrid_assist', False)} (fraction={params.get('assist_fraction',0):.2f}, duration={params.get('assist_duration_min',0)} min)
+
+Be concise, bullet style.
+"""
+    try:
+        resp = _client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"system","content":"You are a precise UAV mission advisor."},
+                      {"role":"user","content":prompt}],
+            temperature=0.35, max_tokens=260
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception:
+        return ("LLM error — heuristic advice:\n"
+                "- Fly near best-endurance speed.\n"
+                "- Descend 100–200 m if gusts rise.\n"
+                "- Engage assist only in high-threat sectors.")
+
+# ─────────────────────────────────────────────────────────
+# Swarm (multi-agent) scaffolding
+# ─────────────────────────────────────────────────────────
+ALLOWED_ACTIONS = ["RTB","LOITER","HANDOFF_TRACK","RELOCATE","ALTITUDE_CHANGE","SPEED_CHANGE","RELAY_COMMS","STANDBY","HYBRID_ASSIST"]
+
+@dataclass
+class AgentState:
+    id: str
+    role: str
+    platform: str
+    endurance_min: float
+    battery_wh: float
+    fuel_l: float
+    speed_kmh: float
+    altitude_m: int
+    x_km: float
+    y_km: float
+    delta_T: float
+    hybrid_assist: bool = False
+    assist_fraction: float = 0.0
+    assist_time_min: float = 0.0
+    waypoints: Optional[list] = None
+    current_wp: int = 0
+    warning: str = ""
+
+def summarize_state(s: AgentState) -> Dict[str, Any]:
+    d = asdict(s).copy()
+    d.pop("waypoints", None)
+    return d
+
+def seed_swarm(n, base_endurance, base_batt_wh, delta_T, altitude_m, platform) -> List[AgentState]:
+    roles = ["LEAD","SCOUT","TRACKER","RELAY","STRIKER"]
+    out=[]
+    for i in range(n):
+        role=roles[i%len(roles)]
+        out.append(AgentState(
+            id=f"UAV_{i+1}", role=role, platform=platform,
+            endurance_min=float(random.uniform(0.7,1.1)*max(5.0, base_endurance)),
+            battery_wh=float(random.uniform(0.8,1.1)*max(10.0, base_batt_wh)),
+            fuel_l=float(random.uniform(70.0,200.0) if "MQ-" in platform else random.uniform(5.0,25.0)),
+            speed_kmh=float(random.uniform(25,40)), altitude_m=int(altitude_m+random.uniform(-20,20)),
+            x_km=float(random.uniform(-1,1)), y_km=float(random.uniform(-1,1)),
+            delta_T=float(delta_T*random.uniform(0.9,1.2))
+        ))
+    return out
+
+AGENT_SYSTEM_TMPL = """You are {role} for {uav_id}, a UAV swarm agent.
+Return STRICT JSON:
+- "message": short comms (<20 words)
+- "proposed_action": one of {allowed}
+- "params": dict (assist: {{"fraction":0-0.3,"duration_min":1-20}})
+- "confidence": 0-1 float
+Rules:
+- If endurance < 8 → prefer RTB/hand-off.
+- If threat_note='elevated' and platform is MQ-1/MQ-9 → consider HYBRID_ASSIST.
+"""
+
+LEAD_SYSTEM = """You are LEAD, the swarm orchestrator.
+Input: env + UAV states + proposals.
+Output STRICT JSON with:
+- "conversation": [{ "from":"...", "msg":"..." }]
+- "actions": [{ "uav_id":"...", "action":"...", "reason":"...", ...params }]
+Rules:
+- HYBRID_ASSIST only for MQ-1/MQ-9.
+- If stealth_ingress=true AND UAV inside threat_zone_km, prefer HYBRID_ASSIST (not all at once).
+- If low endurance, RTB over assist.
+"""
+
+def _safe_json(txt: str) -> Dict[str, Any]:
+    try:
+        return json.loads(txt)
+    except Exception:
+        s,e=txt.find("{"), txt.rfind("}")
+        return json.loads(txt[s:e+1])
+
+def agent_call(env: Dict[str,Any], s: AgentState) -> Dict[str, Any]:
+    if not OPENAI_AVAILABLE:
+        if env.get("threat_note")=="elevated" and ("MQ-1" in s.platform or "MQ-9" in s.platform):
+            return {"message":"Stealth assist on","proposed_action":"HYBRID_ASSIST","params":{"fraction":0.15,"duration_min":10},"confidence":0.7}
+        return {"message":"Loitering","proposed_action":"LOITER","params":{},"confidence":0.6}
+    sys = AGENT_SYSTEM_TMPL.format(role=s.role, uav_id=s.id, allowed=ALLOWED_ACTIONS)
+    payload = {"env": env, "self": summarize_state(s)}
+    try:
+        resp = _client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"system","content":sys},
+                      {"role":"user","content": json.dumps(payload, ensure_ascii=False)}],
+            temperature=0.2, max_tokens=220, response_format={"type":"json_object"}
+        )
+        return _safe_json(resp.choices[0].message.content)
+    except Exception:
+        return {"message":"Standby","proposed_action":"STANDBY","params":{},"confidence":0.5}
+
+def lead_call(env: Dict[str,Any], swarm: List[AgentState], proposals: Dict[str,Any]) -> Dict[str, Any]:
+    if not OPENAI_AVAILABLE:
+        actions=[]
+        for s in swarm:
+            prop = proposals.get(s.id,{})
+            act = prop.get("proposed_action","LOITER")
+            if act=="HYBRID_ASSIST" and ("MQ-1" in s.platform or "MQ-9" in s.platform):
+                actions.append({"uav_id":s.id,"action":"HYBRID_ASSIST","fraction":0.15,"duration_min":10,"reason":"Stealth ingress"})
+            elif s.endurance_min<8:
+                actions.append({"uav_id":s.id,"action":"RTB","reason":"Low endurance"})
+            else:
+                actions.append({"uav_id":s.id,"action":"LOITER","reason":"Holding"})
+        return {"conversation":[{"from":"LEAD","msg":"Fallback fusion active"}],"actions":actions}
+    packed = {"env": env,"swarm":[summarize_state(s) for s in swarm],"proposals": proposals,"allowed_actions": ALLOWED_ACTIONS}
+    try:
+        resp = _client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"system","content":LEAD_SYSTEM},
+                      {"role":"user","content": json.dumps(packed, ensure_ascii=False)}],
+            temperature=0.2, max_tokens=600, response_format={"type":"json_object"}
+        )
+        return _safe_json(resp.choices[0].message.content)
+    except Exception:
+        return {"conversation":[{"from":"LEAD","msg":"LLM error fallback"}],
+                "actions":[{"uav_id":s.id,"action":"LOITER","reason":"LLM error"} for s in swarm]}
+
+def apply_actions(swarm: List[AgentState], acts: List[Dict[str,Any]],
+                  stealth_ingress: bool, threat_zone_km: float) -> List[AgentState]:
+    def in_zone(s: AgentState) -> bool:
+        return (s.x_km**2 + s.y_km**2)**0.5 <= threat_zone_km
+    idx = {s.id: s for s in swarm}
+    for a in acts:
+        s = idx.get(a.get("uav_id"))
+        if not s: continue
+        act = a.get("action")
+        if act == "HYBRID_ASSIST" and ("MQ-1" in s.platform or "MQ-9" in s.platform):
+            frac = float(a.get("fraction",0.10)); dur = float(a.get("duration_min",8))
+            s.hybrid_assist=True; s.assist_fraction=frac; s.assist_time_min=dur
+            s.delta_T *= (1 - frac*0.7); s.fuel_l += 0.05*dur
+            s.warning = f"Hybrid Assist {frac*100:.0f}% for {dur:.0f} min"
+        elif act == "RTB":
+            s.warning="RTB ordered"; s.speed_kmh=max(15,s.speed_kmh)
+        elif act == "LOITER":
+            s.speed_kmh = max(10, s.speed_kmh*0.9)
+        elif act == "RELOCATE":
+            s.x_km += float(a.get("dx_km",0)); s.y_km += float(a.get("dy_km",0))
+        elif act == "ALTITUDE_CHANGE":
+            s.altitude_m += int(a.get("delta_m",0))
+        elif act == "SPEED_CHANGE":
+            s.speed_kmh += float(a.get("delta_kmh",0))
+        elif act == "RELAY_COMMS":
+            s.warning="Relay"
+        s.endurance_min = max(0, s.endurance_min - random.uniform(0.5, 1.5))
+    if stealth_ingress:
+        for s in swarm:
+            if ("MQ-1" in s.platform or "MQ-9" in s.platform) and in_zone(s) and not s.hybrid_assist:
+                s.hybrid_assist=True; s.assist_fraction=0.15; s.assist_time_min=10
+                s.delta_T *= (1 - 0.15*0.7); s.fuel_l += 0.5
+                s.warning="Auto Hybrid Assist (Stealth Ingress)"
+    return swarm
+
+def plot_swarm_map(swarm: List[AgentState], threat_zone_km: float,
+                   stealth_ingress: bool, waypoints=None):
+    fig, ax = plt.subplots(figsize=(5, 5))
+    if stealth_ingress:
+        circle = plt.Circle((0, 0), threat_zone_km, color='red', alpha=0.2, label="Threat Zone")
+        ax.add_patch(circle)
+    if waypoints:
+        xs, ys = zip(*waypoints)
+        ax.plot(xs, ys, "k--", linewidth=1, label="Mission Path")
+        ax.scatter(xs, ys, c="orange", marker="x", s=80, label="Waypoints")
+    for s in swarm:
+        color = "blue"; marker = "o"
+        if s.platform in ["MQ-1 Predator","MQ-9 Reaper"]: marker="s"; color="purple"
+        if s.hybrid_assist: color="green"
+        ax.scatter(s.x_km, s.y_km, c=color, marker=marker, s=100, label=s.id)
+        ax.text(s.x_km+0.2, s.y_km+0.2, f"{s.id}\nAlt {s.altitude_m}m\nΔT {s.delta_T:.1f}°C", fontsize=7)
+    ax.set_title("Swarm Mission Map")
+    ax.set_xlabel("X (km)"); ax.set_ylabel("Y (km)")
+    ax.axhline(0, color='grey', linewidth=0.5); ax.axvline(0, color='grey', linewidth=0.5)
+    handles, labels = ax.get_legend_handles_labels(); uniq = dict(zip(labels, handles))
+    ax.legend(uniq.values(), uniq.keys(), loc="upper right", fontsize=6)
+    ax.set_aspect('equal', adjustable='datalim')
+    return fig
+
+def clamp_battery(platform: Dict[str, Any], requested_wh: float, allow_override: bool) -> float:
+    nominal = float(platform.get("battery_wh", requested_wh))
+    if allow_override:
+        return max(0.0, requested_wh)
+    if requested_wh > nominal:
+        st.warning(f"Battery clamped to platform nominal: {nominal:.0f} Wh (requested {requested_wh:.0f} Wh).")
+    return max(0.0, min(requested_wh, nominal))
+
+# ─────────────────────────────────────────────────────────
+# Simulation + Results
+# ─────────────────────────────────────────────────────────
+if submitted:
+    try:
+        if payload_weight_g > profile["max_payload_g"]:
+            st.error("Payload exceeds lift capacity."); st.stop()
+
+        # Clamp battery unless override
+        if profile["power_system"] == "Battery":
+            battery_capacity_wh = clamp_battery(profile, battery_capacity_wh, allow_pack_override)
+
+        total_weight_kg = profile["base_weight_kg"] + (payload_weight_g / 1000.0)
+        start_batt_wh_for_gauge = battery_capacity_wh  # for correct % depletion visualization
+        V_ms = max(1.0, (flight_speed_kmh / 3.6))
+        rho, rho_ratio = density_ratio(altitude_m, temperature_c)
+        weight_N = total_weight_kg * 9.81
+        W_ms = max(0.0, wind_speed_kmh / 3.6)
+        use_ice_branch = profile["power_system"] == "ICE" and (ice_params is not None)
+
+        # Temperature derate for cells
+        if profile["power_system"] == "Battery":
+            if temperature_c < 15: battery_capacity_wh *= 0.90
+            elif temperature_c > 35: battery_capacity_wh *= 0.95
+            start_batt_wh_for_gauge = battery_capacity_wh  # update after temp derate
+
+        # Atmosphere & key factors
+        st.header("Atmospheric Conditions")
+        st.metric("Air Density ρ", f"{rho:.3f} kg/m³")
+        st.metric("Density Ratio ρ/ρ₀", f"{rho_ratio:.3f}")
+
+        st.header("Applied Environment Factors")
+        if profile["type"] == "rotor":
+            density_factor = rotorcraft_density_scale(rho_ratio)
+            st.markdown(f"**Air density factor:** `{rho_ratio:.3f}` (ρ/ρ₀)  —  **Rotor power factor:** `{density_factor:.3f}` (∝ 1/√ρ)")
+        else:
+            st.markdown(f"**Air density factor:** `{rho_ratio:.3f}` (ρ/ρ₀) — handled via lift/drag in aero model.")
+
+        # Shared, for detailed panel
+        detail: Dict[str, Any] = {
+            "drone_model": drone_model,
+            "type": profile["type"],
+            "power_system": profile["power_system"],
+            "payload_g": payload_weight_g,
+            "total_mass_kg": round(total_weight_kg, 3),
+            "weight_N": round(weight_N, 2),
+            "V_ms": round(V_ms, 3),
+            "W_ms": round(W_ms, 3),
+            "rho": round(rho, 4),
+            "rho_ratio": round(rho_ratio, 4),
+            "cloud_cover_%": cloud_cover,
+            "gustiness": gustiness,
+            "terrain_factor": terrain_penalty,
+            "stealth_drag_factor": stealth_drag_penalty,
+            "altitude_m": altitude_m,
+            "temperature_C": temperature_c,
+            "flight_mode": flight_mode
+        }
+
+        # ───────── ICE aerospace branch ─────────
+        if use_ice_branch:
+            # Aero power (bounded aero for realism)
+            CD0   = max(0.05, ice_params["cd0"])
+            E_OSW = min(0.70, ice_params["oswald_e"])
+            ETA_P = min(0.65, max(0.55, ice_params["prop_eff"]))
+            # Effective speed for Loiter (fixed-wing) — slower endurance speed
+            V_ms_eff = V_ms
+            if flight_mode == "Loiter":
+                V_ms_eff = max(8.0, 0.6 * V_ms)
+
+            P_req_W = aero_power_required_W(
+                weight_N=weight_N, rho=rho, V_ms=V_ms_eff,
+                wing_area_m2=ice_params["wing_area_m2"],
+                cd0=CD0, e=E_OSW,
+                wingspan_m=ice_params["wingspan_m"], prop_eff=ETA_P
+            )
+            # Maneuvering penalties by mission mode
+            if flight_mode == "Waypoint Mission":
+                P_req_W *= 1.05
+            elif flight_mode == "Loiter":
+                P_req_W *= 1.10
+
+            # Gust penalty via wing loading
+            WL = weight_N / max(0.05, ice_params["wing_area_m2"])
+            wind_penalty_frac = gust_penalty_fraction(gustiness, wind_speed_kmh, V_ms_eff, WL)
+            P_req_W *= (1.0 + wind_penalty_frac)
+
+            # Terrain/stealth penalties
+            P_req_W *= terrain_penalty * stealth_drag_penalty
+
+            # Add hotel load to shaft demand (electrical systems)
+            HOTEL_W = HOTEL_W_DEFAULT
+            P_total_W = P_req_W + HOTEL_W
+
+            # Fuel burn at total power
+            lph = bsfc_fuel_burn_lph(P_total_W, ice_params["bsfc_gpkwh"], ice_params["fuel_density_kgpl"])
+
+            # Climb fuel (mgh)
+            climb_L_val = climb_fuel_liters(total_weight_kg, max(0, elevation_gain_m),
+                                            ice_params["bsfc_gpkwh"], ice_params["fuel_density_kgpl"])
+
+            # Usable fuel fraction + reserve
+            usable_fuel_L_start = max(0.0, ice_params["fuel_tank_l"] * USABLE_FUEL_FRAC - max(0.0, climb_L_val))
+            usable_fuel_L = usable_fuel_L_start
+
+            # Optional hybrid assist (battery substitution for a slice of power)
+            if ice_params["hybrid_assist"]:
+                battery_support_Wh = profile.get("battery_wh", 200.0)
+                assist_power_W = P_total_W * ice_params["assist_fraction"]
+                assist_energy_Wh = assist_power_W * (ice_params["assist_duration_min"] / 60.0)
+                if assist_energy_Wh > battery_support_Wh:
+                    ice_params["assist_duration_min"] = (battery_support_Wh / max(1.0, assist_power_W)) * 60.0
+                    assist_energy_Wh = battery_support_Wh
+                # Fuel saved during assist
+                fuel_saved_L = bsfc_fuel_burn_lph(assist_power_W, ice_params["bsfc_gpkwh"], ice_params["fuel_density_kgpl"]) * (ice_params["assist_duration_min"] / 60.0)
+                usable_fuel_L += fuel_saved_L
+
+            raw_endurance_hr = usable_fuel_L / max(0.05, lph)
+            raw_endurance_min = raw_endurance_hr * 60.0
+            dispatch_endurance_min = raw_endurance_min * (1.0 - DISPATCH_RESERVE)
+
+            # Vector-wind ranges on dispatchable endurance
+            best_km, worst_km = heading_range_km(V_ms_eff, W_ms, dispatch_endurance_min)
+
+            # Thermal model (use total power as waste heat proxy)
+            Q_waste = P_total_W  # conservative
+            delta_T = convective_radiative_deltaT(Q_waste, 0.6, 0.85, temperature_c, rho, V_ms_eff)
+            delta_T *= (1.0 - (cloud_cover / 100.0) * 0.35)
+            if ice_params["hybrid_assist"] and ice_params["assist_duration_min"] > 0:
+                delta_T *= (1.0 - ice_params["assist_fraction"] * 0.3)
+
+            # ───────────────── Detectability Alert (ICE) ─────────────────
+            ai_score, ir_score = compute_ai_ir_scores(
+                delta_T=delta_T,
+                altitude_m=altitude_m,
+                cloud_cover=cloud_cover,
+                speed_kmh=flight_speed_kmh,
+                gustiness=gustiness,
+                stealth_factor=stealth_drag_penalty,
+                drone_type=profile["type"],
+                power_system=profile["power_system"]
+            )
+            overall_kind, badges_html = render_detectability_alert(ai_score, ir_score)
+            st.subheader("AI/IR Detectability Alert")
+            if overall_kind == "success":
+                st.success("Overall detectability: LOW")
+            elif overall_kind == "warning":
+                st.warning("Overall detectability: MODERATE")
+            else:
+                st.error("Overall detectability: HIGH")
+            st.markdown(badges_html, unsafe_allow_html=True)
+
+            # Detail panel fields (ICE)
+            detail.update({
+                "CD0_eff": CD0, "e_oswald_eff": E_OSW, "eta_prop_eff": ETA_P,
+                "wing_area_m2": ice_params["wing_area_m2"], "wingspan_m": ice_params["wingspan_m"],
+                "V_ms_effective": round(V_ms_eff,3),
+                "wing_loading_N_per_m2": round(WL,2),
+                "gust_penalty_frac": round(wind_penalty_frac,4),
+                "P_total_W": round(P_total_W,1), "BSFC_g_per_kWh": ice_params["bsfc_gpkwh"],
+                "fuel_density_kg_per_L": ice_params["fuel_density_kgpl"],
+                "fuel_burn_L_per_hr": round(lph,3),
+                "climb_fuel_L": round(climb_L_val,3),
+                "usable_fuel_L_start": round(usable_fuel_L_start,3),
+                "usable_fuel_L_after_assist": round(usable_fuel_L,3),
+                "raw_endurance_min": round(raw_endurance_min,2),
+            })
+
+            wind_penalty_pct = wind_penalty_frac * 100.0
+            climb_energy_Wh_value = None  # ICE uses liters
+            flight_time_minutes = dispatch_endurance_min
+            climb_L = climb_L_val
+
+            # ===== Total distance (km) for selected parameters (ICE) =====
+            total_distance_km = (flight_time_minutes / 60.0) * float(flight_speed_kmh)
+
+            # User-facing metrics (ICE)
+            st.subheader("Thermal & Fuel (ICE)")
+            st.metric("Total Power (shaft+hotel)", f"{P_total_W/1000:.2f} kW")
+            st.metric("Fuel Burn", f"{lph:.2f} L/hr")
+            st.metric("Usable Fuel (after climb/assist)", f"{usable_fuel_L:.2f} L")
+            st.metric("Thermal ΔT", f"{delta_T:.1f} °C")
+
+            # Simple live fuel sim (capped)
+            st.subheader("Live Simulation (Fuel)")
+            time_step = 10
+            total_steps = min(max(1, int(dispatch_endurance_min*60/time_step)), 240)
+            fuel_per_sec = lph/3600.0
+            progress=st.progress(0); status=st.empty(); gauge=st.empty(); timer=st.empty()
+            for step in range(total_steps+1):
+                elapsed=step*time_step
+                fuel_rem=max(0.0, usable_fuel_L_start - fuel_per_sec*elapsed)
+                pct=0.0 if usable_fuel_L_start<=0 else max(0.0, (fuel_rem/usable_fuel_L_start)*100.0)
+                bars=int(pct//10)
+                gauge.markdown(f"**Fuel Gauge:** `[{'|'*bars}{' '*(10-bars)}] {pct:.0f}%`")
+                remain=max(0.0, (dispatch_endurance_min*60)-elapsed)
+                timer.markdown(f"**Elapsed:** {elapsed} sec **Remaining:** {int(remain)} sec")
+                status.markdown(f"**Fuel Remaining:** {fuel_rem:.2f} L  **Burn:** {lph:.2f} L/hr  **V:** {flight_speed_kmh:.0f} km/h")
+                progress.progress(min(step/total_steps,1.0))
+                if fuel_rem<=0.0: break
+                time.sleep(0.02)
+
+        # ───────── Battery/Hybrid (global) ─────────
+        else:
+            if profile["type"] == "rotor":
+                # Rotorcraft: base draw scaled by mass & density + parasitic ~V^2
+                base_draw = profile.get("draw_watt", 180.0)
+                weight_factor = total_weight_kg / max(0.1, profile["base_weight_kg"])
+                density_factor = rotorcraft_density_scale(rho_ratio)  # √(ρ0/ρ)
+                V_term = 0.018 * (flight_speed_kmh ** 2)
+                total_draw = (base_draw * weight_factor * density_factor) + V_term
+                # Gust penalty (rotor WL proxy)
+                WL_proxy = float(profile.get("rotor_WL_proxy", 45.0))
+                wind_penalty_frac = gust_penalty_fraction(gustiness, wind_speed_kmh, V_ms, WL_proxy)
+                total_draw *= (1.0 + wind_penalty_frac)
+
+                # Mission penalties
+                if flight_mode == "Waypoint Mission":
+                    total_draw *= 1.05
+                elif flight_mode == "Loiter":
+                    total_draw *= 1.08  # mild extra load in steady circling
+                elif flight_mode == "Hover":
+                    total_draw *= 1.10  # small reserve for station-keeping
+
+                V_ref_ms = V_ms
+                ref_surface = 0.30
+                detail.update({
+                    "rotor_base_draw_W": base_draw,
+                    "weight_factor": round(weight_factor,3),
+                    "density_factor_rotor": round(density_factor,3),
+                    "V_parasitic_term_W": round(V_term,2),
+                    "WL_proxy": WL_proxy
+                })
+
+            else:
+                # Fixed-wing battery: bounded aero + hotel + install losses
+                wing_area_m2 = float(profile.get("wing_area_m2", 0.5))
+                wingspan_m   = float(profile.get("wingspan_m", 2.0))
+                cd0          = float(profile.get("cd0", 0.05))
+                e            = float(profile.get("oswald_e", 0.70))
+                prop_eff     = float(profile.get("prop_eff", 0.60))
+
+                # Loiter modeled as low-speed endurance setting
+                V_ms_eff = V_ms if flight_mode != "Loiter" else max(8.0, 0.6 * V_ms)
+
+                total_draw = realistic_fixedwing_power(
+                    weight_N=weight_N, rho=rho, V_ms=V_ms_eff,
+                    wing_area_m2=wing_area_m2, wingspan_m=wingspan_m,
+                    cd0=cd0, e=e, prop_eff=prop_eff,
+                    hotel_W=HOTEL_W_DEFAULT, install_frac=INSTALL_FRAC_DEF,
+                    payload_drag_delta=(0.002 if payload_weight_g > 0 else 0.0)
+                )
+                # Gust penalty via wing loading
+                WL = weight_N / max(0.05, wing_area_m2)
+                wind_penalty_frac = gust_penalty_fraction(gustiness, wind_speed_kmh, V_ms_eff, WL)
+                total_draw *= (1.0 + wind_penalty_frac)
+                # Mission penalties
+                if flight_mode == "Waypoint Mission":
+                    total_draw *= 1.05
+                elif flight_mode == "Loiter":
+                    total_draw *= 1.10
+
+                V_ref_ms = V_ms_eff
+                ref_surface = 0.35
+                detail.update({
+                    "wing_area_m2": wing_area_m2, "wingspan_m": wingspan_m,
+                    "cd0_eff": max(0.05, cd0 + (0.002 if payload_weight_g>0 else 0.0)),
+                    "e_oswald_eff": min(0.70, e),
+                    "eta_prop_eff": min(0.65, max(0.55, prop_eff)),
+                    "V_ms_effective": round(V_ms_eff,3),
+                    "wing_loading_N_per_m2": round(WL,2) if 'WL' in locals() else None
+                })
+
+            # Terrain & stealth
+            total_draw *= terrain_penalty * stealth_drag_penalty
+
+            # Climb/Descent energy for battery
+            climb_energy_Wh_value = 0.0
+            if elevation_gain_m > 0:
+                climb_energy_Wh_value = climb_energy_wh(total_weight_kg, elevation_gain_m)
+                battery_capacity_wh -= climb_energy_Wh_value
+            elif elevation_gain_m < 0:
+                recov = (total_weight_kg * 9.81 * abs(elevation_gain_m) / 3600.0) * 0.20
+                battery_capacity_wh += recov
+                detail["descent_recovery_Wh"] = round(recov,2)
+
+            # Usable energy + reserve
+            batt_temp_derated_Wh = battery_capacity_wh
+            usable_Wh = max(0.0, batt_temp_derated_Wh) * USABLE_BATT_FRAC
+            t_raw_min = (usable_Wh / max(5.0, total_draw)) * 60.0
+            dispatch_endurance_min = t_raw_min * (1.0 - DISPATCH_RESERVE)
+
+            # Vector wind ranges (based on V_ref_ms)
+            best_km, worst_km = heading_range_km(V_ref_ms, W_ms, dispatch_endurance_min)
+
+            # Thermal (waste heat = total draw + hotel)
+            Q_waste = total_draw + HOTEL_W_DEFAULT
+            delta_T = convective_radiative_deltaT(Q_waste, ref_surface, 0.90, temperature_c, rho, V_ref_ms)
+            delta_T *= (1.0 - (cloud_cover / 100.0) * 0.35)
+
+            # ───────────────── Detectability Alert (Battery) ─────────────────
+            ai_score, ir_score = compute_ai_ir_scores(
+                delta_T=delta_T,
+                altitude_m=altitude_m,
+                cloud_cover=cloud_cover,
+                speed_kmh=flight_speed_kmh,
+                gustiness=gustiness,
+                stealth_factor=stealth_drag_penalty,
+                drone_type=profile["type"],
+                power_system=profile["power_system"]
+            )
+            overall_kind, badges_html = render_detectability_alert(ai_score, ir_score)
+            st.subheader("AI/IR Detectability Alert")
+            if overall_kind == "success":
+                st.success("Overall detectability: LOW")
+            elif overall_kind == "warning":
+                st.warning("Overall detectability: MODERATE")
+            else:
+                st.error("Overall detectability: HIGH")
+            st.markdown(badges_html, unsafe_allow_html=True)
+
+            # Detail panel fields (Battery)
+            detail.update({
+                "total_draw_W": round(total_draw,1),
+                "wind_penalty_frac": round(wind_penalty_frac,4),
+                "terrain_x_stealth_factor": round(terrain_penalty*stealth_drag_penalty,3),
+                "climb_energy_Wh": round(climb_energy_Wh_value,2),
+                "battery_derated_Wh": round(batt_temp_derated_Wh,2),
+                "usable_battery_Wh": round(usable_Wh,2),
+                "raw_endurance_min": round(t_raw_min,2)
+            })
+
+            wind_penalty_pct = wind_penalty_frac * 100.0
+            flight_time_minutes = dispatch_endurance_min
+            climb_L = None
+
+            # ===== Total distance (km) for selected parameters (Battery) =====
+            total_distance_km = (flight_time_minutes / 60.0) * float(flight_speed_kmh)
+
+            # User-facing metrics (Battery)
+            st.subheader("Thermal Signature & Battery")
+            risk = 'Low' if delta_T < 10 else ('Moderate' if delta_T < 20 else 'High')
+            st.metric("Thermal Signature Risk", f"{risk} (ΔT = {delta_T:.1f}°C)")
+            st.metric("Total Draw (incl. hotel/penalties)", f"{total_draw:.0f} W")
+
+            # Simple live battery sim (capped) — percent uses starting Wh for correct gauge
+            st.subheader("Live Simulation (Battery)")
+            time_step=10
+            total_steps=min(max(1, int(dispatch_endurance_min*60/time_step)), 240)
+            battery_per_step=(total_draw*time_step)/3600
+            progress=st.progress(0); status=st.empty(); gauge=st.empty(); timer=st.empty()
+            for step in range(total_steps+1):
+                elapsed=step*time_step
+                batt_rem=start_batt_wh_for_gauge-(step*battery_per_step)
+                if batt_rem<=0:
+                    gauge.markdown(f"**Battery Gauge:** `[{' ' * 10}] 0%`")
+                    timer.markdown(f"**Elapsed:** {elapsed} sec **Remaining:** 0 sec")
+                    status.markdown(f"**Battery Remaining:** 0.00 Wh  **Power Draw:** {total_draw:.0f} W  **V:** {flight_speed_kmh:.0f} km/h")
+                    progress.progress(1.0); break
+                batt_pct=max(0,(batt_rem/start_batt_wh_for_gauge)*100)
+                bars=int(batt_pct//10)
+                gauge.markdown(f"**Battery Gauge:** `[{'|'*bars}{' '*(10-bars)}] {batt_pct:.0f}%`")
+                remain=max(0,(dispatch_endurance_min*60)-elapsed)
+                timer.markdown(f"**Elapsed:** {elapsed} sec **Remaining:** {int(remain)} sec")
+                status.markdown(f"**Battery Remaining:** {batt_rem:.2f} Wh  **Power Draw:** {total_draw:.0f} W  **V:** {flight_speed_kmh:.0f} km/h")
+                progress.progress(min(step/total_steps,1.0))
+                time.sleep(0.02)
+
+        # ───────── Shared: mission performance metrics for selected UAV ─────────
+        # Uncertainty band (±10%)
+        lo = flight_time_minutes * 0.90
+        hi = flight_time_minutes * 1.10
+
+        st.header("Selected UAV — Mission Performance")
+        st.metric("Dispatchable Endurance", f"{flight_time_minutes:.1f} minutes")
+        st.caption(f"Uncertainty band: {lo:.1f}–{hi:.1f} min (±10%)")
+        st.metric("Total Distance (km)", f"{total_distance_km:.1f} km")
+        st.metric("Best Heading Range", f"{best_km:.1f} km")
+        st.metric("Upwind Range", f"{worst_km:.1f} km")
+
+        # ─────────────────────────────────────────────────────────
+        # NEW: Initialize Comms & LLM agent + metrics (paper features)
+        # ─────────────────────────────────────────────────────────
+        channel = _CommsChannel(bands=("900MHz","2.4GHz","5.8GHz")) if enable_spectrum else None
+        agent = _LLMAgent(_client) if enable_llm_agent else None
+        _costs = _llm_cost_profile(compute_mode, secure_telemetry)
+        _llm_extra_latency_ms = _costs.extra_latency_ms
+        _llm_uplink_kbps = _costs.uplink_kbps
+
+        _metrics = {"llm_calls":0,"llm_latency_ms":0,"uplink_MB":0.0,"band_hops":0,"pkt_loss_pct":0.0,"current_band":None}
+        def _llm_step_overhead(seconds=0.3):
+            _metrics["llm_calls"] += 1
+            _metrics["llm_latency_ms"] += (_llm_extra_latency_ms + int(1000*seconds))
+            _metrics["uplink_MB"] += max(0.0, (_llm_uplink_kbps/8.0) * seconds / 1024.0)
+
+        # ───────── Individual UAV Detailed Calculations (selected model only) ─────────
+        st.header("Individual UAV Detailed Results (Selected Model)")
+        # Accumulate a human-readable summary as well
+        human = []
+        human.append(f"- **Model**: {drone_model} ({profile['type']}, {profile['power_system']})")
+        human.append(f"- **Payload used**: {payload_weight_g} g (max {profile['max_payload_g']} g)")
+        human.append(f"- **Mass**: {total_weight_kg:.3f} kg → **Weight**: {weight_N:.1f} N")
+        human.append(f"- **Atmosphere**: ρ={rho:.3f} kg/m³, ρ/ρ0={rho_ratio:.3f}, T={temperature_c:.1f}°C, Alt={altitude_m} m")
+        human.append(f"- **Speed**: {flight_speed_kmh:.1f} km/h ({V_ms:.2f} m/s), Wind={wind_speed_kmh:.1f} km/h ({W_ms:.2f} m/s)")
+        if profile["power_system"]=="Battery":
+            human.append(f"- **Total draw (incl. hotel/penalties)**: {detail.get('total_draw_W',0):.1f} W")
+            human.append(f"- **Battery (derated)**: {detail.get('battery_derated_Wh',0):.1f} Wh → **Usable (85%)**: {detail.get('usable_battery_Wh',0):.1f} Wh")
+            if elevation_gain_m != 0:
+                human.append(f"- **Climb/Descent net energy**: {detail.get('climb_energy_Wh',0):.2f} Wh (desc recov: {detail.get('descent_recovery_Wh','0.00')} Wh)")
+        else:
+            human.append(f"- **Total shaft+hotel power**: {detail.get('P_total_W',0)/1000:.2f} kW")
+            human.append(f"- **Fuel burn**: {detail.get('fuel_burn_L_per_hr',0):.2f} L/h")
+            human.append(f"- **Usable fuel after climb/assist**: {detail.get('usable_fuel_L_after_assist',0):.2f} L")
+            if ice_params and ice_params.get("hybrid_assist", False):
+                human.append(f"- **Hybrid Assist**: {ice_params['assist_fraction']*100:.0f}% for {ice_params['assist_duration_min']:.0f} min (battery substitution)")
+
+        human.append(f"- **Gust penalty**: {wind_penalty_pct:.1f}%")
+        human.append(f"- **Terrain × Stealth factor**: {terrain_penalty*stealth_drag_penalty:.3f}")
+        human.append(f"- **Thermal ΔT**: {delta_T:.1f} °C")
+        human.append(f"- **Dispatchable Endurance**: {flight_time_minutes:.1f} min")
+        human.append(f"- **Total Distance (km)**: {total_distance_km:.2f} km")
+        human.append(f"- **Best heading / Upwind ranges**: {best_km:.2f} km / {worst_km:.2f} km")
+
+        # Detectability in Detailed Panel
+        human.append(f"- **Detectability (AI visual / IR thermal):** {ai_score:.0f}/100 / {ir_score:.0f}/100")
+        human.append(f"- **Overall Detectability:** {'LOW' if overall_kind=='success' else 'MODERATE' if overall_kind=='warning' else 'HIGH'}")
+
+        st.markdown("\n".join(human))
+
+        # Machine-readable JSON for the detailed panel
+        detail.update({
+            "dispatch_endurance_min": round(flight_time_minutes,1),
+            "total_distance_km": round(total_distance_km,2),
+            "best_heading_range_km": round(best_km,2),
+            "upwind_range_km": round(worst_km,2),
+            "thermal_deltaT_C": round(delta_T,1),
+            "wind_penalty_%": round(wind_penalty_pct,1),
+            # NEW Detectability fields
+            "ai_visual_score_0_100": round(ai_score,1),
+            "ir_thermal_score_0_100": round(ir_score,1),
+            "detectability_overall": ("LOW" if overall_kind=="success" else "MODERATE" if overall_kind=="warning" else "HIGH")
+        })
+        st.json(detail, expanded=False)
+
+        # Exports for the individual UAV
+        indiv_df = pd.DataFrame([detail])
+        st.download_button(
+            "⬇️ Download Individual UAV Detailed Results (CSV)",
+            data=indiv_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"{drone_model.replace(' ','_').lower()}_detailed_results.csv",
+            mime="text/csv"
+        )
+        st.download_button(
+            "⬇️ Download Individual UAV Detailed Results (JSON)",
+            data=json.dumps(detail, indent=2),
+            file_name=f"{drone_model.replace(' ','_').lower()}_detailed_results.json",
+            mime="application/json"
+        )
+
+        # ───────── AI Mission Advisor (LLM) ─────────
+        st.subheader("AI Mission Advisor (LLM)")
+        params = {
+            "drone":drone_model, "payload_g":payload_weight_g, "mode":flight_mode,
+            "speed_kmh":flight_speed_kmh, "alt_m":altitude_m,
+            "wind_kmh":wind_speed_kmh, "gust":gustiness,
+            "endurance_min":flight_time_minutes, "delta_T":delta_T,
+            "fuel_l": (detail.get("usable_fuel_L_after_assist",0.0) if use_ice_branch else 0.0),
+            "hybrid_assist": (use_ice_branch and ice_params.get("hybrid_assist", False)) if use_ice_branch else False,
+            "assist_fraction": (ice_params.get("assist_fraction",0.0) if use_ice_branch else 0.0),
+            "assist_duration_min": (ice_params.get("assist_duration_min",0) if use_ice_branch else 0)
+        }
+        st.write(generate_llm_advice(params))
+        # NEW: small overhead for advisor call
+        if enable_llm_agent:
+            _llm_step_overhead(0.25)
+
+        # ───────── Swarm Advisor ─────────
+        if swarm_enable:
+            st.header("Swarm Advisor (Multi-Agent LLM)")
+            base_endurance = float(max(5.0, flight_time_minutes))
+            base_batt_wh = float(max(10.0, (battery_capacity_wh if profile["power_system"]=="Battery" else 200.0)))
+            swarm = seed_swarm(swarm_size, base_endurance, base_batt_wh, delta_T, altitude_m, platform=drone_model)
+            for s in swarm:
+                s.waypoints = waypoints.copy()
+                s.current_wp = 0
+
+            st.write("**Initial Swarm State**")
+            for s in swarm:
+                st.write(f"- {s.id} [{s.role}] ({s.platform}) — End {s.endurance_min:.1f} min | "
+                         f"Fuel {s.fuel_l:.1f} L | Alt {s.altitude_m} m | Pos ({s.x_km:+.1f},{s.y_km:+.1f}) km | ΔT {s.delta_T:.1f}°C")
+
+            env = {
+                "wind_kmh": wind_speed_kmh, "gust": gustiness, "mission": flight_mode,
+                "threat_note": ("elevated" if (simulate_failure or delta_T > 15 or altitude_m > 100) else "normal"),
+                "stealth_ingress": stealth_ingress, "threat_zone_km": threat_zone_km
+            }
+
+            for round_idx in range(swarm_steps):
+                st.subheader(f"Round {round_idx+1}")
+
+                # NEW: Spectrum step + band selection
+                if channel:
+                    channel.step(ew_jam_db=ew_jam_db, rho_ratio=rho_ratio)
+                    spectrum = channel.summary()
+                    band_choice = channel.pick_band(policy="greedy")
+                    if enable_llm_agent and agent:
+                        band_hint = agent.recommend_band(spectrum)
+                        band_choice = channel.pick_band(policy="llm", hint=band_hint)
+                        _llm_step_overhead(0.05)
+                    if band_choice != _metrics["current_band"]:
+                        _metrics["band_hops"] += 1
+                        _metrics["current_band"] = band_choice
+                    _metrics["pkt_loss_pct"] = channel.loss_pct
+                    st.markdown("**Spectrum State**")
+                    st.write({**spectrum, "chosen": _metrics["current_band"], "pkt_loss_%": round(_metrics["pkt_loss_pct"],1)})
+
+                proposals = {s.id: agent_call(env, s) for s in swarm}
+                fused = lead_call(env, swarm, proposals)
+                if fused.get("conversation"):
+                    st.markdown("**Swarm Conversation**")
+                    for m in fused["conversation"]:
+                        st.write(f"**{m.get('from','LEAD')}:** {m.get('msg','')}")
+                acts = fused.get("actions", [])
+
+                # NEW: optional LLM route amend
+                if enable_llm_agent and agent and waypoints:
+                    amended = agent.amend_route(waypoints)
+                    st.caption("LLM amended first leg (demo): " + str(amended[:2]) + (" ..." if len(amended)>2 else ""))
+                    _llm_step_overhead(0.05)
+
+                # NEW: Supervisor gate
+                if enable_supervisor:
+                    vstate = {
+                        "endurance_min": flight_time_minutes,
+                        "altitude_m": altitude_m,
+                        "fuel_l": detail.get("usable_fuel_L_after_assist", 0.0),
+                        "battery_wh": detail.get("usable_battery_Wh", 0.0),
+                        "link_ok": (_metrics["pkt_loss_pct"] < 35.0)
+                    }
+                    rules = {"min_reserve_min": 6.0, "max_alt_m": 120, "require_link": True}
+                    approved, rejected = _check_actions(acts, vstate, rules)
+                    if rejected:
+                        st.warning("**Supervisor rejections:** " + "; ".join([a.get("rejected_because","") for a in rejected if a.get("rejected_because")]))
+                    acts = approved
+
+                if acts:
+                    st.markdown("**LEAD Actions**")
+                    for a in acts:
+                        tag = (f" (fraction={a.get('fraction',0):.2f}, duration={a.get('duration_min',0)} min)" 
+                               if a.get("action")=="HYBRID_ASSIST" else "")
+                        st.write(f"- {a.get('uav_id')} → `{a.get('action')}` — {a.get('reason','')}{tag}")
+                    swarm = apply_actions(swarm, acts, stealth_ingress, threat_zone_km)
+                else:
+                    st.info("No actions returned.")
+
+                if enable_llm_agent:
+                    _llm_step_overhead(0.20)
+
+                st.markdown("**Updated Swarm State**")
+                for s in swarm:
+                    assist_txt = f" [Assist {s.assist_fraction*100:.0f}% {s.assist_time_min:.0f} min]" if s.hybrid_assist else ""
+                    zone_flag = "🟥 IN ZONE" if (stealth_ingress and ((s.x_km**2 + s.y_km**2)**0.5 <= threat_zone_km)) else ""
+                    alert = f" ⚠ {s.warning}" if s.warning else ""
+                    st.write(f"- {s.id} [{s.role}] — End {s.endurance_min:.1f} min | Fuel {s.fuel_l:.1f} L | Alt {s.altitude_m} m | ΔT {s.delta_T:.1f}°C{assist_txt}{alert} {zone_flag}")
+
+            # Playback history + simple waypoint following
+            st.subheader("Mission Playback")
+            swarm_history = []
+            timesteps = 10
+
+            def move_towards(s: AgentState, target: tuple, step_km: float = 0.5):
+                tx, ty = target
+                dx, dy = tx - s.x_km, ty - s.y_km
+                dist = (dx**2 + dy**2)**0.5
+                if dist < step_km:
+                    s.x_km, s.y_km = tx, ty
+                    s.current_wp = min(s.current_wp + 1, (len(s.waypoints)-1 if s.waypoints else 0))
+                elif dist > 0:
+                    s.x_km += step_km * dx/dist
+                    s.y_km += step_km * dy/dist
+                return s
+
+            for t in range(timesteps):
+                snapshot = []
+                for s in swarm:
+                    if s.waypoints and s.current_wp < len(s.waypoints):
+                        s = move_towards(s, s.waypoints[s.current_wp])
+                    s.endurance_min = max(0, s.endurance_min - random.uniform(0.5, 1.0))
+                    # crude burn-down for fuel to provide visual dynamics
+                    s.fuel_l = max(0, s.fuel_l - (random.uniform(0.6, 1.6) if "MQ-" in s.platform else random.uniform(0.1, 0.5)))
+                    if stealth_ingress and s.platform in ["MQ-1 Predator","MQ-9 Reaper"] and ((s.x_km**2 + s.y_km**2)**0.5 <= threat_zone_km):
+                        s.hybrid_assist = True; s.assist_fraction = 0.15; s.assist_time_min = 10
+                        s.delta_T *= (1 - 0.15*0.7); s.warning = "Auto Hybrid Assist (Stealth Ingress)"
+                    snapshot.append(asdict(s))
+                swarm_history.append(snapshot)
+
+            frame = st.slider("Mission Time (minutes)", 0, timesteps-1, 0)
+            frame_swarm = [AgentState(**data) for data in swarm_history[frame]]
+
+            for s in frame_swarm:
+                assist_txt = f" [Assist {s.assist_fraction*100:.0f}% {s.assist_time_min:.0f} min]" if s.hybrid_assist else ""
+                zone_flag = "🟥 IN ZONE" if (stealth_ingress and ((s.x_km**2 + s.y_km**2)**0.5 <= threat_zone_km)) else ""
+                alert = f" ⚠ {s.warning}" if s.warning else ""
+                st.write(f"- {s.id} [{s.role}] — End {s.endurance_min:.1f} min | Fuel {s.fuel_l:.1f} L | Alt {s.altitude_m} m | ΔT {s.delta_T:.1f}°C{assist_txt}{alert} {zone_flag}")
+
+            fig = plot_swarm_map(frame_swarm, threat_zone_km, stealth_ingress, waypoints)
+            st.pyplot(fig)
+            plt.close(fig)
+
+            # CSV exports
+            rows=[]
+            for t, snapshot in enumerate(swarm_history):
+                for s in snapshot:
+                    rows.append({
+                        "time_min": t, "uav_id": s["id"], "role": s["role"], "platform": s["platform"],
+                        "x_km": s["x_km"], "y_km": s["y_km"], "altitude_m": s["altitude_m"],
+                        "endurance_min": s["endurance_min"], "fuel_l": s["fuel_l"], "delta_T": s["delta_T"],
+                        "hybrid_assist": s["hybrid_assist"], "assist_fraction": s["assist_fraction"],
+                        "assist_time_min": s["assist_time_min"], "warning": s["warning"]
+                    })
+            df = pd.DataFrame(rows)
+            st.subheader("Export Mission Data")
+            st.download_button(
+                "Download Swarm Playback CSV",
+                data=df.to_csv(index=False).encode("utf-8"),
+                file_name="swarm_mission_playback.csv",
+                mime="text/csv"
+            )
+            if waypoints:
+                wp_df = pd.DataFrame(waypoints, columns=["x_km","y_km"])
+                st.download_button(
+                    "Download Mission Waypoints CSV",
+                    data=wp_df.to_csv(index=False).encode("utf-8"),
+                    file_name="mission_waypoints.csv",
+                    mime="text/csv"
+                )
+
+        # ─────────────────────────────────────────────────────────
+        # NEW: LLM & Comms Metrics HUD
+        # ─────────────────────────────────────────────────────────
+        st.header("LLM & Comms Metrics")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("LLM Calls", f"{_metrics['llm_calls']}")
+            st.metric("LLM Latency (sum)", f"{_metrics['llm_latency_ms']} ms")
+        with col2:
+            st.metric("Uplink Used", f"{_metrics['uplink_MB']:.2f} MB")
+            st.metric("Band Hops", f"{_metrics['band_hops']}")
+        with col3:
+            st.metric("Chosen Band", _metrics['current_band'] or "—")
+            st.metric("Pkt Loss (est.)", f"{_metrics['pkt_loss_pct']:.1f}%")
+
+        # ───────── Export Scenario Results (CSV + JSON) ─────────
+        st.subheader("Export Scenario Summary")
+        results = {
+            "Drone Model": drone_model,
+            "Power System": profile["power_system"],
+            "Type": profile["type"],
+            "Flight Mode": flight_mode,
+            "Battery Capacity (Wh)": round(battery_capacity_wh, 2) if profile["power_system"]=="Battery" else profile.get("battery_wh", 0),
+            "Payload (g)": int(payload_weight_g),
+            "Speed (km/h)": float(flight_speed_kmh),
+            "Wind (km/h)": float(wind_speed_kmh),
+            "Gustiness (0-10)": int(gustiness),
+            "Altitude (m)": int(altitude_m),
+            "Air Density (kg/m³)": round(rho, 3),
+            "Density Ratio (ρ/ρ0)": round(rho_ratio, 3),
+            "Wind Penalty (%)": round(wind_penalty_pct, 1) if 'wind_penalty_pct' in locals() else 0.0,
+            "Climb Energy (Wh)": round(climb_energy_Wh_value, 2) if (profile["power_system"]=="Battery") else None,
+            "Climb Fuel (L)": round(climb_L, 2) if ('climb_L' in locals() and climb_L is not None) else None,
+            "Dispatchable Endurance (min)": round(flight_time_minutes, 1),
+            "Total Distance (km)": round(total_distance_km, 2),
+            "Best Heading Range (km)": round(best_km, 2),
+            "Upwind Range (km)": round(worst_km, 2),
+            "ΔT (°C)": round(delta_T, 1),
+            # Detectability fields
+            "AI Visual Detectability (0-100)": round(ai_score,1),
+            "IR Thermal Detectability (0-100)": round(ir_score,1),
+            "Overall Detectability": ("LOW" if overall_kind=="success" else "MODERATE" if overall_kind=="warning" else "HIGH")
+        }
+        # NEW: export LLM/comms/security
+        results.update({
+            "Compute Mode": compute_mode,
+            "Secure Telemetry": secure_telemetry,
+            "LLM Calls": _metrics["llm_calls"],
+            "LLM Latency Sum (ms)": _metrics["llm_latency_ms"],
+            "Uplink Used (MB)": round(_metrics["uplink_MB"], 2),
+            "Band Hops (#)": _metrics["band_hops"],
+            "Chosen Band": _metrics["current_band"],
+            "Packet Loss (%)": round(_metrics["pkt_loss_pct"], 1),
+        })
+
+        df_res = pd.DataFrame([results])
+        csv_buffer = io.BytesIO()
+        df_res.to_csv(csv_buffer, index=False)
+        st.download_button(
+            "⬇️ Download Scenario Summary (CSV)",
+            data=csv_buffer,
+            file_name="mission_results.csv",
+            mime="text/csv"
+        )
+
+        json_str = json.dumps(results, indent=2)
+        st.download_button(
+            "⬇️ Download Scenario Summary (JSON)",
+            data=json_str,
+            file_name="mission_results.json",
+            mime="application/json"
+        )
+        st.text_area("Scenario Summary (JSON Copy-Paste)", json_str, height=250)
+
+        # ───────── AI Suggestions (simple heuristics) ─────────
+        st.subheader("AI Suggestions (Heuristics)")
+        if payload_weight_g == profile["max_payload_g"]:
+            st.write("**Tip:** Payload is at maximum lift capacity.")
+        if wind_speed_kmh > 15:
+            st.write("**Tip:** High wind may reduce flight time and upwind range.")
+        if profile["power_system"]=="Battery" and battery_capacity_wh < 30:
+            st.write("**Tip:** Battery is under 30 Wh. Consider a larger pack.")
+        if flight_mode in ["Hover", "Waypoint Mission", "Loiter"]:
+            st.write("**Tip:** Maneuvering or station-keeping increases power draw; plan extra reserve.")
+        if stealth_drag_penalty > 1.2:
+            st.write("**Tip:** Stealth loadout may reduce endurance.")
+        if delta_T > 15:
+            st.write("**Tip:** Thermal load is high. Consider lighter payload or lower altitude.")
+        if altitude_m > 100:
+            st.write("**Tip:** Flying above 100m may increase detection risk.")
+        if gustiness >= 5:
+            st.write("**Tip:** Gust factor above 5 may destabilize small UAVs.")
+
+        st.caption("GPT-UAV Planner | Built by Tareq Omrani | 2025")
+
+    except Exception as e:
+        st.error("Unexpected error during simulation.")
+        if debug_mode:
+            st.exception(e)
