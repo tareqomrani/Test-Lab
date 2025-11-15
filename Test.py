@@ -10,6 +10,7 @@ from typing import List, Dict, Any, Optional, Tuple
 import streamlit as st
 import matplotlib.pyplot as plt
 import pandas as pd
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
 # ─────────────────────────────────────────────────────────
 # Optional LLM client (graceful fallback if no key present)
@@ -22,136 +23,6 @@ try:
 except Exception:
     _client = None
     OPENAI_AVAILABLE = False
-
-# ─────────────────────────────────────────────────────────
-# NEW: Paper‑aligned helpers inlined (LLMAgent, CommsChannel, Safety Supervisor)
-# These are additive; original app logic is preserved intact below.
-# ─────────────────────────────────────────────────────────
-# (A) LLM agent and cost profile
-@dataclass
-class _CostProfile:
-    infer_power_W: float
-    extra_latency_ms: int
-    uplink_kbps: int
-    security_overhead_pct: float
-
-def _llm_cost_profile(mode: str, secure: bool) -> _CostProfile:
-    if mode.startswith("Onboard"):
-        base = _CostProfile(infer_power_W=6.0, extra_latency_ms=90, uplink_kbps=32, security_overhead_pct=0.0)
-    elif mode == "Edge":
-        base = _CostProfile(infer_power_W=2.5, extra_latency_ms=140, uplink_kbps=256, security_overhead_pct=0.0)
-    else:  # Cloud
-        base = _CostProfile(infer_power_W=1.5, extra_latency_ms=220, uplink_kbps=384, security_overhead_pct=0.0)
-    if secure:
-        base.uplink_kbps = int(base.uplink_kbps * 1.12)
-        base.infer_power_W += 0.5
-    return base
-
-class _LLMAgent:
-    """Local stub tools that complement your existing advisor."""
-    def __init__(self, openai_client=None):
-        self.client = openai_client
-        self.memory = []
-
-    def redact(self, text: str) -> str:
-        return text.replace("(", "[").replace(")", "]")
-
-    def recommend_band(self, spectrum_summary: dict) -> str:
-        candidates = []
-        for band, st in spectrum_summary.items():
-            score = st["rate_mbps"] - 20.0*st["occ"] + (5.0 if st["snr_db"]>8 else 0.0)
-            candidates.append((score, band))
-        candidates.sort(reverse=True)
-        return candidates[0][1] if candidates else "2.4GHz"
-
-    def amend_route(self, waypoints):
-        if not waypoints: return waypoints
-        wps = waypoints[:]
-        if len(wps) >= 2:
-            x0,y0 = wps[0]; x1,y1 = wps[1]
-            wps[1] = ((x0+x1)/2.0, (y0+y1)/2.0)
-        return wps
-
-    def advise(self, params, telemetry, spectrum_state, secure=False):
-        band_hint = self.recommend_band(spectrum_state) if spectrum_state else None
-        note = f"Recommend band {band_hint}; smooth first leg; hold ΔT under 15°C if possible."
-        if secure: note = self.redact(note)
-        out = {"actions":[{"type":"BAND_SELECT","band":band_hint},
-                          {"type":"ROUTE_UPDATE","waypoints":"amended"}],
-               "note": note}
-        self.memory.append({"t": time.time(), "params": params, "telemetry": telemetry,
-                            "spectrum": spectrum_state, "out": out})
-        return out
-
-# (B) Spectrum sensing / sharing mini‑sim
-@dataclass
-class _BandState:
-    name: str
-    noise_bw_db: float
-    occupancy: float = 0.0
-    snr_db: float = 0.0
-    rate_mbps: float = 0.0
-
-class _CommsChannel:
-    """Simple per‑band occupancy + SNR + throughput model with optional jamming."""
-    def __init__(self, bands=("900MHz","2.4GHz","5.8GHz")):
-        base_noise = {"900MHz": -6.0, "2.4GHz": -3.0, "5.8GHz": 0.0}
-        self.bands = {b: _BandState(b, base_noise.get(b, -3.0)) for b in bands}
-        self.last_choice = None
-        self.loss_pct = 0.0
-
-    def step(self, ew_jam_db=0, traffic_mix=None, rho_ratio=1.0):
-        if traffic_mix is None:
-            traffic_mix = {"UAV":0.15, "Civ":0.35, "Other":0.20}
-        total_load = sum(traffic_mix.values())
-        for band, st in self.bands.items():
-            occ = max(0.0, min(1.0, st.occupancy + random.uniform(-0.05, 0.08) + 0.4*total_load))
-            st.occupancy = 0.7*st.occupancy + 0.3*occ
-            snr = 18.0 + st.noise_bw_db - 10.0*st.occupancy - 0.5*ew_jam_db + random.uniform(-1.0,1.0) + 0.5*(1.0-rho_ratio)*10
-            st.snr_db = snr
-            eff = max(0.2, 1.0 - 0.6*st.occupancy)
-            st.rate_mbps = max(0.0, eff * 2.5 * math.log2(1.0 + 10**(snr/10.0)))
-        self.loss_pct = 0.0
-        if self.last_choice and self.last_choice in self.bands:
-            b = self.bands[self.last_choice]
-            self.loss_pct = max(0.0, 35.0 - b.snr_db) * 0.6 + 40.0*b.occupancy
-
-    def pick_band(self, policy="greedy", hint=None):
-        if policy == "llm" and isinstance(hint, str) and hint in self.bands:
-            self.last_choice = hint
-            return hint
-        best = None; score_best = -1e9
-        for name, st in self.bands.items():
-            stick = 0.5 if name == self.last_choice else 0.0
-            score = st.rate_mbps - 0.2*(100.0*st.occupancy) + stick
-            if score > score_best:
-                best, score_best = name, score
-        self.last_choice = best
-        return best
-
-    def summary(self):
-        return {name: dict(occ=round(st.occupancy,2), snr_db=round(st.snr_db,1),
-                           rate_mbps=round(st.rate_mbps,2)) for name, st in self.bands.items()}
-
-# (C) Safety supervisor
-def _check_actions(actions, vehicle_state, rules):
-    approved, rejected = [], []
-    min_reserve = rules.get("min_reserve_min", 6.0)
-    max_alt = rules.get("max_alt_m", 120)
-    require_link = rules.get("require_link", True)
-    link_ok = vehicle_state.get("link_ok", True)
-
-    for a in actions or []:
-        reason = None
-        if a.get("type") == "ALTITUDE_CHANGE":
-            target = vehicle_state.get("altitude_m", 0) + int(a.get("delta_m",0))
-            if target > max_alt: reason = f"Altitude {target} m exceeds {max_alt} m."
-        if a.get("type") == "BAND_SELECT" and require_link and not link_ok:
-            reason = "Comms link unstable—band switch deferred."
-        if a.get("type") == "WAYPOINT_PUSH" and vehicle_state.get("endurance_min",0) < min_reserve:
-            reason = "Below endurance reserve; reject new leg."
-        (rejected if reason else approved).append({**a, **({"rejected_because":reason} if reason else {})})
-    return approved, rejected
 
 # ─────────────────────────────────────────────────────────
 # Streamlit header / UX helpers
@@ -182,22 +53,51 @@ def numeric_input(label: str, default: float) -> float:
         return default
 
 # ─────────────────────────────────────────────────────────
-# NEW: Paper‑aligned sidebar toggles
+# Sidebar: Advanced module toggles + LLM architecture
 # ─────────────────────────────────────────────────────────
 with st.sidebar:
-    st.header("LLM & Comms")
-    enable_llm_agent = st.checkbox("Enable LLM Agent Layer", value=True)
-    compute_mode = st.radio("Compute Mode", ["Onboard (tiny)", "Edge", "Cloud"], index=0,
-                            help="Where inference runs and its power/latency/bandwidth costs.")
-    enable_spectrum = st.checkbox("Enable Spectrum Sensing/Sharing", value=True)
-    ew_jam_db = st.slider("EW/Jam Level (dB)", 0, 40, 8,
-                          help="Adds interference into selected bands, reducing SNR and rate.")
-    secure_telemetry = st.checkbox("Secure Telemetry (Encrypt+Redact)", value=False,
-                                   help="Adds bitrate/power overhead and scrubs PII in LLM outputs.")
-    enable_supervisor = st.checkbox("Enable Safety Supervisor", value=True,
-                                    help="Gates LLM/swarm actions against envelopes, reserves, geofences.")
-    st.caption("These toggles add spectrum sharing, edge/cloud tradeoffs, a safety supervisor, "
-               "and an LLM agent layer—matching the paper’s focus areas.")
+    st.header("Advanced Modules")
+    use_strict_sanity = st.checkbox("Strict Sanity Check", value=True)
+    enable_swarm_module = st.checkbox("Swarm & Autonomy Module", value=True)
+    enable_playback_module = st.checkbox("Mission Playback (2D/3D)", value=True)
+
+    arch_mode = st.selectbox(
+        "LLM Architecture Mode",
+        [
+            "Disabled",
+            "Single-Agent Mission Advisor",
+            "Hierarchical Swarm (Current Default)",
+            "Recovery / Fallback Planner"
+        ],
+        index=(2 if OPENAI_AVAILABLE else 0)
+    )
+
+    # Short legend tying modes to LLM-for-UAV architectures
+    with st.expander("LLM Architecture Legend"):
+        st.markdown("""
+**Disabled**  
+• Physics-only baseline.  
+• No LLM calls; all guidance is heuristic.  
+• Use this to validate the aerodynamic / battery / ICE models in isolation.
+
+**Single-Agent Mission Advisor**  
+• Emulates a single LLM “pilot-in-the-loop” with tools.  
+• One agent reads the mission state and produces high-level recommendations only.  
+• Good match for “tool-augmented single LLM” architectures in recent UAV autonomy work.
+
+**Hierarchical Swarm (Current Default)**  
+• Emulates a **multi-agent / hierarchical** LLM system:  
+  - Per-UAV agents propose local actions (RTB, loiter, hybrid assist, etc.).  
+  - A LEAD / coordinator agent fuses proposals and issues final actions.  
+• This closely reflects **hierarchical + multi-agent LLM for UAV swarms** described in current research/blog examples.
+
+**Recovery / Fallback Planner**  
+• Emulates a conservative safety layer that sits “below” the main autonomy stack.  
+• Biases decisions toward RTB / abort / safe loiter when endurance or threat is bad.  
+• Mirrors “safety guardrail” / fallback LLM architectures that intervene when risk is high or primary planning is unreliable.
+        """)
+
+    st.caption("These modes emulate different LLM-for-UAV architectures without changing your core physics/simulation.")
 
 # ─────────────────────────────────────────────────────────
 # NEW: Detectability model (AI/IR) helpers
@@ -347,8 +247,6 @@ def heading_range_km(V_air_ms: float, W_ms: float, t_min: float) -> Tuple[float,
     best  = (V_air_ms + W_ms) * t_h / 1000.0
     return (best, worst)
 
-SIGMA  # keep symbol for readability (already defined)
-
 def convective_radiative_deltaT(Q_w: float, surface_area_m2: float, emissivity: float,
                                 ambient_C: float, rho: float, V_ms: float) -> float:
     """
@@ -495,6 +393,65 @@ UAV_PROFILES: Dict[str, Dict[str, Any]] = {
 }
 
 # ─────────────────────────────────────────────────────────
+# Strict sanity check helper
+# ─────────────────────────────────────────────────────────
+def sanity_check_inputs(profile: Dict[str, Any],
+                        battery_capacity_wh: float,
+                        payload_weight_g: int,
+                        flight_speed_kmh: float,
+                        wind_speed_kmh: float,
+                        temperature_c: float,
+                        altitude_m: int,
+                        elevation_gain_m: int,
+                        terrain_penalty: float,
+                        stealth_drag_penalty: float) -> None:
+    """Hard sanity check; stops execution if values are outside reasonable aerospace ranges."""
+    errors = []
+
+    # Battery sanity (for battery platforms)
+    if profile["power_system"] == "Battery":
+        if battery_capacity_wh <= 5 or battery_capacity_wh > 5000:
+            errors.append(f"Battery capacity {battery_capacity_wh:.1f} Wh is out of realistic range (5–5000 Wh).")
+    # ICE small buffer check (not strictly required, but keep bounded)
+    if profile["power_system"] == "ICE":
+        if battery_capacity_wh < 0:
+            errors.append("Battery capacity cannot be negative.")
+
+    # Payload
+    if payload_weight_g < 0:
+        errors.append("Payload cannot be negative.")
+    if payload_weight_g > profile["max_payload_g"]:
+        errors.append(f"Payload {payload_weight_g} g exceeds max payload {profile['max_payload_g']} g for this platform.")
+
+    # Speed & wind
+    if flight_speed_kmh <= 0 or flight_speed_kmh > 300:
+        errors.append(f"Flight speed {flight_speed_kmh:.1f} km/h is out of realistic range (0–300 km/h).")
+    if wind_speed_kmh < 0 or wind_speed_kmh > 120:
+        errors.append(f"Wind speed {wind_speed_kmh:.1f} km/h is out of realistic range (0–120 km/h).")
+
+    # Temperature
+    if temperature_c < -40 or temperature_c > 60:
+        errors.append(f"Temperature {temperature_c:.1f} °C is out of range (-40 to +60 °C).")
+
+    # Altitude & climb
+    if altitude_m < -200 or altitude_m > 8000:
+        errors.append(f"Altitude {altitude_m} m is out of range (-200 to 8000 m).")
+    if abs(elevation_gain_m) > 4000:
+        errors.append(f"Elevation gain {elevation_gain_m} m is out of range (|Δh| ≤ 4000 m).")
+
+    # Terrain / stealth penalties
+    if terrain_penalty < 1.0 or terrain_penalty > 1.5:
+        errors.append(f"Terrain penalty {terrain_penalty:.2f} must be between 1.0 and 1.5.")
+    if stealth_drag_penalty < 1.0 or stealth_drag_penalty > 1.5:
+        errors.append(f"Stealth drag factor {stealth_drag_penalty:.2f} must be between 1.0 and 1.5.")
+
+    if errors:
+        st.error("Sanity check failed. Please correct the following:")
+        for e in errors:
+            st.write(f"• {e}")
+        st.stop()
+
+# ─────────────────────────────────────────────────────────
 # Debug toggles & model selection
 # ─────────────────────────────────────────────────────────
 debug_mode = st.checkbox("Enable Debug Mode")
@@ -587,6 +544,13 @@ except Exception:
 # LLM Mission Advisor
 # ─────────────────────────────────────────────────────────
 def generate_llm_advice(params):
+    if arch_mode == "Disabled":
+        # Architecture explicitly disabled
+        return ("LLM architecture disabled — physics-only guidance:\n"
+                "- Reduce payload for longer endurance.\n"
+                "- Lower altitude or speed in gusty winds.\n"
+                "- Use hybrid assist during ingress to cut IR.\n"
+                "- Loiter under cloud where possible.")
     if not OPENAI_AVAILABLE:
         return ("LLM unavailable — heuristic advice:\n"
                 "- Reduce payload for longer endurance.\n"
@@ -700,6 +664,12 @@ def _safe_json(txt: str) -> Dict[str, Any]:
         return json.loads(txt[s:e+1])
 
 def agent_call(env: Dict[str,Any], s: AgentState) -> Dict[str, Any]:
+    # If architecture disabled or single-agent only, use heuristic behavior
+    if arch_mode in ["Disabled", "Single-Agent Mission Advisor"]:
+        if env.get("threat_note")=="elevated" and ("MQ-1" in s.platform or "MQ-9" in s.platform):
+            return {"message":"Stealth assist on","proposed_action":"HYBRID_ASSIST","params":{"fraction":0.15,"duration_min":10},"confidence":0.7}
+        return {"message":"Loitering","proposed_action":"LOITER","params":{},"confidence":0.6}
+
     if not OPENAI_AVAILABLE:
         if env.get("threat_note")=="elevated" and ("MQ-1" in s.platform or "MQ-9" in s.platform):
             return {"message":"Stealth assist on","proposed_action":"HYBRID_ASSIST","params":{"fraction":0.15,"duration_min":10},"confidence":0.7}
@@ -718,18 +688,40 @@ def agent_call(env: Dict[str,Any], s: AgentState) -> Dict[str, Any]:
         return {"message":"Standby","proposed_action":"STANDBY","params":{},"confidence":0.5}
 
 def lead_call(env: Dict[str,Any], swarm: List[AgentState], proposals: Dict[str,Any]) -> Dict[str, Any]:
+    # Recovery / fallback mode: bias toward RTB even in heuristic path
+    recovery_mode = env.get("recovery_mode", False)
+
+    if arch_mode in ["Disabled", "Single-Agent Mission Advisor"]:
+        # Hierarchical LLM layer disabled: heuristic fusion only
+        actions=[]
+        for s in swarm:
+            prop = proposals.get(s.id,{})
+            act = prop.get("proposed_action","LOITER")
+            if recovery_mode and s.endurance_min < 12:
+                actions.append({"uav_id":s.id,"action":"RTB","reason":"Recovery planner: low endurance"})
+            elif act=="HYBRID_ASSIST" and ("MQ-1" in s.platform or "MQ-9" in s.platform):
+                actions.append({"uav_id":s.id,"action":"HYBRID_ASSIST","fraction":0.15,"duration_min":10,"reason":"Stealth ingress"})
+            elif s.endurance_min<8:
+                actions.append({"uav_id":s.id,"action":"RTB","reason":"Low endurance"})
+            else:
+                actions.append({"uav_id":s.id,"action":"LOITER","reason":"Holding"})
+        return {"conversation":[{"from":"LEAD","msg":"Heuristic fusion active"}],"actions":actions}
+
     if not OPENAI_AVAILABLE:
         actions=[]
         for s in swarm:
             prop = proposals.get(s.id,{})
             act = prop.get("proposed_action","LOITER")
-            if act=="HYBRID_ASSIST" and ("MQ-1" in s.platform or "MQ-9" in s.platform):
+            if recovery_mode and s.endurance_min < 12:
+                actions.append({"uav_id":s.id,"action":"RTB","reason":"Recovery planner: low endurance"})
+            elif act=="HYBRID_ASSIST" and ("MQ-1" in s.platform or "MQ-9" in s.platform):
                 actions.append({"uav_id":s.id,"action":"HYBRID_ASSIST","fraction":0.15,"duration_min":10,"reason":"Stealth ingress"})
             elif s.endurance_min<8:
                 actions.append({"uav_id":s.id,"action":"RTB","reason":"Low endurance"})
             else:
                 actions.append({"uav_id":s.id,"action":"LOITER","reason":"Holding"})
         return {"conversation":[{"from":"LEAD","msg":"Fallback fusion active"}],"actions":actions}
+
     packed = {"env": env,"swarm":[summarize_state(s) for s in swarm],"proposals": proposals,"allowed_actions": ALLOWED_ACTIONS}
     try:
         resp = _client.chat.completions.create(
@@ -774,8 +766,7 @@ def apply_actions(swarm: List[AgentState], acts: List[Dict[str,Any]],
         for s in swarm:
             if ("MQ-1" in s.platform or "MQ-9" in s.platform) and in_zone(s) and not s.hybrid_assist:
                 s.hybrid_assist=True; s.assist_fraction=0.15; s.assist_time_min=10
-                s.delta_T *= (1 - 0.15*0.7); s.fuel_l += 0.5
-                s.warning="Auto Hybrid Assist (Stealth Ingress)"
+                s.delta_T *= (1 - 0.15*0.7); s.warning="Auto Hybrid Assist (Stealth Ingress)"
     return swarm
 
 def plot_swarm_map(swarm: List[AgentState], threat_zone_km: float,
@@ -794,12 +785,36 @@ def plot_swarm_map(swarm: List[AgentState], threat_zone_km: float,
         if s.hybrid_assist: color="green"
         ax.scatter(s.x_km, s.y_km, c=color, marker=marker, s=100, label=s.id)
         ax.text(s.x_km+0.2, s.y_km+0.2, f"{s.id}\nAlt {s.altitude_m}m\nΔT {s.delta_T:.1f}°C", fontsize=7)
-    ax.set_title("Swarm Mission Map")
+    ax.set_title("Swarm Mission Map (2D)")
     ax.set_xlabel("X (km)"); ax.set_ylabel("Y (km)")
     ax.axhline(0, color='grey', linewidth=0.5); ax.axvline(0, color='grey', linewidth=0.5)
     handles, labels = ax.get_legend_handles_labels(); uniq = dict(zip(labels, handles))
     ax.legend(uniq.values(), uniq.keys(), loc="upper right", fontsize=6)
     ax.set_aspect('equal', adjustable='datalim')
+    return fig
+
+def plot_swarm_map_3d(swarm: List[AgentState], threat_zone_km: float,
+                      stealth_ingress: bool):
+    """Simple 3D mission view: X/Y in km, altitude as Z."""
+    fig = plt.figure(figsize=(6, 5))
+    ax = fig.add_subplot(111, projection='3d')
+
+    for s in swarm:
+        color = "blue"
+        marker = "o"
+        if s.platform in ["MQ-1 Predator","MQ-9 Reaper"]:
+            marker = "s"
+            color = "purple"
+        if s.hybrid_assist:
+            color = "green"
+        ax.scatter(s.x_km, s.y_km, s.altitude_m, c=color, marker=marker, s=40)
+        ax.text(s.x_km, s.y_km, s.altitude_m + 10, s.id, fontsize=7)
+
+    ax.set_title("Swarm Mission Map (3D)")
+    ax.set_xlabel("X (km)")
+    ax.set_ylabel("Y (km)")
+    ax.set_zlabel("Altitude (m)")
+    ax.grid(True)
     return fig
 
 def clamp_battery(platform: Dict[str, Any], requested_wh: float, allow_override: bool) -> float:
@@ -815,6 +830,21 @@ def clamp_battery(platform: Dict[str, Any], requested_wh: float, allow_override:
 # ─────────────────────────────────────────────────────────
 if submitted:
     try:
+        # Strict sanity check (optional via sidebar)
+        if use_strict_sanity:
+            sanity_check_inputs(
+                profile=profile,
+                battery_capacity_wh=battery_capacity_wh,
+                payload_weight_g=payload_weight_g,
+                flight_speed_kmh=flight_speed_kmh,
+                wind_speed_kmh=wind_speed_kmh,
+                temperature_c=temperature_c,
+                altitude_m=altitude_m,
+                elevation_gain_m=elevation_gain_m,
+                terrain_penalty=terrain_penalty,
+                stealth_drag_penalty=stealth_drag_penalty
+            )
+
         if payload_weight_g > profile["max_payload_g"]:
             st.error("Payload exceeds lift capacity."); st.stop()
 
@@ -961,6 +991,7 @@ if submitted:
             else:
                 st.error("Overall detectability: HIGH")
             st.markdown(badges_html, unsafe_allow_html=True)
+            # ─────────────────────────────────────────────────────────────
 
             # Detail panel fields (ICE)
             detail.update({
@@ -1130,6 +1161,7 @@ if submitted:
             else:
                 st.error("Overall detectability: HIGH")
             st.markdown(badges_html, unsafe_allow_html=True)
+            # ────────────────────────────────────────────────────────────────
 
             # Detail panel fields (Battery)
             detail.update({
@@ -1189,21 +1221,6 @@ if submitted:
         st.metric("Total Distance (km)", f"{total_distance_km:.1f} km")
         st.metric("Best Heading Range", f"{best_km:.1f} km")
         st.metric("Upwind Range", f"{worst_km:.1f} km")
-
-        # ─────────────────────────────────────────────────────────
-        # NEW: Initialize Comms & LLM agent + metrics (paper features)
-        # ─────────────────────────────────────────────────────────
-        channel = _CommsChannel(bands=("900MHz","2.4GHz","5.8GHz")) if enable_spectrum else None
-        agent = _LLMAgent(_client) if enable_llm_agent else None
-        _costs = _llm_cost_profile(compute_mode, secure_telemetry)
-        _llm_extra_latency_ms = _costs.extra_latency_ms
-        _llm_uplink_kbps = _costs.uplink_kbps
-
-        _metrics = {"llm_calls":0,"llm_latency_ms":0,"uplink_MB":0.0,"band_hops":0,"pkt_loss_pct":0.0,"current_band":None}
-        def _llm_step_overhead(seconds=0.3):
-            _metrics["llm_calls"] += 1
-            _metrics["llm_latency_ms"] += (_llm_extra_latency_ms + int(1000*seconds))
-            _metrics["uplink_MB"] += max(0.0, (_llm_uplink_kbps/8.0) * seconds / 1024.0)
 
         # ───────── Individual UAV Detailed Calculations (selected model only) ─────────
         st.header("Individual UAV Detailed Results (Selected Model)")
@@ -1282,12 +1299,10 @@ if submitted:
             "assist_duration_min": (ice_params.get("assist_duration_min",0) if use_ice_branch else 0)
         }
         st.write(generate_llm_advice(params))
-        # NEW: small overhead for advisor call
-        if enable_llm_agent:
-            _llm_step_overhead(0.25)
 
         # ───────── Swarm Advisor ─────────
-        if swarm_enable:
+        swarm_mode_allowed = (arch_mode != "Disabled")
+        if swarm_enable and enable_swarm_module and swarm_mode_allowed:
             st.header("Swarm Advisor (Multi-Agent LLM)")
             base_endurance = float(max(5.0, flight_time_minutes))
             base_batt_wh = float(max(10.0, (battery_capacity_wh if profile["power_system"]=="Battery" else 200.0)))
@@ -1304,28 +1319,12 @@ if submitted:
             env = {
                 "wind_kmh": wind_speed_kmh, "gust": gustiness, "mission": flight_mode,
                 "threat_note": ("elevated" if (simulate_failure or delta_T > 15 or altitude_m > 100) else "normal"),
-                "stealth_ingress": stealth_ingress, "threat_zone_km": threat_zone_km
+                "stealth_ingress": stealth_ingress, "threat_zone_km": threat_zone_km,
+                "recovery_mode": (arch_mode == "Recovery / Fallback Planner")
             }
 
             for round_idx in range(swarm_steps):
                 st.subheader(f"Round {round_idx+1}")
-
-                # NEW: Spectrum step + band selection
-                if channel:
-                    channel.step(ew_jam_db=ew_jam_db, rho_ratio=rho_ratio)
-                    spectrum = channel.summary()
-                    band_choice = channel.pick_band(policy="greedy")
-                    if enable_llm_agent and agent:
-                        band_hint = agent.recommend_band(spectrum)
-                        band_choice = channel.pick_band(policy="llm", hint=band_hint)
-                        _llm_step_overhead(0.05)
-                    if band_choice != _metrics["current_band"]:
-                        _metrics["band_hops"] += 1
-                        _metrics["current_band"] = band_choice
-                    _metrics["pkt_loss_pct"] = channel.loss_pct
-                    st.markdown("**Spectrum State**")
-                    st.write({**spectrum, "chosen": _metrics["current_band"], "pkt_loss_%": round(_metrics["pkt_loss_pct"],1)})
-
                 proposals = {s.id: agent_call(env, s) for s in swarm}
                 fused = lead_call(env, swarm, proposals)
                 if fused.get("conversation"):
@@ -1333,28 +1332,6 @@ if submitted:
                     for m in fused["conversation"]:
                         st.write(f"**{m.get('from','LEAD')}:** {m.get('msg','')}")
                 acts = fused.get("actions", [])
-
-                # NEW: optional LLM route amend
-                if enable_llm_agent and agent and waypoints:
-                    amended = agent.amend_route(waypoints)
-                    st.caption("LLM amended first leg (demo): " + str(amended[:2]) + (" ..." if len(amended)>2 else ""))
-                    _llm_step_overhead(0.05)
-
-                # NEW: Supervisor gate
-                if enable_supervisor:
-                    vstate = {
-                        "endurance_min": flight_time_minutes,
-                        "altitude_m": altitude_m,
-                        "fuel_l": detail.get("usable_fuel_L_after_assist", 0.0),
-                        "battery_wh": detail.get("usable_battery_Wh", 0.0),
-                        "link_ok": (_metrics["pkt_loss_pct"] < 35.0)
-                    }
-                    rules = {"min_reserve_min": 6.0, "max_alt_m": 120, "require_link": True}
-                    approved, rejected = _check_actions(acts, vstate, rules)
-                    if rejected:
-                        st.warning("**Supervisor rejections:** " + "; ".join([a.get("rejected_because","") for a in rejected if a.get("rejected_because")]))
-                    acts = approved
-
                 if acts:
                     st.markdown("**LEAD Actions**")
                     for a in acts:
@@ -1364,10 +1341,6 @@ if submitted:
                     swarm = apply_actions(swarm, acts, stealth_ingress, threat_zone_km)
                 else:
                     st.info("No actions returned.")
-
-                if enable_llm_agent:
-                    _llm_step_overhead(0.20)
-
                 st.markdown("**Updated Swarm State**")
                 for s in swarm:
                     assist_txt = f" [Assist {s.assist_fraction*100:.0f}% {s.assist_time_min:.0f} min]" if s.hybrid_assist else ""
@@ -1376,7 +1349,6 @@ if submitted:
                     st.write(f"- {s.id} [{s.role}] — End {s.endurance_min:.1f} min | Fuel {s.fuel_l:.1f} L | Alt {s.altitude_m} m | ΔT {s.delta_T:.1f}°C{assist_txt}{alert} {zone_flag}")
 
             # Playback history + simple waypoint following
-            st.subheader("Mission Playback")
             swarm_history = []
             timesteps = 10
 
@@ -1406,18 +1378,40 @@ if submitted:
                     snapshot.append(asdict(s))
                 swarm_history.append(snapshot)
 
-            frame = st.slider("Mission Time (minutes)", 0, timesteps-1, 0)
-            frame_swarm = [AgentState(**data) for data in swarm_history[frame]]
+            if enable_playback_module:
+                st.header("Mission Playback")
 
-            for s in frame_swarm:
-                assist_txt = f" [Assist {s.assist_fraction*100:.0f}% {s.assist_time_min:.0f} min]" if s.hybrid_assist else ""
-                zone_flag = "🟥 IN ZONE" if (stealth_ingress and ((s.x_km**2 + s.y_km**2)**0.5 <= threat_zone_km)) else ""
-                alert = f" ⚠ {s.warning}" if s.warning else ""
-                st.write(f"- {s.id} [{s.role}] — End {s.endurance_min:.1f} min | Fuel {s.fuel_l:.1f} L | Alt {s.altitude_m} m | ΔT {s.delta_T:.1f}°C{assist_txt}{alert} {zone_flag}")
+                # 2D playback via slider
+                frame = st.slider("Mission Time (2D view, minutes)", 0, timesteps-1, 0)
+                frame_swarm = [AgentState(**data) for data in swarm_history[frame]]
 
-            fig = plot_swarm_map(frame_swarm, threat_zone_km, stealth_ingress, waypoints)
-            st.pyplot(fig)
-            plt.close(fig)
+                for s in frame_swarm:
+                    assist_txt = f" [Assist {s.assist_fraction*100:.0f}% {s.assist_time_min:.0f} min]" if s.hybrid_assist else ""
+                    zone_flag = "🟥 IN ZONE" if (stealth_ingress and ((s.x_km**2 + s.y_km**2)**0.5 <= threat_zone_km)) else ""
+                    alert = f" ⚠ {s.warning}" if s.warning else ""
+                    st.write(f"- {s.id} [{s.role}] — End {s.endurance_min:.1f} min | Fuel {s.fuel_l:.1f} L | Alt {s.altitude_m} m | ΔT {s.delta_T:.1f}°C{assist_txt}{alert} {zone_flag}")
+
+                fig = plot_swarm_map(frame_swarm, threat_zone_km, stealth_ingress, waypoints)
+                plot_placeholder = st.empty()
+                plot_placeholder.pyplot(fig)
+                plt.close(fig)
+
+                # Optional 2D auto-animation
+                if st.button("▶ Play 2D Animation"):
+                    for f in range(timesteps):
+                        frame_swarm_anim = [AgentState(**data) for data in swarm_history[f]]
+                        fig_anim = plot_swarm_map(frame_swarm_anim, threat_zone_km, stealth_ingress, waypoints)
+                        plot_placeholder.pyplot(fig_anim)
+                        plt.close(fig_anim)
+                        time.sleep(0.3)
+
+                # 3D playback via separate slider
+                st.subheader("3D Mission View")
+                frame3d = st.slider("Mission Time (3D view, minutes)", 0, timesteps-1, 0, key="frame3d")
+                frame_swarm_3d = [AgentState(**data) for data in swarm_history[frame3d]]
+                fig3d = plot_swarm_map_3d(frame_swarm_3d, threat_zone_km, stealth_ingress)
+                st.pyplot(fig3d)
+                plt.close(fig3d)
 
             # CSV exports
             rows=[]
@@ -1447,21 +1441,6 @@ if submitted:
                     mime="text/csv"
                 )
 
-        # ─────────────────────────────────────────────────────────
-        # NEW: LLM & Comms Metrics HUD
-        # ─────────────────────────────────────────────────────────
-        st.header("LLM & Comms Metrics")
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("LLM Calls", f"{_metrics['llm_calls']}")
-            st.metric("LLM Latency (sum)", f"{_metrics['llm_latency_ms']} ms")
-        with col2:
-            st.metric("Uplink Used", f"{_metrics['uplink_MB']:.2f} MB")
-            st.metric("Band Hops", f"{_metrics['band_hops']}")
-        with col3:
-            st.metric("Chosen Band", _metrics['current_band'] or "—")
-            st.metric("Pkt Loss (est.)", f"{_metrics['pkt_loss_pct']:.1f}%")
-
         # ───────── Export Scenario Results (CSV + JSON) ─────────
         st.subheader("Export Scenario Summary")
         results = {
@@ -1490,17 +1469,6 @@ if submitted:
             "IR Thermal Detectability (0-100)": round(ir_score,1),
             "Overall Detectability": ("LOW" if overall_kind=="success" else "MODERATE" if overall_kind=="warning" else "HIGH")
         }
-        # NEW: export LLM/comms/security
-        results.update({
-            "Compute Mode": compute_mode,
-            "Secure Telemetry": secure_telemetry,
-            "LLM Calls": _metrics["llm_calls"],
-            "LLM Latency Sum (ms)": _metrics["llm_latency_ms"],
-            "Uplink Used (MB)": round(_metrics["uplink_MB"], 2),
-            "Band Hops (#)": _metrics["band_hops"],
-            "Chosen Band": _metrics["current_band"],
-            "Packet Loss (%)": round(_metrics["pkt_loss_pct"], 1),
-        })
 
         df_res = pd.DataFrame([results])
         csv_buffer = io.BytesIO()
