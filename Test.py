@@ -1,3 +1,5 @@
+from __future__ import annotations
+from typing import Any, Dict, List, Optional, Tuple
 # =========================
 # PATCH: Pinned "Ops Top Bar" (Battery/Fuel + Nav Confidence + Detectability)
 # Adds an always-visible status strip at the very top of the main page.
