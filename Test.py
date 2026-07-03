@@ -1,475 +1,741 @@
-# app.py
-from io import BytesIO
+import math
 import json
+from datetime import datetime, timezone
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+
+# -----------------------------
+# Page configuration
+# -----------------------------
 st.set_page_config(
-    page_title="TCAS II MBSE Workbench",
-    page_icon="✈️",
+    page_title="Lunar Autonomous Landing Zone Assessment",
+    page_icon="🌙",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-st.markdown("""
-<style>
-.stApp {
-    background:
-        radial-gradient(circle at 12% 12%, rgba(255,255,255,.95) 0 6%, transparent 7%),
-        radial-gradient(circle at 32% 8%, rgba(255,255,255,.82) 0 4%, transparent 5%),
-        radial-gradient(circle at 78% 16%, rgba(255,255,255,.88) 0 7%, transparent 8%),
-        linear-gradient(180deg, #87CEEB 0%, #BDEBFF 45%, #F7FCFF 100%);
-}
-h1, h2, h3, p, label, .stMarkdown { color: #08345C; }
-.panel {
-    padding: 1rem;
-    border: 1px solid rgba(8, 52, 92, .25);
-    border-radius: 18px;
-    background: rgba(255,255,255,.86);
-    box-shadow: 0 8px 24px rgba(8, 52, 92, .14);
-}
-</style>
-""", unsafe_allow_html=True)
 
-MISSION = (
-    "Engineer a highly reliable, fully integrated airborne collision-prevention "
-    "architecture that restores pilot trust and ensures airspace safety."
+# -----------------------------
+# Styling
+# -----------------------------
+st.markdown(
+    """
+    <style>
+    :root {
+        --bg: #050914;
+        --panel: #0b1220;
+        --panel2: #101a2e;
+        --border: #20324d;
+        --text: #e6f1ff;
+        --muted: #8ea4c2;
+        --blue: #4db3ff;
+        --green: #5cff8d;
+        --amber: #ffd166;
+        --red: #ff4d4d;
+        --purple: #b96dff;
+    }
+
+    .stApp {
+        background:
+            radial-gradient(circle at 20% 10%, rgba(77,179,255,0.13), transparent 28%),
+            radial-gradient(circle at 90% 0%, rgba(185,109,255,0.10), transparent 22%),
+            linear-gradient(180deg, #030711 0%, #07101f 100%);
+        color: var(--text);
+    }
+
+    [data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #070d18 0%, #0b1424 100%);
+        border-right: 1px solid var(--border);
+    }
+
+    .main-title {
+        font-size: 2.65rem;
+        font-weight: 900;
+        letter-spacing: 0.05em;
+        line-height: 1.05;
+        margin-bottom: 0.15rem;
+        color: #f4f8ff;
+        text-shadow: 0 0 22px rgba(77,179,255,0.25);
+    }
+
+    .subtitle {
+        color: var(--blue);
+        font-size: 1.02rem;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+        margin-bottom: 1.15rem;
+    }
+
+    .section-card {
+        background: rgba(10, 18, 32, 0.88);
+        border: 1px solid rgba(77, 179, 255, 0.22);
+        border-radius: 16px;
+        padding: 1.0rem 1.05rem;
+        box-shadow: 0 0 24px rgba(0,0,0,0.30);
+        height: 100%;
+    }
+
+    .small-card {
+        background: rgba(13, 25, 44, 0.88);
+        border: 1px solid rgba(77, 179, 255, 0.18);
+        border-radius: 14px;
+        padding: 0.85rem;
+        height: 100%;
+    }
+
+    .card-title {
+        color: var(--blue);
+        font-weight: 800;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        font-size: 0.90rem;
+        margin-bottom: 0.75rem;
+    }
+
+    .metric-label {
+        color: var(--muted);
+        font-size: 0.74rem;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+    }
+
+    .metric-value {
+        font-size: 2rem;
+        font-weight: 900;
+        color: var(--green);
+        margin-top: -0.2rem;
+    }
+
+    .metric-value-blue {
+        font-size: 2rem;
+        font-weight: 900;
+        color: var(--blue);
+        margin-top: -0.2rem;
+    }
+
+    .good { color: var(--green); font-weight: 800; }
+    .warn { color: var(--amber); font-weight: 800; }
+    .bad { color: var(--red); font-weight: 800; }
+    .muted { color: var(--muted); }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+
+    div[data-testid="stMetric"] {
+        background: rgba(12, 23, 40, 0.75);
+        border: 1px solid rgba(77,179,255,0.18);
+        padding: 0.75rem;
+        border-radius: 14px;
+    }
+
+    .stButton button, .stDownloadButton button {
+        background: linear-gradient(90deg, #102845, #0d395f);
+        color: #e6f1ff;
+        border: 1px solid rgba(77,179,255,0.45);
+        border-radius: 10px;
+        font-weight: 800;
+    }
+
+    .stProgress > div > div > div > div {
+        background-image: linear-gradient(90deg, #37e67a, #4db3ff);
+    }
+
+    hr {
+        border: none;
+        border-top: 1px solid rgba(77,179,255,0.18);
+        margin: 0.75rem 0;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
-NEEDS = {
-    "SN1": ("User Need", "Restore pilot trust."),
-    "SN2": ("User Need", "Provide intuitive, unified pilot interface."),
-    "SN3": ("User Need", "Deliver clear, non-conflicting, actionable resolution advisories."),
-    "SN4": ("User Need", "Provide supplemental situational awareness cues."),
-    "SN5": ("User Need", "Coordinate and exchange data with Air Traffic Control."),
-    "SN6": ("Customer Need", "Provide reliable integrated collision-prevention architecture."),
-    "SN8": ("Customer Need", "Process complex, high-density airspace scenarios."),
-    "SN9": ("Customer Need", "Support reliable deployment and confidence."),
-    "SN10": ("Customer Need", "Meet safety and performance targets before deployment."),
-    "SN11": ("Customer Need", "Support safer skies through ATC integration."),
-    "SN12": ("Stakeholder Need", "Restore pilot trust and ensure airspace safety."),
-    "SN16": ("Stakeholder Need", "Validate performance through nominal, stress, and edge-case testing."),
-}
 
-SUBSYSTEMS = [
-    ("S1", "Surveillance & Data Acquisition", -4, 0, 1.2, ["SN4","SN6","SN8"], ["F1 Acquire Surveillance Data"], ["ADS-B data","Mode S replies","Aircraft state data"], ["Validated surveillance data"], ["SYS-1.0"], ["Simulation","Data validation"]),
-    ("S2", "Data Fusion & Track Management", -2.6, 0, 1.2, ["SN4","SN6","SN8"], ["F2 Fuse and Manage Traffic Data"], ["Validated surveillance data"], ["Correlated traffic picture"], ["SYS-2.0"], ["Track correlation tests"]),
-    ("S3", "Threat Assessment Engine", -1.1, 0, 1.2, ["SN3","SN4","SN8","SN12"], ["F3 Assess Collision Threats"], ["Traffic picture","Ownship state"], ["Threat assessment results"], ["SYS-3.0"], ["Scenario simulation"]),
-    ("S4", "Resolution Advisory Generator", 0.5, 0, 1.2, ["SN3","SN8","SN12","SN16"], ["F4 Generate Resolution Advisories"], ["Threat assessment results"], ["CLIMB / DESCEND / MAINTAIN advisories"], ["RAG-1.0","RAG-1.1"], ["HIL","Simulation"]),
-    ("S5", "Unified Pilot Interface", 2.2, 0, 1.2, ["SN1","SN2","SN3","SN4"], ["F5 Present Pilot Guidance"], ["Resolution advisories","Traffic display data"], ["Pilot visual and aural guidance"], ["RAG-2.0"], ["Human factors evaluation"]),
-    ("S6", "Pilot Response Assessment", 3.8, 0, 1.2, ["SN1","SN9","SN16"], ["F6 Monitor Pilot Response"], ["Pilot action","Aircraft response"], ["Feedback to advisory generator"], ["SYS-6.0"], ["Pilot-in-the-loop evaluation"]),
-    ("S7", "System Health & Safety Monitor", 0.5, -2, 1.2, ["SN6","SN9","SN10","SN12"], ["F7 Monitor System Health"], ["Subsystem health data","BIT results"], ["Fault status"], ["RAG-4.0"], ["Fault injection test"]),
-    ("S8", "ATC Coordination Interface", 0.5, 2, 1.2, ["SN5","SN11"], ["Coordinate advisory status with ATC"], ["ATC coordination data"], ["Shared advisory status"], ["RAG-3.0"], ["Interface test"]),
-]
+# -----------------------------
+# Utility functions
+# -----------------------------
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
 
-COLS = ["id","name","x","y","z","needs","functions","inputs","outputs","requirements","verification"]
-DATA = [dict(zip(COLS, s)) for s in SUBSYSTEMS]
-BY_ID = {d["id"]: d for d in DATA}
 
-EDGES = [
-    ("S1","S2","Surveillance data"),
-    ("S2","S3","Traffic picture"),
-    ("S3","S4","Threat assessment"),
-    ("S4","S5","Resolution advisory"),
-    ("S5","S6","Pilot guidance / response"),
-    ("S6","S4","Feedback"),
-    ("S4","S8","Advisory status"),
-    ("S7","S5","System health status"),
-    ("S1","S8","Coordination data"),
-]
+def generate_lunar_terrain(seed: int, grid_size: int, roughness: float, crater_count: int, boulder_count: int):
+    rng = np.random.default_rng(seed)
+    x = np.linspace(-500, 500, grid_size)
+    y = np.linspace(-500, 500, grid_size)
+    xx, yy = np.meshgrid(x, y)
 
-TIMELINE = [
-    ("0. Surveillance", ["S1"]),
-    ("1. Fusion", ["S1", "S2"]),
-    ("2. Threat Assessment", ["S1", "S2", "S3"]),
-    ("3. RA Generation", ["S1", "S2", "S3", "S4"]),
-    ("4. Pilot Interface", ["S1", "S2", "S3", "S4", "S5"]),
-    ("5. Pilot Response", ["S1", "S2", "S3", "S4", "S5", "S6"]),
-    ("6. System Monitoring", ["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8"]),
-]
-
-SCENARIOS = {
-    "Cruise": ["S1","S2","S3","S4","S5","S7"],
-    "High Density": ["S1","S2","S3","S4","S5","S6","S7","S8"],
-    "Oceanic / Remote": ["S1","S2","S3","S4","S5","S8"],
-    "Arrival": ["S1","S2","S3","S4","S5","S6","S7","S8"],
-}
-
-FUNCTIONS = [
-    ["F0", "", "Provide Safe Aircraft Separation", "Top-level mission function"],
-    ["F1", "F0", "Acquire Surveillance Data", "Level 1 function"],
-    ["F2", "F0", "Fuse and Manage Traffic Data", "Level 1 function"],
-    ["F3", "F0", "Assess Collision Threats", "Level 1 function"],
-    ["F4", "F0", "Generate Resolution Advisories", "Level 1 function"],
-    ["F5", "F0", "Present Pilot Guidance", "Level 1 function"],
-    ["F6", "F0", "Monitor Pilot Response", "Level 1 function"],
-    ["F7", "F0", "Monitor System Health", "Level 1 function"],
-    ["F4.1", "F4", "Determine Maneuver", "Level 2 decomposition"],
-    ["F4.2", "F4", "Validate Advisory", "Level 2 decomposition"],
-    ["F4.3", "F4", "Resolve Advisory Conflicts", "Level 2 decomposition"],
-    ["F4.4", "F4", "Publish Resolution Advisory", "Level 2 decomposition"],
-    ["F4.5", "F4", "Monitor Advisory Effectiveness", "Support function"],
-]
-
-REQUIREMENTS = [
-    ["RAG-1.0", "", "Originating", "SN3", "S4", "The Resolution Advisory Generator SHALL generate clear, non-conflicting, and actionable resolution advisories when the threat assessment engine determines that safe aircraft separation is at risk.", "Simulation/Test"],
-    ["RAG-1.1", "RAG-1.0", "Derived", "SN3", "S4", "The Resolution Advisory Generator SHALL provide CLIMB, DESCEND, and MAINTAIN advisory options when those advisories are valid for the predicted encounter geometry.", "Inspection/Simulation"],
-    ["RAG-1.2", "RAG-1.0", "Derived", "SN3", "S4", "The Resolution Advisory Generator SHALL inhibit advisories that would create an internal conflict with another active resolution advisory.", "Simulation/Test"],
-    ["RAG-1.3", "RAG-1.0", "Derived", "SN8", "S4", "The Resolution Advisory Generator SHALL process multiple intruder aircraft tracks when operating in high-density airspace scenarios.", "Stress Simulation"],
-    ["RAG-2.0", "", "Originating", "SN2", "S5", "The system SHALL present each active resolution advisory through an intuitive, unified pilot interface.", "Demonstration/Human Factors Evaluation"],
-    ["RAG-2.1", "RAG-2.0", "Derived", "SN2", "S5", "The pilot interface SHALL display the active resolution advisory using plain-language command terminology.", "Inspection/Usability Test"],
-    ["RAG-3.0", "", "Originating", "SN5", "S8", "The system SHALL support coordination of advisory status with Air Traffic Control without making ATC data a prerequisite for onboard resolution advisory generation.", "Analysis/Interface Test"],
-    ["RAG-4.0", "", "Originating", "SN6", "S7", "The system SHALL monitor the operational status of the resolution advisory function and report degraded or unavailable advisory capability to the pilot interface.", "Built-In Test/Fault Injection"],
-    ["RAG-5.0", "", "Originating", "SN14", "S4", "The resolution advisory logic SHALL be evaluated through modeling and simulation in realistic operational environments prior to deployment.", "Modeling/Simulation/Review"],
-    ["RAG-5.1", "RAG-5.0", "Derived", "SN16", "S4", "The simulation test set SHALL include nominal, stress, and edge-case encounter scenarios.", "Simulation/Test Report Review"],
-]
-
-def subsystem_table():
-    df = pd.DataFrame(DATA)
-    for col in ["needs", "functions", "inputs", "outputs", "requirements", "verification"]:
-        df[col] = df[col].apply(", ".join)
-    return df[["id", "name", "needs", "functions", "inputs", "outputs", "requirements", "verification"]]
-
-def needs_table():
-    rows = []
-    for need_id, (cat, text) in NEEDS.items():
-        linked = [d["id"] for d in DATA if need_id in d["needs"]]
-        rows.append([need_id, cat, text, ", ".join(linked)])
-    return pd.DataFrame(rows, columns=["Need ID", "Category", "System Need", "Linked Subsystems"])
-
-def functions_table():
-    return pd.DataFrame(FUNCTIONS, columns=["Function ID", "Parent Function", "Function", "Level"])
-
-def requirements_table():
-    return pd.DataFrame(
-        REQUIREMENTS,
-        columns=[
-            "Requirement ID",
-            "Parent Requirement",
-            "Type",
-            "Source Need",
-            "Subsystem",
-            "Requirement Statement",
-            "Verification Method",
-        ],
+    z = (
+        18 * np.sin(xx / 155)
+        + 12 * np.cos(yy / 128)
+        + 7 * np.sin((xx + yy) / 95)
+        + rng.normal(0, roughness, size=xx.shape)
     )
 
-def interface_table():
-    return pd.DataFrame(EDGES, columns=["Source", "Target", "Interface / Data Flow"])
+    craters = []
+    for _ in range(crater_count):
+        cx, cy = rng.uniform(-420, 420, 2)
+        radius = rng.uniform(28, 95)
+        depth = rng.uniform(8, 32)
+        dist = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+        bowl = -depth * np.exp(-(dist / radius) ** 2)
+        rim = 0.33 * depth * np.exp(-((dist - radius) / (radius * 0.22)) ** 2)
+        z += bowl + rim
+        craters.append({"x": float(cx), "y": float(cy), "radius": float(radius), "depth": float(depth)})
 
-def traceability_table():
-    req_df = requirements_table()
-    return req_df[[
-        "Requirement ID",
-        "Parent Requirement",
-        "Type",
-        "Source Need",
-        "Subsystem",
-        "Verification Method",
-    ]]
+    boulders = []
+    for _ in range(boulder_count):
+        bx, by = rng.uniform(-450, 450, 2)
+        radius = rng.uniform(8, 30)
+        height = rng.uniform(4, 18)
+        dist = np.sqrt((xx - bx) ** 2 + (yy - by) ** 2)
+        z += height * np.exp(-(dist / radius) ** 2)
+        boulders.append({"x": float(bx), "y": float(by), "radius": float(radius), "height": float(height)})
 
-def make_3d_model(show_interfaces, show_inactive, selected_id, need_filter, active_nodes):
+    return x, y, xx, yy, z, craters, boulders
+
+
+def slope_degrees(z: np.ndarray, spacing: float) -> np.ndarray:
+    gy, gx = np.gradient(z, spacing, spacing)
+    return np.degrees(np.arctan(np.sqrt(gx**2 + gy**2)))
+
+
+def radial_penalty(xx, yy, items, kind):
+    penalty = np.zeros_like(xx, dtype=float)
+    for item in items:
+        if kind == "crater":
+            sigma = item["radius"] * 1.35
+            weight = clamp(item["depth"] / 32, 0.2, 1.0)
+        else:
+            sigma = item["radius"] * 2.5
+            weight = clamp(item["height"] / 18, 0.2, 1.0)
+        dist = np.sqrt((xx - item["x"]) ** 2 + (yy - item["y"]) ** 2)
+        penalty += weight * np.exp(-(dist / sigma) ** 2)
+    return clamp_array(penalty, 0, 1)
+
+
+def clamp_array(arr, low, high):
+    return np.maximum(low, np.minimum(high, arr))
+
+
+def landing_suitability(xx, yy, z, slope, craters, boulders, solar_weight, comm_weight, hazard_weight):
+    slope_score = clamp_array(1 - slope / 18, 0, 1)
+    crater_penalty = radial_penalty(xx, yy, craters, "crater")
+    boulder_penalty = radial_penalty(xx, yy, boulders, "boulder")
+    hazard_score = clamp_array(1 - (0.58 * crater_penalty + 0.42 * boulder_penalty), 0, 1)
+
+    # Favor broad, gently elevated ridges for sunlight and direct-to-relay coverage.
+    z_norm = (z - z.min()) / max(1e-6, (z.max() - z.min()))
+    solar_score = clamp_array(0.45 + 0.55 * z_norm + 0.08 * np.sin(xx / 170), 0, 1)
+    comm_score = clamp_array(0.60 + 0.25 * np.cos((xx - yy) / 260) + 0.15 * z_norm, 0, 1)
+
+    score = (
+        hazard_weight * hazard_score
+        + 0.30 * slope_score
+        + solar_weight * solar_score
+        + comm_weight * comm_score
+    )
+    score = score / (hazard_weight + 0.30 + solar_weight + comm_weight)
+    return clamp_array(score * 100, 0, 100), solar_score, comm_score, hazard_score
+
+
+def nearest_grid_index(x, y, target_x, target_y):
+    ix = int(np.argmin(np.abs(x - target_x)))
+    iy = int(np.argmin(np.abs(y - target_y)))
+    return iy, ix
+
+
+def build_terrain_figure(x, y, z, suitability, craters, boulders, best_x, best_y):
     fig = go.Figure()
 
-    fig.add_trace(go.Scatter3d(
-        x=[-4.8, 4.8],
-        y=[0, 0],
-        z=[0.2, 0.2],
-        mode="lines",
-        line=dict(width=14, color="rgba(255,255,255,0.85)"),
-        hoverinfo="skip",
-        showlegend=False,
-    ))
-
-    fig.add_trace(go.Scatter3d(
-        x=[0, 0],
-        y=[-2.8, 2.8],
-        z=[0.15, 0.15],
-        mode="lines",
-        line=dict(width=9, color="rgba(255,255,255,0.65)"),
-        hoverinfo="skip",
-        showlegend=False,
-    ))
-
-    if show_interfaces:
-        for source, target, label in EDGES:
-            a, b = BY_ID[source], BY_ID[target]
-            if not show_inactive and (source not in active_nodes or target not in active_nodes):
-                continue
-
-            fig.add_trace(go.Scatter3d(
-                x=[a["x"], b["x"]],
-                y=[a["y"], b["y"]],
-                z=[a["z"], b["z"]],
-                mode="lines",
-                line=dict(
-                    width=7 if selected_id in [source, target] else 3,
-                    color="rgba(8, 94, 155, 0.86)",
-                ),
-                hovertext=label,
-                hoverinfo="text",
-                showlegend=False,
-            ))
-
-    xs, ys, zs, labels, hover, colors, sizes = [], [], [], [], [], [], []
-
-    for d in DATA:
-        need_active = True if need_filter == "All" else need_filter in d["needs"]
-        scenario_active = d["id"] in active_nodes
-        active = need_active and scenario_active
-
-        if not active and not show_inactive:
-            continue
-
-        xs.append(d["x"])
-        ys.append(d["y"])
-        zs.append(d["z"])
-        labels.append(f'{d["id"]}<br>{d["name"]}')
-        hover.append(
-            f"<b>{d['id']} {d['name']}</b><br>"
-            f"Needs: {', '.join(d['needs'])}<br>"
-            f"Functions: {', '.join(d['functions'])}<br>"
-            f"Outputs: {', '.join(d['outputs'])}"
+    fig.add_trace(
+        go.Surface(
+            x=x,
+            y=y,
+            z=z,
+            surfacecolor=suitability,
+            colorscale=[
+                [0.0, "#3b0000"],
+                [0.25, "#9d1d1d"],
+                [0.50, "#c58922"],
+                [0.72, "#84b547"],
+                [1.0, "#38e67a"],
+            ],
+            colorbar=dict(title="LZ Score", thickness=12, len=0.70),
+            opacity=0.96,
+            showscale=True,
         )
+    )
 
-        if d["id"] == selected_id:
-            colors.append("#FFB703")
-            sizes.append(24)
-        elif active:
-            colors.append("#0077B6")
-            sizes.append(18)
-        else:
-            colors.append("#B8D8E8")
-            sizes.append(10)
+    crater_x = [c["x"] for c in craters]
+    crater_y = [c["y"] for c in craters]
+    crater_z = []
+    for c in craters:
+        iy, ix = nearest_grid_index(x, y, c["x"], c["y"])
+        crater_z.append(z[iy, ix] + 8)
 
-    fig.add_trace(go.Scatter3d(
-        x=xs,
-        y=ys,
-        z=zs,
-        mode="markers+text",
-        text=labels,
-        textposition="top center",
-        marker=dict(size=sizes, color=colors, line=dict(width=2, color="white")),
-        hovertext=hover,
-        hoverinfo="text",
-        showlegend=False,
-    ))
+    fig.add_trace(
+        go.Scatter3d(
+            x=crater_x,
+            y=crater_y,
+            z=crater_z,
+            mode="markers",
+            marker=dict(size=4, symbol="circle", color="#ff4d4d"),
+            name="Crater hazards",
+        )
+    )
+
+    boulder_x = [b["x"] for b in boulders]
+    boulder_y = [b["y"] for b in boulders]
+    boulder_z = []
+    for b in boulders:
+        iy, ix = nearest_grid_index(x, y, b["x"], b["y"])
+        boulder_z.append(z[iy, ix] + 10)
+
+    fig.add_trace(
+        go.Scatter3d(
+            x=boulder_x,
+            y=boulder_y,
+            z=boulder_z,
+            mode="markers",
+            marker=dict(size=3, symbol="diamond", color="#ffb000"),
+            name="Boulder hazards",
+        )
+    )
+
+    iy, ix = nearest_grid_index(x, y, best_x, best_y)
+    fig.add_trace(
+        go.Scatter3d(
+            x=[best_x],
+            y=[best_y],
+            z=[z[iy, ix] + 30],
+            mode="markers+text",
+            marker=dict(size=9, symbol="diamond", color="#5cff8d"),
+            text=["BEST LZ"],
+            textposition="top center",
+            name="Recommended LZ",
+        )
+    )
 
     fig.update_layout(
-        height=720,
-        paper_bgcolor="rgba(255,255,255,0)",
+        height=610,
+        margin=dict(l=0, r=0, t=20, b=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#e6f1ff"),
         scene=dict(
-            bgcolor="rgba(255,255,255,0)",
-            xaxis=dict(visible=False),
-            yaxis=dict(visible=False),
-            zaxis=dict(visible=False),
-            camera=dict(eye=dict(x=1.7, y=1.8, z=1.25)),
-            aspectmode="data",
+            bgcolor="rgba(0,0,0,0)",
+            xaxis=dict(title="East-West, m", gridcolor="#20324d", showbackground=False),
+            yaxis=dict(title="North-South, m", gridcolor="#20324d", showbackground=False),
+            zaxis=dict(title="Elevation, m", gridcolor="#20324d", showbackground=False),
+            camera=dict(eye=dict(x=1.6, y=-1.7, z=0.85)),
+            aspectratio=dict(x=1.35, y=1.35, z=0.35),
         ),
-        margin=dict(l=0, r=0, t=10, b=0),
-        showlegend=False,
+        legend=dict(
+            bgcolor="rgba(8,14,24,0.70)",
+            bordercolor="#20324d",
+            borderwidth=1,
+            orientation="h",
+            y=0.01,
+        ),
     )
     return fig
 
-st.sidebar.title("✈️ MBSE Controls")
 
-view = st.sidebar.radio(
-    "Engineering View",
-    [
-        "Digital Twin",
-        "Mission View",
-        "Requirements View",
-        "Functional View",
-        "Logical Architecture",
-        "Verification & Validation",
-        "Assignment Export",
-    ]
-)
-
-scenario = st.sidebar.selectbox("Operational Scenario", list(SCENARIOS.keys()))
-need_filter = st.sidebar.selectbox("Highlight System Need", ["All"] + list(NEEDS.keys()))
-selected = st.sidebar.selectbox(
-    "Inspect Subsystem",
-    [f'{d["id"]} – {d["name"]}' for d in DATA],
-    index=3
-)
-selected_id = selected.split(" – ")[0]
-
-show_interfaces = st.sidebar.checkbox("Show Interfaces", True)
-show_requirements = st.sidebar.checkbox("Show Requirements Layer", True)
-show_verification = st.sidebar.checkbox("Show Verification Layer", False)
-show_inactive = st.sidebar.checkbox("Show Inactive Subsystems", True)
-
-timeline_step = st.sidebar.slider(
-    "Mission Timeline",
-    0,
-    len(TIMELINE) - 1,
-    len(TIMELINE) - 1,
-    format="%d"
-)
-
-active_from_timeline = TIMELINE[timeline_step][1]
-active_from_scenario = SCENARIOS[scenario]
-active_nodes = sorted(set(active_from_timeline).intersection(set(active_from_scenario)))
-
-st.title("TCAS II MBSE Workbench")
-st.caption("Sky-blue interactive digital twin for subsystem traceability, functional modeling, and verification.")
-
-if view == "Digital Twin":
-    left, right = st.columns([2.2, 1])
-
-    with left:
-        fig = make_3d_model(
-            show_interfaces=show_interfaces,
-            show_inactive=show_inactive,
-            selected_id=selected_id,
-            need_filter=need_filter,
-            active_nodes=active_nodes,
+def build_heatmap(title, x, y, values, colorscale, best_x=None, best_y=None):
+    fig = go.Figure(
+        go.Heatmap(
+            x=x,
+            y=y,
+            z=values,
+            colorscale=colorscale,
+            colorbar=dict(thickness=10),
         )
-        st.plotly_chart(fig, use_container_width=True)
-
-    with right:
-        d = BY_ID[selected_id]
-        st.markdown('<div class="panel">', unsafe_allow_html=True)
-        st.subheader(f'{d["id"]} {d["name"]}')
-        st.write("**Timeline Phase:** " + TIMELINE[timeline_step][0])
-        st.write("**Scenario:** " + scenario)
-        st.write("**Functions:** " + ", ".join(d["functions"]))
-        st.write("**Inputs:** " + ", ".join(d["inputs"]))
-        st.write("**Outputs:** " + ", ".join(d["outputs"]))
-        st.write("**System Needs:**")
-        for n in d["needs"]:
-            category, text = NEEDS.get(n, ("", ""))
-            st.write(f"- **{n} ({category}):** {text}")
-        if show_requirements:
-            st.write("**Requirements:** " + ", ".join(d["requirements"]))
-        if show_verification:
-            st.write("**Verification:** " + ", ".join(d["verification"]))
-        st.markdown("</div>", unsafe_allow_html=True)
-
-elif view == "Mission View":
-    st.markdown('<div class="panel">', unsafe_allow_html=True)
-    st.header("Mission Statement")
-    st.write(MISSION)
-    st.header("Operational Purpose")
-    st.write(
-        "Transform aircraft state, surveillance, environmental, and ATC coordination data "
-        "into timely, clear, and actionable resolution advisories that support safe aircraft separation."
     )
-    st.markdown("</div>", unsafe_allow_html=True)
-
-elif view == "Requirements View":
-    st.dataframe(needs_table(), use_container_width=True, hide_index=True)
-    st.subheader("Requirements")
-    st.dataframe(requirements_table(), use_container_width=True, hide_index=True)
-
-elif view == "Functional View":
-    st.markdown('<div class="panel">', unsafe_allow_html=True)
-    st.header("Functional Flow")
-    st.write(
-        "F0 Provide Safe Aircraft Separation → "
-        "F1 Acquire Surveillance Data → "
-        "F2 Fuse and Manage Traffic Data → "
-        "F3 Assess Collision Threats → "
-        "F4 Generate Resolution Advisories → "
-        "F5 Present Pilot Guidance → "
-        "F6 Monitor Pilot Response → "
-        "F7 Monitor System Health"
+    if best_x is not None:
+        fig.add_trace(
+            go.Scatter(
+                x=[best_x],
+                y=[best_y],
+                mode="markers+text",
+                marker=dict(size=14, symbol="x", color="#ffffff"),
+                text=["LZ"],
+                textposition="top center",
+                name="LZ",
+            )
+        )
+    fig.update_layout(
+        title=title,
+        height=305,
+        margin=dict(l=0, r=0, t=40, b=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#e6f1ff"),
+        xaxis=dict(gridcolor="#20324d"),
+        yaxis=dict(gridcolor="#20324d", scaleanchor="x", scaleratio=1),
     )
-    st.header("Level 2 Decomposition of F4")
-    st.write(
-        "F4.1 Determine Maneuver → "
-        "F4.2 Validate Advisory → "
-        "F4.3 Resolve Advisory Conflicts → "
-        "F4.4 Publish Resolution Advisory → "
-        "F4.5 Monitor Advisory Effectiveness"
+    return fig
+
+
+def rover_path(best_x, best_y, radius, legs):
+    theta = np.linspace(0, 2 * np.pi, legs, endpoint=False)
+    points = []
+    for i, t in enumerate(theta):
+        r = radius * (0.65 + 0.35 * ((i % 3) / 2))
+        px = best_x + r * np.cos(t)
+        py = best_y + r * np.sin(t)
+        points.append((float(clamp(px, -480, 480)), float(clamp(py, -480, 480))))
+    points.insert(0, (float(best_x), float(best_y)))
+    points.append((float(best_x), float(best_y)))
+    return points
+
+
+def path_distance(points):
+    return sum(math.dist(points[i], points[i + 1]) for i in range(len(points) - 1))
+
+
+def risk_band(score):
+    if score >= 85:
+        return "LOW", "good"
+    if score >= 70:
+        return "MODERATE", "warn"
+    return "HIGH", "bad"
+
+
+# -----------------------------
+# Sidebar inputs
+# -----------------------------
+with st.sidebar:
+    st.markdown("## 🌙 Mission Controls")
+    mission_id = st.text_input("Mission ID", "LZAP-2026-001")
+    target_body = st.selectbox("Target Body", ["Moon", "Mars", "Phobos", "Europa", "Custom airless body"], index=0)
+    mission_profile = st.selectbox(
+        "Mission Profile",
+        [
+            "Landing Zone + Habitat Preparation",
+            "Landing Zone Survey Only",
+            "Habitat Site Planning Only",
+            "Communications Relay Survey",
+        ],
+        index=0,
     )
-    st.markdown("</div>", unsafe_allow_html=True)
-    st.subheader("Function Table")
-    st.dataframe(functions_table(), use_container_width=True, hide_index=True)
 
-elif view == "Logical Architecture":
-    st.dataframe(subsystem_table(), use_container_width=True, hide_index=True)
-    st.subheader("Interface Map")
-    st.dataframe(interface_table(), use_container_width=True, hide_index=True)
+    st.markdown("---")
+    st.markdown("### Terrain Model")
+    seed = st.number_input("Simulation Seed", min_value=1, max_value=9999, value=42, step=1)
+    grid_size = st.slider("Map Resolution", 40, 110, 72, 2)
+    roughness = st.slider("Regolith Roughness", 0.5, 8.0, 3.0, 0.1)
+    crater_count = st.slider("Crater Density", 3, 35, 12)
+    boulder_count = st.slider("Boulder Density", 5, 80, 28)
 
-elif view == "Verification & Validation":
-    rows = []
-    for d in DATA:
-        for v in d["verification"]:
-            rows.append([d["id"], d["name"], v, ", ".join(d["requirements"])])
+    st.markdown("---")
+    st.markdown("### Scoring Weights")
+    hazard_weight = st.slider("Hazard Avoidance Weight", 0.30, 0.70, 0.48, 0.01)
+    solar_weight = st.slider("Solar Exposure Weight", 0.05, 0.30, 0.14, 0.01)
+    comm_weight = st.slider("Communication Coverage Weight", 0.05, 0.30, 0.08, 0.01)
 
-    st.dataframe(
-        pd.DataFrame(rows, columns=["Subsystem", "Name", "Verification Method", "Requirement IDs"]),
+    st.markdown("---")
+    st.markdown("### Rover Planning")
+    rover_speed = st.slider("Rover Survey Speed, m/s", 0.05, 1.50, 0.35, 0.05)
+    route_radius = st.slider("Survey Radius, m", 80, 420, 260, 10)
+    route_legs = st.slider("Survey Waypoints", 4, 16, 9)
+
+    run_button = st.button("Run Autonomous Assessment", use_container_width=True)
+
+
+# -----------------------------
+# Model execution
+# -----------------------------
+x, y, xx, yy, z, craters, boulders = generate_lunar_terrain(
+    int(seed), int(grid_size), float(roughness), int(crater_count), int(boulder_count)
+)
+spacing = abs(x[1] - x[0])
+slope = slope_degrees(z, spacing)
+
+suitability, solar_score, comm_score, hazard_score = landing_suitability(
+    xx, yy, z, slope, craters, boulders, float(solar_weight), float(comm_weight), float(hazard_weight)
+)
+
+best_idx = np.unravel_index(np.argmax(suitability), suitability.shape)
+best_y = float(yy[best_idx])
+best_x = float(xx[best_idx])
+best_score = float(suitability[best_idx])
+best_slope = float(slope[best_idx])
+best_solar = float(solar_score[best_idx])
+best_comm = float(comm_score[best_idx])
+best_hazard = float(hazard_score[best_idx])
+
+risk, risk_class = risk_band(best_score)
+path_points = rover_path(best_x, best_y, route_radius, route_legs)
+total_path_m = path_distance(path_points)
+survey_time_hr = total_path_m / max(rover_speed, 0.01) / 3600
+
+crater_risks = sum(1 for c in craters if math.dist((best_x, best_y), (c["x"], c["y"])) < c["radius"] * 2.2)
+boulder_risks = sum(1 for b in boulders if math.dist((best_x, best_y), (b["x"], b["y"])) < b["radius"] * 3.0)
+total_hazards = crater_risks + boulder_risks
+survey_coverage = clamp((math.pi * route_radius**2) / (1000 * 1000) * 100, 0, 100)
+
+
+# -----------------------------
+# Header
+# -----------------------------
+st.markdown(
+    """
+    <div class="main-title">LUNAR AUTONOMOUS LANDING ZONE ASSESSMENT</div>
+    <div class="subtitle">AI-powered survey, hazard detection, and habitat planning for future lunar operations</div>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# -----------------------------
+# Top mission metrics
+# -----------------------------
+m1, m2, m3, m4, m5 = st.columns(5)
+m1.metric("Landing Zone Score", f"{best_score:.0f}/100", risk)
+m2.metric("Slope at LZ", f"{best_slope:.1f}°", "Target < 5°")
+m3.metric("Hazards Near LZ", f"{total_hazards}", "Crater + boulder")
+m4.metric("Solar Index", f"{best_solar*100:.0f}%", "Power viability")
+m5.metric("Comm Index", f"{best_comm*100:.0f}%", "Relay visibility")
+
+
+# -----------------------------
+# Main layout
+# -----------------------------
+left, right = st.columns([3.6, 1.25], gap="large")
+
+with left:
+    st.markdown('<div class="section-card"><div class="card-title">3D Terrain Map & Landing Zone Analysis</div>', unsafe_allow_html=True)
+    st.plotly_chart(
+        build_terrain_figure(x, y, z, suitability, craters, boulders, best_x, best_y),
         use_container_width=True,
-        hide_index=True,
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+with right:
+    st.markdown('<div class="section-card"><div class="card-title">Mission Overview</div>', unsafe_allow_html=True)
+    st.markdown(
+        f"""
+        <span class="metric-label">Mission ID</span><br>
+        <span class="mono">{mission_id}</span><br><br>
+        <span class="metric-label">Target Body</span><br>
+        <b>{target_body}</b><br><br>
+        <span class="metric-label">Profile</span><br>
+        <b>{mission_profile}</b><br><br>
+        <span class="metric-label">System Status</span><br>
+        <span class="good">NOMINAL</span><br><br>
+        <span class="metric-label">Assessment</span><br>
+        <span class="{risk_class}">{risk} RISK</span>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown("<hr>", unsafe_allow_html=True)
+    st.markdown('<div class="card-title">AI Hazard Detection</div>', unsafe_allow_html=True)
+    st.write(f"🔴 Craters detected: **{len(craters)}**")
+    st.write(f"🟠 Boulder fields detected: **{len(boulders)}**")
+    st.write(f"🟡 Local hazards near LZ: **{total_hazards}**")
+    st.write(f"🟢 Regolith stability estimate: **{best_hazard*100:.0f}%**")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+# -----------------------------
+# Secondary analysis panels
+# -----------------------------
+c1, c2, c3 = st.columns(3, gap="large")
+
+with c1:
+    st.markdown('<div class="small-card"><div class="card-title">Slope Hazard Map</div>', unsafe_allow_html=True)
+    st.plotly_chart(
+        build_heatmap(
+            "Slope, degrees",
+            x,
+            y,
+            slope,
+            "Inferno",
+            best_x,
+            best_y,
+        ),
+        use_container_width=True,
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+with c2:
+    st.markdown('<div class="small-card"><div class="card-title">Solar Exposure Analysis</div>', unsafe_allow_html=True)
+    st.plotly_chart(
+        build_heatmap(
+            "Relative Solar Exposure",
+            x,
+            y,
+            solar_score,
+            "YlOrBr",
+            best_x,
+            best_y,
+        ),
+        use_container_width=True,
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+with c3:
+    st.markdown('<div class="small-card"><div class="card-title">Communication Coverage</div>', unsafe_allow_html=True)
+    st.plotly_chart(
+        build_heatmap(
+            "Relay Link Quality",
+            x,
+            y,
+            comm_score,
+            "Blues",
+            best_x,
+            best_y,
+        ),
+        use_container_width=True,
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+# -----------------------------
+# Habitat and rover path
+# -----------------------------
+h1, h2 = st.columns([1.55, 1.45], gap="large")
+
+with h1:
+    st.markdown('<div class="section-card"><div class="card-title">Habitat Planning Recommendation</div>', unsafe_allow_html=True)
+
+    hab_offset = 115
+    habitat_x = clamp(best_x + hab_offset, -480, 480)
+    habitat_y = clamp(best_y + hab_offset * 0.45, -480, 480)
+    power_x = clamp(best_x - 120, -480, 480)
+    power_y = clamp(best_y + 85, -480, 480)
+    comm_x = clamp(best_x + 180, -480, 480)
+    comm_y = clamp(best_y - 75, -480, 480)
+
+    plan_df = pd.DataFrame(
+        [
+            ["Primary Landing Zone", best_x, best_y, "Low slope, strong hazard clearance"],
+            ["Habitat Zone", habitat_x, habitat_y, "Offset from descent plume and local hazards"],
+            ["Solar Power Zone", power_x, power_y, "Higher exposure and clear line of sight"],
+            ["Comms Relay", comm_x, comm_y, "Improves Earth/relay geometry"],
+        ],
+        columns=["Element", "X m", "Y m", "Rationale"],
     )
 
-elif view == "Assignment Export":
-    st.header("Assignment Export Package")
+    st.dataframe(plan_df, use_container_width=True, hide_index=True)
 
-    needs_df = needs_table()
-    subsystems_df = subsystem_table()
-    interfaces_df = interface_table()
-    functions_df = functions_table()
-    requirements_df = requirements_table()
-    traceability_df = traceability_table()
+    st.markdown(
+        f"""
+        **Engineering interpretation:** the recommended site balances terrain safety, slope, solar power availability,
+        and communication geometry. A habitat should not be placed directly at the touchdown point because plume effects,
+        dust lofting, and landing dispersions create avoidable risk.
+        """
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    export_data = {
-        "mission_statement": MISSION,
-        "needs": needs_df.to_dict(orient="records"),
-        "subsystems": subsystems_df.to_dict(orient="records"),
-        "interfaces": interfaces_df.to_dict(orient="records"),
-        "functions": functions_df.to_dict(orient="records"),
-        "requirements": requirements_df.to_dict(orient="records"),
-        "traceability": traceability_df.to_dict(orient="records"),
+with h2:
+    st.markdown('<div class="section-card"><div class="card-title">Rover Path Planning</div>', unsafe_allow_html=True)
+    px = [p[0] for p in path_points]
+    py = [p[1] for p in path_points]
+    path_fig = go.Figure()
+    path_fig.add_trace(
+        go.Heatmap(
+            x=x,
+            y=y,
+            z=suitability,
+            colorscale="Viridis",
+            colorbar=dict(thickness=10, title="LZ"),
+        )
+    )
+    path_fig.add_trace(
+        go.Scatter(
+            x=px,
+            y=py,
+            mode="lines+markers",
+            line=dict(width=3),
+            marker=dict(size=8),
+            name="Rover survey path",
+        )
+    )
+    path_fig.update_layout(
+        height=360,
+        margin=dict(l=0, r=0, t=10, b=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#e6f1ff"),
+        xaxis=dict(gridcolor="#20324d"),
+        yaxis=dict(gridcolor="#20324d", scaleanchor="x", scaleratio=1),
+    )
+    st.plotly_chart(path_fig, use_container_width=True)
+    st.write(f"Survey path length: **{total_path_m/1000:.2f} km**")
+    st.write(f"Estimated survey time: **{survey_time_hr:.2f} hr** at **{rover_speed:.2f} m/s**")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+# -----------------------------
+# Recommendations and export
+# -----------------------------
+r1, r2 = st.columns([1.6, 1.0], gap="large")
+
+recommendations = [
+    "Select the identified landing zone as the primary candidate if orbital imagery confirms local hazard clearance.",
+    "Place the habitat outside the touchdown zone to reduce dust, plume, and descent dispersion risk.",
+    "Deploy a solar array on the higher-exposure ridge and validate shadowing across the local lunar day.",
+    "Use LiDAR, stereo EO imagery, thermal imaging, and ground-penetrating radar for final site verification.",
+    "Establish a relay node before crew arrival to improve command, telemetry, and contingency operations.",
+]
+
+with r1:
+    st.markdown('<div class="section-card"><div class="card-title">AI Mission Recommendations</div>', unsafe_allow_html=True)
+    for rec in recommendations:
+        st.success(rec)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+with r2:
+    st.markdown('<div class="section-card"><div class="card-title">Mission Summary & Export</div>', unsafe_allow_html=True)
+    summary = {
+        "mission_id": mission_id,
+        "target_body": target_body,
+        "mission_profile": mission_profile,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "recommended_landing_zone": {"x_m": best_x, "y_m": best_y, "score": best_score},
+        "slope_deg": best_slope,
+        "solar_index": best_solar,
+        "communication_index": best_comm,
+        "local_hazards": total_hazards,
+        "craters_detected": len(craters),
+        "boulders_detected": len(boulders),
+        "survey_path_km": total_path_m / 1000,
+        "estimated_survey_time_hr": survey_time_hr,
+        "recommendations": recommendations,
     }
 
-    col1, col2, col3 = st.columns(3)
+    st.json(summary, expanded=False)
+    st.download_button(
+        "Export Mission Report JSON",
+        data=json.dumps(summary, indent=2),
+        file_name=f"{mission_id}_mission_report.json",
+        mime="application/json",
+        use_container_width=True,
+    )
 
-    with col1:
-        st.download_button(
-            "Download Assignment Data JSON",
-            json.dumps(export_data, indent=2).encode("utf-8"),
-            "tcas_assignment_data.json",
-            "application/json",
-            use_container_width=True,
-        )
+    csv_df = pd.DataFrame([summary]).drop(columns=["recommendations"])
+    st.download_button(
+        "Export Mission Summary CSV",
+        data=csv_df.to_csv(index=False),
+        file_name=f"{mission_id}_mission_summary.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    with col2:
-        st.download_button(
-            "Download Requirements CSV",
-            requirements_df.to_csv(index=False).encode("utf-8"),
-            "tcas_requirements.csv",
-            "text/csv",
-            use_container_width=True,
-        )
 
-    excel_buffer = BytesIO()
-    with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-        needs_df.to_excel(writer, sheet_name="System Needs", index=False)
-        subsystems_df.to_excel(writer, sheet_name="Subsystems", index=False)
-        interfaces_df.to_excel(writer, sheet_name="Interfaces", index=False)
-        functions_df.to_excel(writer, sheet_name="Functions", index=False)
-        requirements_df.to_excel(writer, sheet_name="Requirements", index=False)
-        traceability_df.to_excel(writer, sheet_name="Traceability", index=False)
-
-    with col3:
-        st.download_button(
-            "Download Assignment Workbook",
-            excel_buffer.getvalue(),
-            "tcas_assignment_export.xlsx",
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
-
-    st.subheader("Export Preview")
-    st.dataframe(traceability_df, use_container_width=True, hide_index=True)
-
-st.download_button(
-    "Download Subsystem Data CSV",
-    subsystem_table().to_csv(index=False).encode("utf-8"),
-    "tcas_mbse_subsystems.csv",
-    "text/csv",
+# -----------------------------
+# Footer
+# -----------------------------
+st.markdown(
+    """
+    <br>
+    <div class="muted" style="text-align:center; letter-spacing:0.20em; text-transform:uppercase;">
+        Autonomy | Intelligence | Exploration | Systems Engineering
+    </div>
+    """,
+    unsafe_allow_html=True,
 )
