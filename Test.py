@@ -1,1476 +1,389 @@
+"""Offshore Autonomous Blade Inspection Mission Simulator V2.
 
-import math
-import json
-import heapq
-import os
-from datetime import datetime, timezone
+Concept-level systems-engineering simulator. Not a validated flight-dynamics,
+operational-safety, or defect-detection system.
+"""
+from __future__ import annotations
+
+import json, math
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-
-# -----------------------------
-# Optional LLM client state
-# -----------------------------
-OPENAI_CLIENT = None
-OPENAI_ERROR = None
-
-
-# -----------------------------
-# Page configuration
-# -----------------------------
-st.set_page_config(
-    page_title="Planetary Autonomous Landing Zone Assessment",
-    page_icon="🌙",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-
-# -----------------------------
-# Styling
-# -----------------------------
-st.markdown(
-    """
-    <style>
-    :root {
-        --bg: #050914;
-        --panel: #0b1220;
-        --panel2: #101a2e;
-        --border: #20324d;
-        --text: #e6f1ff;
-        --muted: #8ea4c2;
-        --blue: #4db3ff;
-        --green: #5cff8d;
-        --amber: #ffd166;
-        --red: #ff4d4d;
-        --purple: #b96dff;
-    }
-
-    .stApp {
-        background:
-            radial-gradient(circle at 20% 10%, rgba(77,179,255,0.13), transparent 28%),
-            radial-gradient(circle at 90% 0%, rgba(185,109,255,0.10), transparent 22%),
-            linear-gradient(180deg, #030711 0%, #07101f 100%);
-        color: var(--text);
-    }
-
-    [data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #070d18 0%, #0b1424 100%);
-        border-right: 1px solid var(--border);
-    }
-
-    .main-title {
-        font-size: 2.35rem;
-        font-weight: 900;
-        letter-spacing: 0.05em;
-        line-height: 1.05;
-        margin-bottom: 0.15rem;
-        color: #f4f8ff;
-        text-shadow: 0 0 22px rgba(77,179,255,0.25);
-    }
-
-    .subtitle {
-        color: var(--blue);
-        font-size: 1.0rem;
-        letter-spacing: 0.16em;
-        text-transform: uppercase;
-        margin-bottom: 1.15rem;
-    }
-
-    .section-card {
-        background: rgba(10, 18, 32, 0.88);
-        border: 1px solid rgba(77, 179, 255, 0.22);
-        border-radius: 16px;
-        padding: 1.0rem 1.05rem;
-        box-shadow: 0 0 24px rgba(0,0,0,0.30);
-        height: 100%;
-    }
-
-    .small-card {
-        background: rgba(13, 25, 44, 0.88);
-        border: 1px solid rgba(77, 179, 255, 0.18);
-        border-radius: 14px;
-        padding: 0.85rem;
-        height: 100%;
-    }
-
-    .card-title {
-        color: var(--blue);
-        font-weight: 800;
-        letter-spacing: 0.08em;
-        text-transform: uppercase;
-        font-size: 0.90rem;
-        margin-bottom: 0.75rem;
-    }
-
-    .metric-label {
-        color: var(--muted);
-        font-size: 0.74rem;
-        text-transform: uppercase;
-        letter-spacing: 0.08em;
-    }
-
-    .good { color: var(--green); font-weight: 800; }
-    .warn { color: var(--amber); font-weight: 800; }
-    .bad { color: var(--red); font-weight: 800; }
-    .muted { color: var(--muted); }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
-
-    div[data-testid="stMetric"] {
-        background: rgba(12, 23, 40, 0.75);
-        border: 1px solid rgba(77,179,255,0.18);
-        padding: 0.75rem;
-        border-radius: 14px;
-    }
-
-    .stButton button, .stDownloadButton button, .stFormSubmitButton button {
-        background: linear-gradient(90deg, #102845, #0d395f);
-        color: #e6f1ff;
-        border: 1px solid rgba(77,179,255,0.45);
-        border-radius: 10px;
-        font-weight: 800;
-    }
-
-    hr {
-        border: none;
-        border-top: 1px solid rgba(77,179,255,0.18);
-        margin: 0.75rem 0;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-# -----------------------------
-# Planetary constants and presets
-# -----------------------------
-BODY_PRESETS = {
-    "Moon": {
-        "gravity": 1.62,
-        "solar_flux": 1361.0,
-        "atmosphere": False,
-        "day_length_hr": 708.7,
-        "comm_mode": "Earth direct or lunar relay",
-        "terrain_note": "Airless regolith with craters, ejecta, boulders, and severe shadow contrast",
-        "slope_soft_limit": 5.0,
-        "slope_hard_limit": 15.0,
-        "safe_hazard_buffer_m": 35.0,
-        "thermal_penalty": 0.10,
-    },
-    "Mars": {
-        "gravity": 3.71,
-        "solar_flux": 586.0,
-        "atmosphere": True,
-        "day_length_hr": 24.66,
-        "comm_mode": "Orbiter relay preferred",
-        "terrain_note": "Dust, rocks, slopes, thermal cycling, and atmospheric entry constraints",
-        "slope_soft_limit": 7.0,
-        "slope_hard_limit": 18.0,
-        "safe_hazard_buffer_m": 45.0,
-        "thermal_penalty": 0.18,
-    },
-    "Phobos": {
-        "gravity": 0.0057,
-        "solar_flux": 586.0,
-        "atmosphere": False,
-        "day_length_hr": 7.65,
-        "comm_mode": "Mars proximity relay geometry",
-        "terrain_note": "Extremely low gravity with irregular shape, weak surface acceleration, and escape-risk operations",
-        "slope_soft_limit": 3.0,
-        "slope_hard_limit": 10.0,
-        "safe_hazard_buffer_m": 60.0,
-        "thermal_penalty": 0.16,
-    },
-    "Europa": {
-        "gravity": 1.315,
-        "solar_flux": 50.0,
-        "atmosphere": False,
-        "day_length_hr": 85.2,
-        "comm_mode": "Jupiter system relay required",
-        "terrain_note": "Ice surface, radiation environment, ridges, chaos terrain, and low solar power availability",
-        "slope_soft_limit": 4.0,
-        "slope_hard_limit": 14.0,
-        "safe_hazard_buffer_m": 50.0,
-        "thermal_penalty": 0.28,
-    },
-    "Custom airless body": {
-        "gravity": 1.0,
-        "solar_flux": 1000.0,
-        "atmosphere": False,
-        "day_length_hr": 100.0,
-        "comm_mode": "User-defined relay geometry",
-        "terrain_note": "Generic airless-body terrain model",
-        "slope_soft_limit": 5.0,
-        "slope_hard_limit": 15.0,
-        "safe_hazard_buffer_m": 40.0,
-        "thermal_penalty": 0.15,
-    },
-}
-
-
-# -----------------------------
-# Optional LLM client helper
-# -----------------------------
-def get_openai_client():
-    """Create the OpenAI client lazily so Streamlit page config stays first."""
-    global OPENAI_CLIENT, OPENAI_ERROR
-
-    if OPENAI_CLIENT is not None:
-        return OPENAI_CLIENT
-
-    try:
-        from openai import OpenAI
-
-        api_key = None
-        try:
-            api_key = st.secrets.get("OPENAI_API_KEY", None)
-        except Exception:
-            api_key = None
-
-        api_key = api_key or os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise RuntimeError("OPENAI_API_KEY is not set in Streamlit secrets or environment variables.")
-
-        OPENAI_CLIENT = OpenAI(api_key=api_key)
-        return OPENAI_CLIENT
-    except Exception as exc:
-        OPENAI_ERROR = str(exc)
-        raise
-
-
-# -----------------------------
-# Utility functions
-# -----------------------------
-def clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(high, value))
-
-
-def clamp_array(arr, low, high):
-    return np.maximum(low, np.minimum(high, arr))
-
-
-def unit_vector_from_az_el(az_deg: float, el_deg: float) -> np.ndarray:
-    az = math.radians(az_deg)
-    el = math.radians(el_deg)
-    return np.array([
-        math.cos(el) * math.sin(az),
-        math.cos(el) * math.cos(az),
-        math.sin(el),
-    ], dtype=float)
-
-
-def generate_planetary_terrain(seed: int, grid_size: int, roughness: float, crater_count: int, boulder_count: int, body_name: str):
-    rng = np.random.default_rng(seed)
-    x = np.linspace(-500, 500, grid_size)
-    y = np.linspace(-500, 500, grid_size)
-    xx, yy = np.meshgrid(x, y)
-
-    body = BODY_PRESETS[body_name]
-    gravity_scale = clamp(body["gravity"] / 1.62, 0.05, 2.5)
-
-    z = (
-        16 * np.sin(xx / 155)
-        + 11 * np.cos(yy / 128)
-        + 7 * np.sin((xx + yy) / 95)
-        + rng.normal(0, roughness, size=xx.shape)
-    )
-
-    if body_name == "Europa":
-        z += 7 * np.sin((xx - 0.5 * yy) / 55)
-    elif body_name == "Phobos":
-        z += 26 * np.sin(xx / 260) + 19 * np.cos(yy / 240)
-    elif body_name == "Mars":
-        z += 5 * np.sin(xx / 75)
-
-    craters = []
-    for i in range(crater_count):
-        cx, cy = rng.uniform(-420, 420, 2)
-        radius = rng.uniform(28, 95)
-        depth = rng.uniform(8, 32)
-
-        if body_name == "Phobos":
-            radius *= 1.25
-            depth *= 0.85
-        elif body_name == "Europa":
-            depth *= 0.55
-        elif body_name == "Mars":
-            depth *= 0.75
-
-        dist = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
-        bowl = -depth * np.exp(-(dist / radius) ** 2)
-        rim = 0.33 * depth * np.exp(-((dist - radius) / (radius * 0.22)) ** 2)
-        z += bowl + rim
-        craters.append(
-            {
-                "id": f"C-{i + 1:03d}",
-                "x": float(cx),
-                "y": float(cy),
-                "radius": float(radius),
-                "depth": float(depth),
-            }
-        )
-
-    boulders = []
-    boulder_height_scale = clamp(1.15 / max(gravity_scale, 0.25), 0.6, 2.1)
-    for i in range(boulder_count):
-        bx, by = rng.uniform(-450, 450, 2)
-        radius = rng.uniform(8, 30)
-        height = rng.uniform(4, 18) * boulder_height_scale
-        if body_name == "Europa":
-            radius *= 1.2
-            height *= 0.85
-
-        dist = np.sqrt((xx - bx) ** 2 + (yy - by) ** 2)
-        z += height * np.exp(-(dist / radius) ** 2)
-        boulders.append(
-            {
-                "id": f"B-{i + 1:03d}",
-                "x": float(bx),
-                "y": float(by),
-                "radius": float(radius),
-                "height": float(height),
-            }
-        )
-
-    return x, y, xx, yy, z, craters, boulders
-
-
-def slope_degrees(z: np.ndarray, spacing: float) -> np.ndarray:
-    gy, gx = np.gradient(z, spacing, spacing)
-    return np.degrees(np.arctan(np.sqrt(gx**2 + gy**2)))
-
-
-def surface_normals(z: np.ndarray, spacing: float):
-    gy, gx = np.gradient(z, spacing, spacing)
-    nx = -gx
-    ny = -gy
-    nz = np.ones_like(z)
-    norm = np.sqrt(nx**2 + ny**2 + nz**2)
-    return nx / norm, ny / norm, nz / norm
-
-
-def illumination_model(x, y, z, spacing, sun_azimuth_deg, sun_elevation_deg, solar_flux):
-    sun_vec = unit_vector_from_az_el(sun_azimuth_deg, sun_elevation_deg)
-    nx, ny, nz = surface_normals(z, spacing)
-
-    incidence = clamp_array(nx * sun_vec[0] + ny * sun_vec[1] + nz * sun_vec[2], 0, 1)
-
-    shadow = np.zeros_like(z, dtype=bool)
-    if sun_vec[2] <= 0:
-        shadow[:, :] = True
-    else:
-        max_steps = min(28, z.shape[0] // 2)
-        step_m = spacing
-        sx = sun_vec[0]
-        sy = sun_vec[1]
-        sz = max(sun_vec[2], 1e-6)
-
-        nrows, ncols = z.shape
-        for k in range(1, max_steps + 1):
-            dx_m = -sx * step_m * k
-            dy_m = -sy * step_m * k
-            dz_los = sz * step_m * k
-
-            col_shift = int(round(dx_m / spacing))
-            row_shift = int(round(dy_m / spacing))
-
-            shifted = np.full_like(z, -1e9)
-            src_r0 = max(0, -row_shift)
-            src_r1 = min(nrows, nrows - row_shift)
-            src_c0 = max(0, -col_shift)
-            src_c1 = min(ncols, ncols - col_shift)
-
-            dst_r0 = src_r0 + row_shift
-            dst_r1 = src_r1 + row_shift
-            dst_c0 = src_c0 + col_shift
-            dst_c1 = src_c1 + col_shift
-
-            shifted[dst_r0:dst_r1, dst_c0:dst_c1] = z[src_r0:src_r1, src_c0:src_c1]
-            shadow |= shifted > (z + dz_los)
-
-    flux_norm = clamp(solar_flux / 1361.0, 0.0, 1.0)
-    solar_score = incidence * flux_norm
-    solar_score = np.where(shadow, solar_score * 0.08, solar_score)
-    return clamp_array(solar_score, 0, 1), shadow, incidence
-
-
-def line_of_sight_score(x, y, z, xx, yy, relay_azimuth_deg, relay_elevation_deg, body_name):
-    relay_vec = unit_vector_from_az_el(relay_azimuth_deg, relay_elevation_deg)
-
-    if relay_vec[2] <= 0:
-        return np.zeros_like(z), np.ones_like(z, dtype=bool)
-
-    spacing = abs(x[1] - x[0])
-    blocked = np.zeros_like(z, dtype=bool)
-    max_steps = min(30, z.shape[0] // 2)
-    sx = relay_vec[0]
-    sy = relay_vec[1]
-    sz = max(relay_vec[2], 1e-6)
-
-    nrows, ncols = z.shape
-    for k in range(1, max_steps + 1):
-        dx_m = -sx * spacing * k
-        dy_m = -sy * spacing * k
-        dz_los = sz * spacing * k
-
-        col_shift = int(round(dx_m / spacing))
-        row_shift = int(round(dy_m / spacing))
-
-        shifted = np.full_like(z, -1e9)
-        src_r0 = max(0, -row_shift)
-        src_r1 = min(nrows, nrows - row_shift)
-        src_c0 = max(0, -col_shift)
-        src_c1 = min(ncols, ncols - col_shift)
-
-        dst_r0 = src_r0 + row_shift
-        dst_r1 = src_r1 + row_shift
-        dst_c0 = src_c0 + col_shift
-        dst_c1 = src_c1 + col_shift
-
-        shifted[dst_r0:dst_r1, dst_c0:dst_c1] = z[src_r0:src_r1, src_c0:src_c1]
-        blocked |= shifted > (z + dz_los)
-
-    elevation_gain = clamp_array((z - z.min()) / max(1e-6, z.max() - z.min()), 0, 1)
-    base = clamp(math.sin(math.radians(relay_elevation_deg)), 0, 1)
-    deep_space_penalty = 0.55 if body_name == "Europa" else 0.75 if body_name == "Phobos" else 0.90
-    comm_score = (0.55 * base + 0.45 * elevation_gain) * deep_space_penalty
-    comm_score = np.where(blocked, comm_score * 0.15, comm_score)
-    return clamp_array(comm_score, 0, 1), blocked
-
-
-def radial_penalty(xx, yy, items, kind, safe_buffer_m):
-    penalty = np.zeros_like(xx, dtype=float)
-    for item in items:
-        if kind == "crater":
-            sigma = item["radius"] * 1.35 + safe_buffer_m
-            weight = clamp(item["depth"] / 32, 0.2, 1.0)
-        else:
-            sigma = item["radius"] * 2.5 + safe_buffer_m
-            weight = clamp(item["height"] / 18, 0.2, 1.0)
-
-        dist = np.sqrt((xx - item["x"]) ** 2 + (yy - item["y"]) ** 2)
-        penalty += weight * np.exp(-(dist / sigma) ** 2)
-
-    return clamp_array(penalty, 0, 1)
-
-
-def landing_suitability(
-    xx,
-    yy,
-    z,
-    slope,
-    craters,
-    boulders,
-    solar_score,
-    comm_score,
-    body_name,
-    solar_weight,
-    comm_weight,
-    hazard_weight,
-):
-    body = BODY_PRESETS[body_name]
-    soft = body["slope_soft_limit"]
-    hard = body["slope_hard_limit"]
-    safe_buffer = body["safe_hazard_buffer_m"]
-
-    slope_score = clamp_array(1 - (slope - soft) / max(1e-6, hard - soft), 0, 1)
-    crater_penalty = radial_penalty(xx, yy, craters, "crater", safe_buffer)
-    boulder_penalty = radial_penalty(xx, yy, boulders, "boulder", safe_buffer)
-    hazard_score = clamp_array(1 - (0.58 * crater_penalty + 0.42 * boulder_penalty), 0, 1)
-
-    thermal_score = 1.0 - body["thermal_penalty"]
-    if body_name == "Europa":
-        thermal_score *= 0.82
-    if body_name == "Phobos":
-        thermal_score *= 0.92
-
-    thermal_map = np.full_like(z, thermal_score, dtype=float)
-
-    score = (
-        hazard_weight * hazard_score
-        + 0.28 * slope_score
-        + solar_weight * solar_score
-        + comm_weight * comm_score
-        + 0.10 * thermal_map
-    )
-
-    score = score / (hazard_weight + 0.28 + solar_weight + comm_weight + 0.10)
-    return clamp_array(score * 100, 0, 100), hazard_score, slope_score, thermal_map
-
-
-def nearest_grid_index(x, y, target_x, target_y):
-    ix = int(np.argmin(np.abs(x - target_x)))
-    iy = int(np.argmin(np.abs(y - target_y)))
-    return iy, ix
-
-
-def risk_band(score):
-    if score >= 85:
-        return "LOW", "good"
-    if score >= 70:
-        return "MODERATE", "warn"
-    return "HIGH", "bad"
-
-
-def hazard_cost_map(suitability, slope, shadow, comm_blocked, body_name):
-    body = BODY_PRESETS[body_name]
-    cost = 1.0 + (100.0 - suitability) / 22.0
-    cost += clamp_array((slope - body["slope_soft_limit"]) / max(1e-6, body["slope_hard_limit"]), 0, 3)
-    cost += np.where(shadow, 0.45 if body_name != "Europa" else 0.15, 0.0)
-    cost += np.where(comm_blocked, 0.55, 0.0)
-    return np.asarray(cost, dtype=float)
-
-
-def astar_path(cost_map, start_idx, goal_idx):
-    rows, cols = cost_map.shape
-    sr, sc = start_idx
-    gr, gc = goal_idx
-
-    def h(r, c):
-        return math.hypot(r - gr, c - gc)
-
-    open_set = [(h(sr, sc), 0.0, sr, sc)]
-    came_from = {}
-    g_score = {(sr, sc): 0.0}
-    neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]
-
-    while open_set:
-        _, g, r, c = heapq.heappop(open_set)
-        if (r, c) == (gr, gc):
-            path = [(r, c)]
-            while (r, c) in came_from:
-                r, c = came_from[(r, c)]
-                path.append((r, c))
-            return list(reversed(path))
-
-        for dr, dc in neighbors:
-            nr, nc = r + dr, c + dc
-            if nr < 0 or nr >= rows or nc < 0 or nc >= cols:
-                continue
-
-            step = math.sqrt(2) if dr != 0 and dc != 0 else 1.0
-            tentative = g + step * float(cost_map[nr, nc])
-            if tentative < g_score.get((nr, nc), float("inf")):
-                came_from[(nr, nc)] = (r, c)
-                g_score[(nr, nc)] = tentative
-                heapq.heappush(open_set, (tentative + h(nr, nc), tentative, nr, nc))
-
-    return [start_idx, goal_idx]
-
-
-def rover_path_hazard_aware(x, y, best_x, best_y, radius, legs, cost_map):
-    theta = np.linspace(0, 2 * np.pi, legs, endpoint=False)
-    goal_points = []
-    for i, t in enumerate(theta):
-        r = radius * (0.65 + 0.35 * ((i % 3) / 2))
-        px = clamp(best_x + r * np.cos(t), -480, 480)
-        py = clamp(best_y + r * np.sin(t), -480, 480)
-        goal_points.append((float(px), float(py)))
-
-    goal_points.insert(0, (float(best_x), float(best_y)))
-    goal_points.append((float(best_x), float(best_y)))
-
-    full_points = []
-    for i in range(len(goal_points) - 1):
-        start_idx = nearest_grid_index(x, y, goal_points[i][0], goal_points[i][1])
-        goal_idx = nearest_grid_index(x, y, goal_points[i + 1][0], goal_points[i + 1][1])
-        idx_path = astar_path(cost_map, start_idx, goal_idx)
-
-        segment = [(float(x[c]), float(y[r])) for r, c in idx_path]
-        if i > 0 and segment:
-            segment = segment[1:]
-        full_points.extend(segment)
-
-    return full_points
-
-
-def path_distance(points):
-    return sum(math.dist(points[i], points[i + 1]) for i in range(len(points) - 1))
-
-
-def build_terrain_figure(x, y, z, suitability, craters, boulders, best_x, best_y):
-    fig = go.Figure()
-
-    fig.add_trace(
-        go.Surface(
-            x=x,
-            y=y,
-            z=z,
-            surfacecolor=suitability,
-            colorscale=[
-                [0.0, "#3b0000"],
-                [0.25, "#9d1d1d"],
-                [0.50, "#c58922"],
-                [0.72, "#84b547"],
-                [1.0, "#38e67a"],
-            ],
-            colorbar=dict(title="LZ Score", thickness=12, len=0.70),
-            opacity=0.96,
-            showscale=True,
-            name="Landing Suitability Surface",
-            hovertemplate=(
-                "Landing Suitability<br>"
-                "X: %{x:.1f} m<br>"
-                "Y: %{y:.1f} m<br>"
-                "Elevation: %{z:.1f} m<br>"
-                "LZ Score: %{surfacecolor:.1f}/100"
-                "<extra></extra>"
-            ),
-        )
-    )
-
-    crater_x, crater_y, crater_z, crater_text = [], [], [], []
-    for c in craters:
-        iy, ix = nearest_grid_index(x, y, c["x"], c["y"])
-        crater_x.append(c["x"])
-        crater_y.append(c["y"])
-        crater_z.append(z[iy, ix] + 8)
-        crater_text.append(
-            f"Crater Hazard<br>"
-            f"Object ID: {c['id']}<br>"
-            f"Radius: {c['radius']:.1f} m<br>"
-            f"Depth: {c['depth']:.1f} m"
-        )
-
-    fig.add_trace(
-        go.Scatter3d(
-            x=crater_x,
-            y=crater_y,
-            z=crater_z,
-            mode="markers",
-            marker=dict(size=4, symbol="circle", color="#ff4d4d"),
-            text=crater_text,
-            hovertemplate="%{text}<extra></extra>",
-            name="Crater Hazards",
-        )
-    )
-
-    boulder_x, boulder_y, boulder_z, boulder_text = [], [], [], []
-    for b in boulders:
-        iy, ix = nearest_grid_index(x, y, b["x"], b["y"])
-        boulder_x.append(b["x"])
-        boulder_y.append(b["y"])
-        boulder_z.append(z[iy, ix] + 10)
-        boulder_text.append(
-            f"Boulder Hazard<br>"
-            f"Object ID: {b['id']}<br>"
-            f"Radius: {b['radius']:.1f} m<br>"
-            f"Height: {b['height']:.1f} m"
-        )
-
-    fig.add_trace(
-        go.Scatter3d(
-            x=boulder_x,
-            y=boulder_y,
-            z=boulder_z,
-            mode="markers",
-            marker=dict(size=3, symbol="diamond", color="#ffb000"),
-            text=boulder_text,
-            hovertemplate="%{text}<extra></extra>",
-            name="Boulder Hazards",
-        )
-    )
-
-    iy, ix = nearest_grid_index(x, y, best_x, best_y)
-    fig.add_trace(
-        go.Scatter3d(
-            x=[best_x],
-            y=[best_y],
-            z=[z[iy, ix] + 30],
-            mode="markers+text",
-            marker=dict(size=9, symbol="diamond", color="#5cff8d"),
-            text=["BEST LZ"],
-            textposition="top center",
-            hovertemplate=(
-                "Recommended Landing Zone<br>"
-                f"X: {best_x:.1f} m<br>"
-                f"Y: {best_y:.1f} m"
-                "<extra></extra>"
-            ),
-            name="Recommended LZ",
-        )
-    )
-
-    fig.update_layout(
-        height=610,
-        margin=dict(l=0, r=0, t=20, b=0),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(color="#e6f1ff"),
-        scene=dict(
-            bgcolor="rgba(0,0,0,0)",
-            xaxis=dict(title="East-West, m", gridcolor="#20324d", showbackground=False),
-            yaxis=dict(title="North-South, m", gridcolor="#20324d", showbackground=False),
-            zaxis=dict(title="Relative Elevation, m", gridcolor="#20324d", showbackground=False),
-            camera=dict(eye=dict(x=1.6, y=-1.7, z=0.85)),
-            aspectratio=dict(x=1.35, y=1.35, z=0.35),
-        ),
-        legend=dict(
-            bgcolor="rgba(8,14,24,0.70)",
-            bordercolor="#20324d",
-            borderwidth=1,
-            orientation="h",
-            y=0.01,
-        ),
-    )
+st.set_page_config(page_title="Offshore UAS Blade Inspection V2", page_icon="🌊", layout="wide")
+APP_VERSION = "2.0.0"
+RNG_SEED = 42
+G = 9.80665
+RHO = 1.225
+
+st.markdown("""
+<style>
+.stApp{background:linear-gradient(180deg,#061827,#0b2638);color:#f4fbff}
+[data-testid="stSidebar"]{background:linear-gradient(180deg,#061624,#0a2234)}
+.hero{padding:1.25rem 1.45rem;border:1px solid rgba(117,224,255,.25);border-radius:18px;
+background:linear-gradient(135deg,rgba(19,82,114,.8),rgba(4,27,43,.94));margin-bottom:.8rem}
+.hero h1{margin:0;color:#effcff;font-size:clamp(1.9rem,4vw,3rem)}
+.hero p{color:#c8eaf4;max-width:1050px}.eyebrow{color:#7ef6be;font-weight:800;letter-spacing:.14em;text-transform:uppercase}
+.card{padding:.9rem;border:1px solid rgba(151,224,255,.2);border-radius:14px;background:rgba(8,35,52,.72)}
+.label{font-size:.75rem;color:#a8d6e5;text-transform:uppercase;letter-spacing:.08em}.value{font-size:1.4rem;font-weight:800}
+.note{padding:.75rem .9rem;border-left:4px solid #53e6aa;background:rgba(44,175,128,.08);border-radius:8px}
+</style>
+""", unsafe_allow_html=True)
+
+@dataclass(frozen=True)
+class Inputs:
+    mission_id: str
+    turbine_rating_mw: float
+    annual_capacity_factor_pct: float
+    hub_height_m: float
+    rotor_diameter_m: float
+    blade_root_offset_m: float
+    blades_to_inspect: int
+    rotor_state: str
+    blade_rpm: float
+    mean_wind_ms: float
+    gust_ms: float
+    turbulence_intensity_pct: float
+    wave_height_m: float
+    visibility_km: float
+    precipitation: str
+    launch_platform: str
+    navigation_condition: str
+    uas_mass_kg: float
+    rotor_count: int
+    propeller_diameter_m: float
+    figure_of_merit: float
+    motor_esc_efficiency: float
+    drag_area_m2: float
+    max_continuous_power_w: float
+    battery_capacity_wh: float
+    initial_soc_pct: float
+    reserve_soc_pct: float
+    cruise_speed_ms: float
+    inspection_speed_ms: float
+    desired_standoff_m: float
+    launch_distance_m: float
+    camera_hfov_deg: float
+    camera_vfov_deg: float
+    camera_frame_rate_hz: float
+    optical_quality_pct: float
+    lidar_range_m: float
+    lidar_noise_cm: float
+    lidar_rate_hz: float
+    imu_quality_pct: float
+    sync_error_ms: float
+    required_overlap_pct: float
+    energy_price_per_mwh: float
+    assumed_aep_loss_pct: float
+    turbines_in_farm: int
+
+@dataclass
+class Summary:
+    disposition: str
+    reason: str
+    mission_duration_min: float
+    inspection_duration_min: float
+    distance_m: float
+    final_soc_pct: float
+    min_energy_margin_wh: float
+    coverage_pct: float
+    mean_overlap_pct: float
+    images: int
+    mean_standoff_m: float
+    p95_standoff_error_m: float
+    p95_nav_error_m: float
+    hazard_index: float
+    data_suitability_index: float
+    annual_generation_mwh: float
+    revenue_risk_per_turbine: float
+    revenue_risk_farm: float
+    terminated: bool
+    termination_phase: str
+    recommendations: List[str]
+
+def clamp(x, lo, hi): return max(lo, min(hi, x))
+def pct(x): return f"{x:.1f}%"
+def money(x): return f"${x:,.0f}"
+def total_disk_area(i: Inputs): return i.rotor_count*math.pi*(i.propeller_diameter_m/2)**2
+
+def blade_line(i: Inputs, blade_idx: int, n=180):
+    ang=math.radians([90,210,330][blade_idx]); r=np.linspace(i.blade_root_offset_m,i.rotor_diameter_m/2,n)
+    chord=5.5+(1.1-5.5)*(r-r.min())/max(r.max()-r.min(),1e-6)
+    return pd.DataFrame({"blade_id":blade_idx+1,"r_m":r,"x_m":0.0,"y_m":r*np.cos(ang),
+                         "z_m":i.hub_height_m+r*np.sin(ang),"chord_m":chord,"azimuth_deg":math.degrees(ang)})
+
+def surface_grid(i: Inputs, blade_id: int):
+    line=blade_line(i,blade_id-1,80); rows=[]
+    for _,r in line.iterrows():
+        a=math.radians(r.azimuth_deg); cy=-math.sin(a); cz=math.cos(a)
+        for cf in np.linspace(-.5,.5,20):
+            rows.append({"blade_id":blade_id,"r_m":r.r_m,"x_m":0.0,
+                         "y_m":r.y_m+cf*r.chord_m*cy,"z_m":r.z_m+cf*r.chord_m*cz,
+                         "covered":False,"obs":0})
+    return pd.DataFrame(rows)
+
+def add_seg(segs,phase,x,y,z,blade_id=0,pass_id=0):
+    segs.append(pd.DataFrame({"phase":phase,"x_m":x,"y_m":y,"z_m":z,"blade_id":blade_id,
+                              "pass_id":pass_id,"phase_progress":np.linspace(0,1,len(x))}))
+
+def trans(a,b,n):
+    t=np.linspace(0,1,n,endpoint=False); s=3*t*t-2*t*t*t
+    return tuple(a[k]+(b[k]-a[k])*s for k in range(3))
+
+def build_path(i: Inputs):
+    segs=[]; launch=(-i.launch_distance_m,-.12*i.launch_distance_m,2.0)
+    transit_alt=max(25,min(i.hub_height_m*.38,i.hub_height_m-20)); safe_x=-max(i.desired_standoff_m*4,20)
+    add_seg(segs,"Takeoff",np.full(36,launch[0]),np.full(36,launch[1]),np.linspace(2,transit_alt,36,endpoint=False))
+    x,y,z=trans((launch[0],launch[1],transit_alt),(safe_x,0,transit_alt),70); add_seg(segs,"Transit",x,y,z)
+    current=(x[-1],y[-1],z[-1])
+    for b in range(i.blades_to_inspect):
+        line=blade_line(i,b,160); ox=np.full(len(line),-i.desired_standoff_m); oy=line.y_m.to_numpy(); oz=line.z_m.to_numpy()
+        tx,ty,tz=trans(current,(ox[0],oy[0],oz[0]),36); add_seg(segs,"Blade transition",tx,ty,tz,b+1)
+        add_seg(segs,"Blade inspection",ox,oy,oz,b+1,1)
+        a=math.radians(line.azimuth_deg.iloc[0]); cy=-math.sin(a); cz=math.cos(a)
+        add_seg(segs,"Blade inspection",ox,oy[::-1]+.55*cy,oz[::-1]+.55*cz,b+1,2)
+        current=(ox[-1],oy[0]+.55*cy,oz[0]+.55*cz)
+        if b<i.blades_to_inspect-1:
+            clear=(-max(i.desired_standoff_m*2.4,12),0,i.hub_height_m)
+            tx,ty,tz=trans(current,clear,28); add_seg(segs,"Hub clearance",tx,ty,tz,b+1); current=clear
+    tx,ty,tz=trans(current,(safe_x,0,transit_alt),45); add_seg(segs,"Egress",tx,ty,tz)
+    tx,ty,tz=trans((safe_x,0,transit_alt),(launch[0],launch[1],transit_alt),70); add_seg(segs,"Return to launch",tx,ty,tz)
+    add_seg(segs,"Landing",np.full(34,launch[0]),np.full(34,launch[1]),np.linspace(transit_alt,2,34))
+    p=pd.concat(segs,ignore_index=True); p["step"]=np.arange(len(p));
+    d=p[["x_m","y_m","z_m"]].diff().fillna(0); p["segment_distance_m"]=np.sqrt((d*d).sum(axis=1))
+    speeds={"Takeoff":min(2.8,i.cruise_speed_ms*.35),"Transit":i.cruise_speed_ms,
+            "Blade transition":min(3.2,i.cruise_speed_ms*.45),"Blade inspection":i.inspection_speed_ms,
+            "Hub clearance":min(2.6,i.cruise_speed_ms*.35),"Egress":min(4,i.cruise_speed_ms*.5),
+            "Return to launch":i.cruise_speed_ms,"Landing":min(2.2,i.cruise_speed_ms*.3)}
+    p["commanded_speed_ms"]=p.phase.map(speeds).astype(float); p["dt_s"]=p.segment_distance_m/p.commanded_speed_ms.clip(lower=.2)
+    p.loc[0,"dt_s"]=.5; p["elapsed_s"]=p.dt_s.cumsum(); return p
+
+def nav_sigma(i: Inputs):
+    return {"RTK fixed":.04,"RTK float":.12,"Standard GNSS":.65,
+            "Multipath / degraded":1.4,"GNSS denied — alternate navigation":.85}[i.navigation_condition]
+
+def fusion_credit(i: Inputs):
+    optical=i.optical_quality_pct/100; lidar=clamp(.72-.006*max(0,i.lidar_noise_cm-2)+.002*(i.lidar_rate_hz-10),.35,.95)
+    imu=i.imu_quality_pct/100; sync=clamp(1-i.sync_error_ms/120,.2,1); vis=clamp(i.visibility_km/8,.25,1)
+    rain={"None":1,"Light rain":.9,"Moderate rain":.72,"Heavy rain":.5}[i.precipitation]
+    return clamp(.34*optical+.30*lidar+.22*imu+.14*sync,.3,.94)*vis*rain
+
+def power_w(i: Inputs,speed,phase):
+    area=total_disk_area(i); weight=i.uas_mass_kg*G; rel=math.sqrt(speed**2+i.mean_wind_ms**2)
+    drag=.5*RHO*i.drag_area_m2*rel**2; tilt=math.atan2(drag,weight); thrust=weight/max(math.cos(tilt),.3)
+    induced=thrust**1.5/math.sqrt(max(2*RHO*area,1e-9))/max(i.figure_of_merit,.35)
+    profile=.1*induced+28*i.rotor_count; parasitic=.5*RHO*i.drag_area_m2*speed**3
+    pf={"Takeoff":1.18,"Transit":1,"Blade transition":1.08,"Blade inspection":1.12,"Hub clearance":1.1,
+        "Egress":1.06,"Return to launch":1,"Landing":.92}[phase]
+    env=(1+.01*i.turbulence_intensity_pct)*(1+.022*max(0,i.gust_ms-i.mean_wind_ms))*{"None":1,"Light rain":1.03,"Moderate rain":1.08,"Heavy rain":1.15}[i.precipitation]
+    hotel=110+4*i.lidar_rate_hz+2*i.camera_frame_rate_hz
+    return min(i.max_continuous_power_w*1.25,(induced+profile+parasitic)/i.motor_esc_efficiency*pf*env+hotel)
+
+def return_energy(i: Inputs,row):
+    launch=np.array([-i.launch_distance_m,-.12*i.launch_distance_m,2.0]); p=np.array([row.x_m,row.y_m,row.z_m])
+    dist=np.linalg.norm((p-launch)[:2])+.35*abs(p[2]-launch[2]); t=dist/max(i.cruise_speed_ms,.5)+20
+    pw=power_w(i,i.cruise_speed_ms,"Return to launch"); return pw*t/3600+.35*pw*25/3600
+
+def annotate(i: Inputs,p: pd.DataFrame):
+    rng=np.random.default_rng(RNG_SEED); out=p.copy(); fusion=fusion_credit(i); base=nav_sigma(i)
+    moving=1 if i.rotor_state=="Parked and secured" else 1+.10*i.blade_rpm
+    phase_credit=out.phase.map({"Takeoff":.35,"Transit":.25,"Blade transition":.75,"Blade inspection":1,
+                                "Hub clearance":.8,"Egress":.65,"Return to launch":.25,"Landing":.35}).astype(float)
+    sigma=(base*(1-phase_credit*fusion)+.02+.012*i.mean_wind_ms+.025*max(0,i.gust_ms-i.mean_wind_ms)+.004*i.turbulence_intensity_pct)*moving
+    out["relative_nav_error_m"]=np.abs(rng.normal(0,np.maximum(sigma,.02)))
+    cache={k:blade_line(i,k-1,220) for k in (1,2,3)}; actual=[]
+    for _,r in out.iterrows():
+        if r.blade_id in cache:
+            pts=cache[int(r.blade_id)][["x_m","y_m","z_m"]].to_numpy(); q=np.array([r.x_m,r.y_m,r.z_m]); d=np.linalg.norm(pts-q,axis=1).min()
+        else: d=abs(r.x_m)
+        actual.append(d)
+    noise=rng.normal(0,.035+.012*i.mean_wind_ms+.02*max(0,i.gust_ms-i.mean_wind_ms)+.004*i.turbulence_intensity_pct,len(out))*moving
+    out["actual_standoff_m"]=np.maximum(.1,np.array(actual)+noise); out["standoff_error_m"]=abs(out.actual_standoff_m-i.desired_standoff_m)
+    out["power_w"]=[power_w(i,s,ph) for s,ph in zip(out.commanded_speed_ms,out.phase)]
+    out["energy_wh"]=out.power_w*out.dt_s/3600; out["cumulative_energy_wh"]=out.energy_wh.cumsum()
+    initial=i.battery_capacity_wh*i.initial_soc_pct/100; out["remaining_energy_wh"]=initial-out.cumulative_energy_wh
+    out["soc_pct_raw"]=100*out.remaining_energy_wh/i.battery_capacity_wh; reserve=i.battery_capacity_wh*i.reserve_soc_pct/100
+    out["predicted_return_energy_wh"]=[return_energy(i,r) for _,r in out.iterrows()]
+    out["energy_margin_wh"]=out.remaining_energy_wh-out.predicted_return_energy_wh-reserve
+    inspection=out.phase=="Blade inspection"; blur=.18*max(0,i.mean_wind_ms-8)+.35*max(0,i.gust_ms-i.mean_wind_ms)+.08*i.inspection_speed_ms**2+.25*i.blade_rpm
+    q=clamp(100-blur-1.8*max(0,4-i.visibility_km)-{"None":0,"Light rain":5,"Moderate rain":14,"Heavy rain":28}[i.precipitation],10,100)
+    out["image_overlap_pct"]=np.where(inspection,np.clip(i.required_overlap_pct-2*out.standoff_error_m-.04*(100-q)+rng.normal(0,1,len(out)),10,98),np.nan)
+    lq=100-2.2*i.lidar_noise_cm-.2*i.mean_wind_ms-.6*max(0,i.gust_ms-i.mean_wind_ms)-{"None":0,"Light rain":5,"Moderate rain":15,"Heavy rain":30}[i.precipitation]-8*out.relative_nav_error_m
+    out["lidar_quality_index"]=np.where(inspection,np.clip(lq,5,100),np.nan)
+    clearance=np.maximum(out.actual_standoff_m-.8,.1)
+    out["hazard_index"]=np.clip(8+1.7*i.mean_wind_ms+2.6*max(0,i.gust_ms-i.mean_wind_ms)+.9*i.turbulence_intensity_pct+11*out.relative_nav_error_m+20*out.standoff_error_m/clearance+7*max(0,i.blade_rpm-.3),0,100)
+    abort=(out.soc_pct_raw<=0)|(out.energy_margin_wh<0)|(out.power_w>i.max_continuous_power_w)
+    out["active"]=True
+    if abort.any(): out.loc[int(np.argmax(abort.to_numpy()))+1:,"active"]=False
+    out["soc_pct"]=np.clip(out.soc_pct_raw,0,100); return out
+
+def camera_footprint(i: Inputs,rng_m):
+    return 2*rng_m*math.tan(math.radians(i.camera_hfov_deg/2)),2*rng_m*math.tan(math.radians(i.camera_vfov_deg/2))
+
+def coverage(i: Inputs,p: pd.DataFrame):
+    grids={b:surface_grid(i,b) for b in range(1,i.blades_to_inspect+1)}; insp=p[(p.active)&(p.phase=="Blade inspection")]
+    next_t=0; images=0
+    for _,r in insp.iterrows():
+        if r.elapsed_s<next_t: continue
+        next_t=r.elapsed_s+1/max(i.camera_frame_rate_hz,.1); images+=1; g=grids[int(r.blade_id)]
+        w,h=camera_footprint(i,max(r.actual_standoff_m,.5)); dy=abs(g.y_m-r.y_m); dz=abs(g.z_m-r.z_m)
+        d=np.linalg.norm(g[["x_m","y_m","z_m"]].to_numpy()-np.array([r.x_m,r.y_m,r.z_m]),axis=1)
+        ok=(r.image_overlap_pct>=max(45,i.required_overlap_pct-15)) and (r.lidar_quality_index>=45) and (r.relative_nav_error_m<=1.5)
+        if ok:
+            idx=np.where((dy<=w/2)&(dz<=h/2)&(d<=min(i.lidar_range_m,max(r.actual_standoff_m*2,3))))[0]
+            g.loc[idx,"covered"]=True; g.loc[idx,"obs"]+=1; grids[int(r.blade_id)]=g
+    total=sum(len(g) for g in grids.values()); cov=100*sum(int(g.covered.sum()) for g in grids.values())/max(total,1)
+    return cov,grids,images
+
+def summarize(i: Inputs,p: pd.DataFrame):
+    cov,grids,images=coverage(i,p); a=p[p.active]; insp=a[a.phase=="Blade inspection"]; term=len(a)<len(p)
+    ts="None" if not term else p[~p.active].phase.iloc[0]; final=float(a.soc_pct.iloc[-1]); margin=float(a.energy_margin_wh.min())
+    p95n=float(insp.relative_nav_error_m.quantile(.95)); p95s=float(insp.standoff_error_m.quantile(.95)); meanst=float(insp.actual_standoff_m.mean()); overlap=float(insp.image_overlap_pct.mean()); hz=float(insp.hazard_index.quantile(.95)); lq=float(insp.lidar_quality_index.mean())
+    suit=.30*cov+.20*clamp((overlap-40)/40*100,0,100)+.18*clamp(100-50*p95n,0,100)+.15*clamp(100-40*p95s,0,100)+.12*lq+.05*clamp((final-i.reserve_soc_pct)*3+55,0,100)
+    if term: disp="SIMULATED MISSION INFEASIBLE"; reason=f"Mission terminated during {ts} because energy or power feasibility was violated."
+    elif hz>=80 or p95n>1.5: disp="SIMULATED MISSION INFEASIBLE"; reason="Relative-navigation or rotor-proximity criteria were exceeded."
+    elif cov<90 or final<i.reserve_soc_pct or hz>=55: disp="SIMULATED MISSION CONDITIONAL"; reason="One or more concept-level acceptance criteria were not fully satisfied."
+    else: disp="SIMULATED MISSION ACCEPTABLE"; reason="Modeled coverage, energy, navigation, and hazard criteria were satisfied."
+    annual=i.turbine_rating_mw*8760*i.annual_capacity_factor_pct/100; rev=annual*i.assumed_aep_loss_pct/100*i.energy_price_per_mwh
+    rec=[]
+    if term or margin<0: rec.append("Reduce mission scope, shorten launch distance, or increase battery capacity.")
+    if hz>=55: rec.append("Increase stand-off distance or postpone the mission until gust exposure is lower.")
+    if p95n>.5: rec.append("Improve blade-relative navigation before close-proximity inspection.")
+    if cov<95: rec.append("Add a targeted rescan or reduce inspection speed to improve geometric coverage.")
+    if i.rotor_state!="Parked and secured": rec.append("Treat rotating-rotor results as stress cases only; blade tracking is not modeled.")
+    if not rec: rec=["The modeled mission satisfies the current concept-level criteria."]
+    return Summary(disp,reason,float(a.elapsed_s.iloc[-1]/60),float(insp.dt_s.sum()/60),float(a.segment_distance_m.sum()),final,margin,cov,overlap,images,meanst,p95s,p95n,hz,suit,annual,rev,rev*i.turbines_in_farm,term,str(ts),rec)
+
+def turbine_traces(i: Inputs):
+    tr=[go.Scatter3d(x=[0,0],y=[0,0],z=[0,i.hub_height_m],mode="lines",line=dict(width=10,color="#dceaf0"),name="Tower")]
+    for b in range(3):
+        l=blade_line(i,b,120); tr.append(go.Scatter3d(x=l.x_m,y=l.y_m,z=l.z_m,mode="lines",line=dict(width=11,color="#f6fbfd"),name=f"Blade {b+1}"))
+    return tr
+
+def mission_fig(i: Inputs,p: pd.DataFrame):
+    fig=go.Figure();
+    span=max(i.launch_distance_m*1.15,i.rotor_diameter_m*1.15,220); x=np.linspace(-span,span*.45,32); y=np.linspace(-span*.58,span*.58,32); xx,yy=np.meshgrid(x,y); zz=min(2,i.wave_height_m/2)*(.55*np.sin(xx/18+yy/30)+.45*np.cos(yy/14))
+    fig.add_trace(go.Surface(x=xx,y=yy,z=zz,colorscale=[[0,"#063954"],[1,"#0a6b88"]],opacity=.72,showscale=False,name="Ocean"))
+    for t in turbine_traces(i): fig.add_trace(t)
+    colors={"Takeoff":"#78f0bb","Transit":"#63b9ff","Blade transition":"#ffd166","Blade inspection":"#51f6a6","Hub clearance":"#ffb86c","Egress":"#e89bff","Return to launch":"#b99cff","Landing":"#7dd3fc"}
+    for ph,g in p[p.active].groupby("phase",sort=False): fig.add_trace(go.Scatter3d(x=g.x_m,y=g.y_m,z=g.z_m,mode="lines",line=dict(width=6,color=colors[ph]),name=ph))
+    fig.update_layout(height=690,margin=dict(l=0,r=0,t=35,b=0),paper_bgcolor="rgba(0,0,0,0)",scene=dict(bgcolor="rgba(5,25,39,.35)",xaxis_title="Along-track (m)",yaxis_title="Cross-track (m)",zaxis_title="Height above local water datum (m)",camera=dict(eye=dict(x=1.7,y=-1.75,z=1.15)),aspectmode="manual",aspectratio=dict(x=1.55,y=1,z=1.25)))
     return fig
 
+def telemetry_fig(i: Inputs,p: pd.DataFrame):
+    a=p[p.active]; t=a.elapsed_s/60; fig=go.Figure(); fig.add_trace(go.Scatter(x=t,y=a.soc_pct,name="State of charge")); fig.add_hline(y=i.reserve_soc_pct,line_dash="dash",annotation_text="Reserve")
+    fig.add_trace(go.Scatter(x=t,y=a.hazard_index,name="Rotor-proximity hazard index")); fig.update_layout(height=420,xaxis_title="Elapsed time (min)",yaxis_title="Percent / index",yaxis_range=[0,105],paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(6,27,42,.55)",hovermode="x unified"); return fig
 
-def build_heatmap(title, x, y, values, colorscale, best_x=None, best_y=None, value_fmt=".2f"):
-    fig = go.Figure(
-        go.Heatmap(
-            x=x,
-            y=y,
-            z=values,
-            colorscale=colorscale,
-            colorbar=dict(thickness=10),
-            hovertemplate=(
-                f"{title}<br>"
-                "X: %{x:.1f} m<br>"
-                "Y: %{y:.1f} m<br>"
-                f"Value: %{{z:{value_fmt}}}"
-                "<extra></extra>"
-            ),
-            name=title,
-        )
-    )
+def coverage_fig(i: Inputs,p: pd.DataFrame):
+    _,grids,_=coverage(i,p); rows=[]
+    for bid,g in grids.items(): rows.append(g.groupby("r_m").covered.mean().reset_index().assign(blade_id=bid))
+    d=pd.concat(rows); piv=d.pivot(index="blade_id",columns="r_m",values="covered")
+    fig=go.Figure(go.Heatmap(z=100*piv.to_numpy(),x=piv.columns,y=[f"Blade {x}" for x in piv.index],zmin=0,zmax=100,colorbar=dict(title="Covered %")))
+    fig.update_layout(height=360,xaxis_title="Radial distance from hub (m)",paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(6,27,42,.55)"); return fig
 
-    if best_x is not None:
-        fig.add_trace(
-            go.Scatter(
-                x=[best_x],
-                y=[best_y],
-                mode="markers+text",
-                marker=dict(size=14, symbol="x", color="#ffffff"),
-                text=["LZ"],
-                textposition="top center",
-                hovertemplate="Recommended LZ<extra></extra>",
-                name="Recommended LZ",
-            )
-        )
+def card(label,value,note=""):
+    st.markdown(f'<div class="card"><div class="label">{label}</div><div class="value">{value}</div><div>{note}</div></div>',unsafe_allow_html=True)
 
-    fig.update_layout(
-        title=title,
-        height=305,
-        margin=dict(l=0, r=0, t=40, b=0),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(color="#e6f1ff"),
-        xaxis=dict(gridcolor="#20324d"),
-        yaxis=dict(gridcolor="#20324d", scaleanchor="x", scaleratio=1),
-    )
-    return fig
+def report(i: Inputs,s: Summary):
+    rec="\n".join(f"- {x}" for x in s.recommendations)
+    return f"""# Offshore Autonomous Blade Inspection Mission Report\n\n**Mission ID:** {i.mission_id}  \n**Generated:** {datetime.now():%Y-%m-%d %H:%M}  \n**Simulator:** {APP_VERSION}  \n**Disposition:** {s.disposition}\n\n{s.reason}\n\n## Results\n- Geometric blade-surface coverage: {s.coverage_pct:.1f}%\n- Final state of charge: {s.final_soc_pct:.1f}%\n- Minimum dynamic energy margin: {s.min_energy_margin_wh:.0f} Wh\n- P95 stand-off error: {s.p95_standoff_error_m:.2f} m\n- P95 relative-navigation error: {s.p95_nav_error_m:.2f} m\n- Rotor-proximity hazard index: {s.hazard_index:.1f}/100\n- Inspection-data-suitability index: {s.data_suitability_index:.1f}/100\n\n## Economics\n- Annual capacity factor assumption: {i.annual_capacity_factor_pct:.1f}%\n- Estimated annual generation: {s.annual_generation_mwh:,.0f} MWh\n- Revenue at risk per turbine-year: {money(s.revenue_risk_per_turbine)}\n- Revenue at risk for {i.turbines_in_farm} turbines: {money(s.revenue_risk_farm)}\n\nThese are scenario-dependent values, not guaranteed UAS savings.\n\n## Recommendations\n{rec}\n\n## Limitations\nConcept-level model only. No full 6-DOF dynamics, calibrated collision probability, validated defect detector, or time-dependent rotating-blade tracking.\n"""
 
+for k in ("path","summary","inputs"):
+    if k not in st.session_state: st.session_state[k]=None
 
-def run_assessment(params):
-    body_name = params["target_body"]
-    body = BODY_PRESETS[body_name]
+st.markdown('<div class="hero"><div class="eyebrow">Concept-Level Offshore Inspection Digital-Twin Prototype</div><h1>Offshore Wind Turbine Blade Inspection Mission Simulator</h1><p>Blade-by-blade autonomous inspection, geometric coverage, blade-relative navigation, energy-aware return logic, offshore environmental effects, and systems-engineering outputs.</p></div>',unsafe_allow_html=True)
+st.caption("Academic concept demonstrator; not validated operational software.")
 
-    x, y, xx, yy, z, craters, boulders = generate_planetary_terrain(
-        int(params["seed"]),
-        int(params["grid_size"]),
-        float(params["roughness"]),
-        int(params["crater_count"]),
-        int(params["boulder_count"]),
-        body_name,
-    )
-
-    spacing = abs(x[1] - x[0])
-    slope = slope_degrees(z, spacing)
-
-    solar_score, shadow_map, incidence_map = illumination_model(
-        x,
-        y,
-        z,
-        spacing,
-        float(params["sun_azimuth"]),
-        float(params["sun_elevation"]),
-        body["solar_flux"],
-    )
-
-    comm_score, comm_blocked = line_of_sight_score(
-        x,
-        y,
-        z,
-        xx,
-        yy,
-        float(params["relay_azimuth"]),
-        float(params["relay_elevation"]),
-        body_name,
-    )
-
-    suitability, hazard_score, slope_score, thermal_score = landing_suitability(
-        xx,
-        yy,
-        z,
-        slope,
-        craters,
-        boulders,
-        solar_score,
-        comm_score,
-        body_name,
-        float(params["solar_weight"]),
-        float(params["comm_weight"]),
-        float(params["hazard_weight"]),
-    )
-
-    best_idx = np.unravel_index(np.argmax(suitability), suitability.shape)
-    best_y = float(yy[best_idx])
-    best_x = float(xx[best_idx])
-    best_score = float(suitability[best_idx])
-    best_slope = float(slope[best_idx])
-    best_solar = float(solar_score[best_idx])
-    best_comm = float(comm_score[best_idx])
-    best_hazard = float(hazard_score[best_idx])
-    best_thermal = float(thermal_score[best_idx])
-
-    cost_map = hazard_cost_map(suitability, slope, shadow_map, comm_blocked, body_name)
-    path_points = rover_path_hazard_aware(
-        x,
-        y,
-        best_x,
-        best_y,
-        float(params["route_radius"]),
-        int(params["route_legs"]),
-        cost_map,
-    )
-
-    total_path_m = path_distance(path_points)
-    mobility_factor = clamp(body["gravity"] / 1.62, 0.18, 2.4)
-    effective_speed = max(float(params["rover_speed"]) / (0.75 + 0.25 * mobility_factor), 0.01)
-    survey_time_hr = total_path_m / effective_speed / 3600
-
-    crater_risks = sum(
-        1 for c in craters if math.dist((best_x, best_y), (c["x"], c["y"])) < c["radius"] * 2.2 + body["safe_hazard_buffer_m"]
-    )
-    boulder_risks = sum(
-        1 for b in boulders if math.dist((best_x, best_y), (b["x"], b["y"])) < b["radius"] * 3.0 + body["safe_hazard_buffer_m"]
-    )
-
-    total_hazards = crater_risks + boulder_risks
-    survey_coverage = clamp((math.pi * float(params["route_radius"]) ** 2) / (1000 * 1000) * 100, 0, 100)
-    risk, risk_class = risk_band(best_score)
-
-    return {
-        "x": x,
-        "y": y,
-        "xx": xx,
-        "yy": yy,
-        "z": z,
-        "craters": craters,
-        "boulders": boulders,
-        "slope": slope,
-        "suitability": suitability,
-        "solar_score": solar_score,
-        "comm_score": comm_score,
-        "hazard_score": hazard_score,
-        "slope_score": slope_score,
-        "thermal_score": thermal_score,
-        "shadow_map": shadow_map,
-        "incidence_map": incidence_map,
-        "comm_blocked": comm_blocked,
-        "cost_map": cost_map,
-        "best_x": best_x,
-        "best_y": best_y,
-        "best_score": best_score,
-        "best_slope": best_slope,
-        "best_solar": best_solar,
-        "best_comm": best_comm,
-        "best_hazard": best_hazard,
-        "best_thermal": best_thermal,
-        "path_points": path_points,
-        "total_path_m": total_path_m,
-        "effective_speed": effective_speed,
-        "survey_time_hr": survey_time_hr,
-        "total_hazards": total_hazards,
-        "survey_coverage": survey_coverage,
-        "risk": risk,
-        "risk_class": risk_class,
-    }
-
-
-
-# -----------------------------
-# Optional LLM mission reasoning layer
-# -----------------------------
-def build_llm_hazard_packet(active_params, active_body, results, summary=None):
-    """Create a compact, non-sensitive engineering packet for LLM assessment."""
-    packet = {
-        "mission_id": active_params.get("mission_id"),
-        "target_body": active_params.get("target_body"),
-        "mission_profile": active_params.get("mission_profile"),
-        "body_model": {
-            "gravity_mps2": active_body["gravity"],
-            "solar_flux_w_m2": active_body["solar_flux"],
-            "atmosphere": active_body["atmosphere"],
-            "comm_mode": active_body["comm_mode"],
-            "slope_soft_limit_deg": active_body["slope_soft_limit"],
-            "slope_hard_limit_deg": active_body["slope_hard_limit"],
-            "safe_hazard_buffer_m": active_body["safe_hazard_buffer_m"],
-            "terrain_note": active_body["terrain_note"],
-        },
-        "geometry_inputs": {
-            "sun_azimuth_deg": active_params.get("sun_azimuth"),
-            "sun_elevation_deg": active_params.get("sun_elevation"),
-            "relay_azimuth_deg": active_params.get("relay_azimuth"),
-            "relay_elevation_deg": active_params.get("relay_elevation"),
-        },
-        "recommended_landing_zone": {
-            "x_m": round(float(results["best_x"]), 2),
-            "y_m": round(float(results["best_y"]), 2),
-            "score_0_100": round(float(results["best_score"]), 1),
-            "slope_deg": round(float(results["best_slope"]), 2),
-            "illumination_index_0_1": round(float(results["best_solar"]), 3),
-            "communication_index_0_1": round(float(results["best_comm"]), 3),
-            "hazard_clearance_index_0_1": round(float(results["best_hazard"]), 3),
-            "thermal_index_0_1": round(float(results["best_thermal"]), 3),
-        },
-        "map_statistics": {
-            "craters_modeled": len(results["craters"]),
-            "boulders_modeled": len(results["boulders"]),
-            "local_buffered_hazards_near_lz": int(results["total_hazards"]),
-            "terrain_shadow_fraction": round(float(np.mean(results["shadow_map"])), 3),
-            "comm_blocked_fraction": round(float(np.mean(results["comm_blocked"])), 3),
-        },
-        "rover_plan": {
-            "survey_path_km": round(float(results["total_path_m"] / 1000), 3),
-            "effective_speed_mps": round(float(results["effective_speed"]), 3),
-            "estimated_survey_time_hr": round(float(results["survey_time_hr"]), 3),
-            "survey_coverage_percent": round(float(results["survey_coverage"]), 2),
-        },
-        "engine_status": "Physics engine remains authoritative. LLM output is advisory reasoning only.",
-    }
-    if summary:
-        packet["baseline_recommendations"] = summary.get("recommendations", [])
-    return packet
-
-
-def deterministic_hazard_brief(active_params, active_body, results):
-    """Fallback advisory text when no LLM API key is available."""
-    concerns = []
-    if results["best_slope"] > active_body["slope_soft_limit"]:
-        concerns.append("LZ slope is above the soft limit and should be treated as a mobility and landing-stability concern.")
-    if results["best_solar"] < 0.35:
-        concerns.append("Illumination is weak at the selected point, so solar power and thermal margins need additional validation.")
-    if results["best_comm"] < 0.35:
-        concerns.append("Communication line-of-sight is marginal and relay placement should be prioritized before surface operations.")
-    if results["total_hazards"] > 0:
-        concerns.append("Buffered crater or boulder hazards remain near the LZ, so final descent imagery should verify clearance.")
-    if not concerns:
-        concerns.append("No dominant single-point hazard was identified by the current physics-informed scoring model.")
-
-    return "\n".join([
-        "**LLM advisory unavailable. Deterministic autonomy brief generated instead.**",
-        "",
-        "**Hazard assessment:** " + " ".join(concerns),
-        "",
-        "**Avoidance strategy:** Maintain the hazard-aware rover route, verify local slopes with descent or rover imagery, and avoid committing habitat placement until illumination and relay geometry are confirmed over the relevant mission window.",
-        "",
-        "**AI claim boundary:** This fallback uses rule-based autonomy logic, not generative reasoning.",
-    ])
-
-
-def call_llm_hazard_advisor(packet, model_name, temperature=0.2):
-    """Call OpenAI as an optional mission reasoning layer. Returns advisory markdown."""
-    client = get_openai_client()
-
-    system_text = (
-        "You are an aerospace mission autonomy analyst. Review the provided planetary landing-zone "
-        "assessment packet. Do not invent sensor data, flight certification, or real terrain validation. "
-        "Treat the numerical physics engine as authoritative. Provide concise advisory reasoning for hazard "
-        "avoidance, sensor tasking, rover path risk, and site verification. Use professional aerospace language."
-    )
-    user_text = (
-        "Analyze this assessment packet and return exactly four sections: "
-        "1) Top Hazards, 2) Avoidance Actions, 3) Sensor Tasking, 4) Confidence and Limitations.\n\n"
-        + json.dumps(packet, indent=2)
-    )
-
-    response = client.responses.create(
-        model=model_name,
-        input=[
-            {"role": "system", "content": system_text},
-            {"role": "user", "content": user_text},
-        ],
-        temperature=temperature,
-    )
-    return response.output_text
-
-# -----------------------------
-# Sidebar mission controls
-# -----------------------------
 with st.sidebar:
-    with st.form("mission_controls_form", clear_on_submit=False):
-        st.markdown("## 🌙 Mission Controls")
+    st.header("Mission configuration")
+    mission_id=st.text_input("Mission ID","OW-UAS-V2-001")
+    with st.expander("Turbine",True):
+        turbine_rating_mw=st.slider("Turbine rating (MW)",6.0,25.0,15.0,.5); annual_capacity_factor_pct=st.slider("Annual capacity factor (%)",30,65,48)
+        hub_height_m=st.slider("Hub height above water datum (m)",80,180,135,5); rotor_diameter_m=st.slider("Rotor diameter (m)",120,280,236,4)
+        blade_root_offset_m=st.slider("Hub-to-blade-root offset (m)",1.0,8.0,3.0,.5); blades_to_inspect=st.select_slider("Blades to inspect",[1,2,3],3)
+        rotor_state=st.selectbox("Rotor state",["Parked and secured","Slow rotation — exploratory stress case","Operational rotation — unsupported stress case"])
+        blade_rpm=st.slider("Rotor speed (rpm)",0.0,8.0,0.0 if rotor_state=="Parked and secured" else 1.0,.1)
+    with st.expander("Environment",True):
+        mean_wind_ms=st.slider("Mean wind (m/s)",2.0,20.0,9.0,.5); gust_ms=st.slider("Peak gust (m/s)",float(mean_wind_ms),26.0,float(max(12,mean_wind_ms+3)),.5)
+        turbulence_intensity_pct=st.slider("Turbulence intensity (%)",2,30,10); wave_height_m=st.slider("Significant wave height (m)",.2,6.0,1.5,.1)
+        visibility_km=st.slider("Visibility (km)",.5,20.0,10.0,.5); precipitation=st.selectbox("Precipitation",["None","Light rain","Moderate rain","Heavy rain"])
+        launch_platform=st.selectbox("Launch platform",["Fixed turbine platform","Service vessel","Offshore substation"])
+        navigation_condition=st.selectbox("Navigation condition",["RTK fixed","RTK float","Standard GNSS","Multipath / degraded","GNSS denied — alternate navigation"],index=3)
+    with st.expander("UAS and energy",True):
+        uas_mass_kg=st.slider("Takeoff mass (kg)",6.0,35.0,14.5,.5); rotor_count=st.select_slider("Rotor count",[4,6,8],4); propeller_diameter_m=st.slider("Propeller diameter (m)",.35,1.1,.65,.05)
+        figure_of_merit=st.slider("Rotor figure of merit",.45,.85,.68,.01); motor_esc_efficiency=st.slider("Motor/ESC efficiency",.70,.95,.88,.01); drag_area_m2=st.slider("Equivalent drag area CdA (m²)",.10,1.2,.42,.02)
+        max_continuous_power_w=st.slider("Max continuous power (W)",1500,14000,6500,250); battery_capacity_wh=st.slider("Battery capacity (Wh)",700,7000,3200,100)
+        initial_soc_pct=st.slider("Initial state of charge (%)",50,100,100); reserve_soc_pct=st.slider("Required landing reserve (%)",15,40,30)
+        cruise_speed_ms=st.slider("Cruise speed (m/s)",3.0,15.0,8.0,.5); inspection_speed_ms=st.slider("Inspection speed (m/s)",.3,4.0,1.2,.1)
+        desired_standoff_m=st.slider("Desired stand-off (m)",2.0,12.0,5.0,.5); launch_distance_m=st.slider("Launch distance (m)",50,1000,250,25)
+    with st.expander("Sensors",True):
+        camera_hfov_deg=st.slider("Camera horizontal FOV (deg)",30,100,70,2); camera_vfov_deg=st.slider("Camera vertical FOV (deg)",20,80,50,2); camera_frame_rate_hz=st.slider("Image capture rate (Hz)",.5,10.0,2.0,.5)
+        optical_quality_pct=st.slider("Optical tracking quality (%)",30,100,82); lidar_range_m=st.slider("LiDAR range (m)",20,120,60,5); lidar_noise_cm=st.slider("LiDAR range noise (cm)",.5,15.0,2.0,.5)
+        lidar_rate_hz=st.slider("LiDAR update rate (Hz)",5,50,20); imu_quality_pct=st.slider("IMU quality index (%)",30,100,82); sync_error_ms=st.slider("Sensor synchronization error (ms)",1,100,12)
+        required_overlap_pct=st.slider("Required image overlap (%)",50,90,75)
+    with st.expander("Economics",False):
+        energy_price_per_mwh=st.number_input("Electricity value ($/MWh)",20.0,300.0,80.0,5.0); assumed_aep_loss_pct=st.slider("Assumed AEP-loss scenario (%)",.1,8.0,1.5,.1); turbines_in_farm=st.slider("Turbines in wind farm",1,200,100)
+    run=st.button("Run autonomous inspection",type="primary",use_container_width=True)
 
-        mission_id = st.text_input("Mission ID", "LZAP-2026-001")
-        target_body = st.selectbox(
-            "Target Body",
-            ["Moon", "Mars", "Phobos", "Europa", "Custom airless body"],
-            index=0,
-        )
-        mission_profile = st.selectbox(
-            "Mission Profile",
-            [
-                "Landing Zone + Habitat Preparation",
-                "Landing Zone Survey Only",
-                "Habitat Site Planning Only",
-                "Communications Relay Survey",
-            ],
-            index=0,
-        )
+i=Inputs(mission_id,turbine_rating_mw,annual_capacity_factor_pct,hub_height_m,rotor_diameter_m,blade_root_offset_m,blades_to_inspect,rotor_state,blade_rpm,mean_wind_ms,gust_ms,turbulence_intensity_pct,wave_height_m,visibility_km,precipitation,launch_platform,navigation_condition,uas_mass_kg,rotor_count,propeller_diameter_m,figure_of_merit,motor_esc_efficiency,drag_area_m2,max_continuous_power_w,battery_capacity_wh,initial_soc_pct,reserve_soc_pct,cruise_speed_ms,inspection_speed_ms,desired_standoff_m,launch_distance_m,camera_hfov_deg,camera_vfov_deg,camera_frame_rate_hz,optical_quality_pct,lidar_range_m,lidar_noise_cm,lidar_rate_hz,imu_quality_pct,sync_error_ms,required_overlap_pct,energy_price_per_mwh,assumed_aep_loss_pct,turbines_in_farm)
 
-        body = BODY_PRESETS[target_body]
+clearance=i.hub_height_m-i.rotor_diameter_m/2
+if clearance<15: st.error(f"Invalid turbine geometry: lower tip clearance is {clearance:.1f} m; at least 15 m is required.")
+if i.rotor_state!="Parked and secured": st.warning("Rotating-rotor cases are stress scenarios only; time-dependent blade tracking is not implemented.")
+if i.uas_mass_kg>=24.95: st.info("Selected mass is at or above approximately 55 lb (24.95 kg), outside the usual U.S. Part 107 small-UAS weight range.")
+if i.hub_height_m+i.rotor_diameter_m/2>121.9: st.info("The simulated inspection volume can exceed 400 ft above the local water datum; real operations may require specific authorization.")
 
-        st.markdown("---")
-        st.markdown("### Terrain Model")
-        seed = st.number_input("Simulation Seed", min_value=1, max_value=9999, value=42, step=1)
-        grid_size = st.slider("Map Resolution", 40, 110, 72, 2)
-        roughness = st.slider("Surface Roughness", 0.5, 8.0, 3.0, 0.1)
-        crater_count = st.slider("Crater Count", 3, 35, 12)
-        boulder_count = st.slider("Boulder Count", 5, 80, 28)
+if run and clearance>=15:
+    with st.spinner("Simulating blade-by-blade mission..."):
+        p=annotate(i,build_path(i)); s=summarize(i,p); st.session_state.path=p; st.session_state.summary=s; st.session_state.inputs=i
 
-        st.markdown("---")
-        st.markdown("### Illumination and Communications")
-        sun_azimuth = st.slider("Sun Azimuth, deg", 0, 359, 125)
-        sun_elevation = st.slider("Sun Elevation, deg", 1, 80, 18)
-        relay_azimuth = st.slider("Relay or Earth Azimuth, deg", 0, 359, 210)
-        relay_elevation = st.slider("Relay or Earth Elevation, deg", 1, 85, 24)
-
-        st.caption(
-            f"{target_body}: gravity {body['gravity']} m/s², solar flux about {body['solar_flux']} W/m², "
-            f"comm mode: {body['comm_mode']}."
-        )
-
-        st.markdown("---")
-        st.markdown("### Scoring Weights")
-        hazard_weight = st.slider("Hazard Avoidance Weight", 0.30, 0.70, 0.50, 0.01)
-        solar_weight = st.slider("Illumination Weight", 0.05, 0.30, 0.14, 0.01)
-        comm_weight = st.slider("Communication Weight", 0.05, 0.30, 0.10, 0.01)
-
-        st.markdown("---")
-        st.markdown("### Rover Planning")
-        rover_speed = st.slider("Nominal Rover Speed, m/s", 0.05, 1.50, 0.35, 0.05)
-        route_radius = st.slider("Survey Radius, m", 80, 420, 260, 10)
-        route_legs = st.slider("Survey Waypoints", 4, 16, 9)
-
-        st.markdown("---")
-        st.markdown("### Optional LLM Advisory")
-        use_llm = st.checkbox("Enable LLM hazard advisor", value=False)
-        llm_model = st.selectbox("LLM Model", ["gpt-5.5", "gpt-5.5-mini", "gpt-4.1-mini"], index=1)
-        st.caption("Requires OPENAI_API_KEY in Streamlit secrets or environment variables. The physics engine remains authoritative.")
-
-        submitted = st.form_submit_button("Run Autonomous Assessment", use_container_width=True)
-
-    params = {
-        "mission_id": mission_id,
-        "target_body": target_body,
-        "mission_profile": mission_profile,
-        "seed": seed,
-        "grid_size": grid_size,
-        "roughness": roughness,
-        "crater_count": crater_count,
-        "boulder_count": boulder_count,
-        "sun_azimuth": sun_azimuth,
-        "sun_elevation": sun_elevation,
-        "relay_azimuth": relay_azimuth,
-        "relay_elevation": relay_elevation,
-        "hazard_weight": hazard_weight,
-        "solar_weight": solar_weight,
-        "comm_weight": comm_weight,
-        "rover_speed": rover_speed,
-        "route_radius": route_radius,
-        "route_legs": route_legs,
-        "use_llm": use_llm,
-        "llm_model": llm_model,
-    }
-
-    if submitted:
-        st.session_state["assessment_results"] = run_assessment(params)
-        st.session_state["assessment_params"] = params.copy()
-        st.session_state["assessment_timestamp"] = datetime.now(timezone.utc).isoformat()
-
-
-# -----------------------------
-# Header
-# -----------------------------
-st.markdown(
-    """
-    <div class="main-title">PLANETARY AUTONOMOUS LANDING ZONE ASSESSMENT</div>
-    <div class="subtitle">Physics-informed survey, hazard scoring, illumination analysis, and habitat planning</div>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-if "assessment_results" not in st.session_state:
-    st.info("Configure mission parameters in the sidebar, then click **Run Autonomous Assessment**.")
+if st.session_state.path is None:
+    st.info("Configure the scenario and select **Run autonomous inspection**.")
     st.stop()
 
+i=st.session_state.inputs; p=st.session_state.path; s=st.session_state.summary
+st.subheader(s.disposition); st.caption(s.reason)
+cols=st.columns(6)
+with cols[0]: card("Geometric coverage",pct(s.coverage_pct),"Simplified blade-surface grid")
+with cols[1]: card("Final state of charge",pct(s.final_soc_pct),f"Reserve {i.reserve_soc_pct:.0f}%")
+with cols[2]: card("Mission time",f"{s.mission_duration_min:.1f} min",f"Inspection {s.inspection_duration_min:.1f} min")
+with cols[3]: card("P95 stand-off error",f"{s.p95_standoff_error_m:.2f} m","Blade-relative")
+with cols[4]: card("P95 nav error",f"{s.p95_nav_error_m:.2f} m","Illustrative target 0.50 m")
+with cols[5]: card("Data suitability",f"{s.data_suitability_index:.0f}/100","Uncalibrated index")
 
-results = st.session_state["assessment_results"]
-active_params = st.session_state["assessment_params"]
-active_body = BODY_PRESETS[active_params["target_body"]]
+tabs=st.tabs(["Mission Prototype","Telemetry","Coverage and Data","Safety","Economics","Systems Engineering","Report and Export"])
+with tabs[0]:
+    st.plotly_chart(mission_fig(i,p),use_container_width=True)
+    st.caption("Blade-by-blade stationary-rotor concept trajectory; not a full six-degree-of-freedom simulation.")
+with tabs[1]:
+    st.plotly_chart(telemetry_fig(i,p),use_container_width=True)
+    st.dataframe(p[p.active][["elapsed_s","phase","blade_id","actual_standoff_m","relative_nav_error_m","power_w","soc_pct","energy_margin_wh","hazard_index"]].round(2),use_container_width=True,hide_index=True)
+with tabs[2]:
+    st.plotly_chart(coverage_fig(i,p),use_container_width=True)
+    st.markdown('<div class="note">Coverage is computed from a simplified blade-surface grid and camera footprint. The data-suitability index is not a defect-detection probability.</div>',unsafe_allow_html=True)
+with tabs[3]:
+    st.metric("Rotor-proximity hazard index",f"{s.hazard_index:.1f}/100")
+    st.caption("Ordinal and uncalibrated; not a collision probability.")
+    for r in s.recommendations: st.markdown(f"- {r}")
+with tabs[4]:
+    ec=st.columns(4); ec[0].metric("Annual capacity factor",pct(i.annual_capacity_factor_pct)); ec[1].metric("Annual generation",f"{s.annual_generation_mwh:,.0f} MWh"); ec[2].metric("Revenue at risk per turbine-year",money(s.revenue_risk_per_turbine)); ec[3].metric("Wind-farm revenue at risk",money(s.revenue_risk_farm))
+    st.markdown('<div class="note">Annual capacity factor is a user assumption, not inferred from mission-day weather. Revenue at risk is not guaranteed UAS savings.</div>',unsafe_allow_html=True)
+with tabs[5]:
+    trace=pd.DataFrame([
+        ["SN-01","SYS-1.1","The UAS shall conduct remote blade inspection without personnel entering the rotor inspection envelope.","ConOps review and demonstration"],
+        ["SN-02","NAV-1.1","The UAS shall maintain P95 blade-relative position error no greater than 0.50 m under the defined degraded-GNSS test condition.","HIL and controlled flight test"],
+        ["SN-03","INS-1.1","The UAS shall achieve at least 90% geometric coverage of the defined blade inspection surface.","Simulation and reference-target inspection"],
+        ["SN-04","ENE-1.1","The UAS shall preserve energy for predicted return, landing, and the selected reserve.","Energy analysis and flight-log review"],
+    ],columns=["Need ID","Requirement ID","Requirement","Verification"])
+    st.dataframe(trace,use_container_width=True,hide_index=True)
+with tabs[6]:
+    text=report(i,s); st.text_area("Report preview",text,height=500,disabled=True)
+    payload={"inputs":asdict(i),"summary":asdict(s),"model":{"version":APP_VERSION,"seed":RNG_SEED}}
+    d=st.columns(3); d[0].download_button("Download report",text.encode(),f"{i.mission_id}_report.md","text/markdown",use_container_width=True); d[1].download_button("Download telemetry",p.to_csv(index=False).encode(),f"{i.mission_id}_telemetry.csv","text/csv",use_container_width=True); d[2].download_button("Download JSON",json.dumps(payload,indent=2).encode(),f"{i.mission_id}_simulation.json","application/json",use_container_width=True)
 
-x = results["x"]
-y = results["y"]
-z = results["z"]
-craters = results["craters"]
-boulders = results["boulders"]
-slope = results["slope"]
-suitability = results["suitability"]
-solar_score = results["solar_score"]
-comm_score = results["comm_score"]
-hazard_score = results["hazard_score"]
-shadow_map = results["shadow_map"]
-comm_blocked = results["comm_blocked"]
-best_x = results["best_x"]
-best_y = results["best_y"]
-best_score = results["best_score"]
-best_slope = results["best_slope"]
-best_solar = results["best_solar"]
-best_comm = results["best_comm"]
-best_hazard = results["best_hazard"]
-best_thermal = results["best_thermal"]
-path_points = results["path_points"]
-total_path_m = results["total_path_m"]
-effective_speed = results["effective_speed"]
-survey_time_hr = results["survey_time_hr"]
-total_hazards = results["total_hazards"]
-survey_coverage = results["survey_coverage"]
-risk = results["risk"]
-risk_class = results["risk_class"]
-
-
-# -----------------------------
-# Top mission metrics
-# -----------------------------
-m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("Landing Zone Score", f"{best_score:.0f}/100", risk)
-m2.metric("Slope at LZ", f"{best_slope:.1f}°", f"Soft limit {active_body['slope_soft_limit']:.0f}°")
-m3.metric("Hazards Near LZ", f"{total_hazards}", "Buffered count")
-m4.metric("Illumination Index", f"{best_solar * 100:.0f}%", "Sun plus shadow")
-m5.metric("Comm Index", f"{best_comm * 100:.0f}%", "LOS masked")
-
-
-# -----------------------------
-# Main layout
-# -----------------------------
-left, right = st.columns([3.6, 1.25], gap="large")
-
-with left:
-    st.markdown(
-        '<div class="section-card"><div class="card-title">3D Terrain Map and Landing Zone Analysis</div>',
-        unsafe_allow_html=True,
-    )
-    st.plotly_chart(
-        build_terrain_figure(x, y, z, suitability, craters, boulders, best_x, best_y),
-        use_container_width=True,
-    )
-    st.markdown("</div>", unsafe_allow_html=True)
-
-with right:
-    st.markdown('<div class="section-card"><div class="card-title">Mission Overview</div>', unsafe_allow_html=True)
-    st.markdown(
-        f"""
-        <span class="metric-label">Mission ID</span><br>
-        <span class="mono">{active_params["mission_id"]}</span><br><br>
-        <span class="metric-label">Target Body</span><br>
-        <b>{active_params["target_body"]}</b><br><br>
-        <span class="metric-label">Profile</span><br>
-        <b>{active_params["mission_profile"]}</b><br><br>
-        <span class="metric-label">Body Model</span><br>
-        <span class="mono">g = {active_body["gravity"]} m/s²</span><br>
-        <span class="mono">Flux = {active_body["solar_flux"]:.0f} W/m²</span><br><br>
-        <span class="metric-label">Assessment</span><br>
-        <span class="{risk_class}">{risk} RISK</span>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    st.markdown("<hr>", unsafe_allow_html=True)
-    st.markdown('<div class="card-title">Autonomous Hazard Scoring</div>', unsafe_allow_html=True)
-    st.write(f"🔴 Craters modeled: **{len(craters)}**")
-    st.write(f"🟠 Boulder hazards modeled: **{len(boulders)}**")
-    st.write(f"🟡 Buffered hazards near LZ: **{total_hazards}**")
-    st.write(f"🟢 Hazard clearance score: **{best_hazard * 100:.0f}%**")
-    st.write(f"🔵 Terrain shadow fraction: **{np.mean(shadow_map) * 100:.0f}%**")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-
-# -----------------------------
-# Secondary analysis panels
-# -----------------------------
-c1, c2, c3 = st.columns(3, gap="large")
-
-with c1:
-    st.markdown('<div class="small-card"><div class="card-title">Slope Hazard Map</div>', unsafe_allow_html=True)
-    st.plotly_chart(
-        build_heatmap("Slope, degrees", x, y, slope, "Inferno", best_x, best_y, ".1f"),
-        use_container_width=True,
-    )
-    st.markdown("</div>", unsafe_allow_html=True)
-
-with c2:
-    st.markdown('<div class="small-card"><div class="card-title">Physics-Based Illumination</div>', unsafe_allow_html=True)
-    st.plotly_chart(
-        build_heatmap("Illumination Score", x, y, solar_score, "YlOrBr", best_x, best_y, ".2f"),
-        use_container_width=True,
-    )
-    st.markdown("</div>", unsafe_allow_html=True)
-
-with c3:
-    st.markdown('<div class="small-card"><div class="card-title">Line-of-Sight Communication</div>', unsafe_allow_html=True)
-    st.plotly_chart(
-        build_heatmap("Relay Link Score", x, y, comm_score, "Blues", best_x, best_y, ".2f"),
-        use_container_width=True,
-    )
-    st.markdown("</div>", unsafe_allow_html=True)
-
-
-# -----------------------------
-# Habitat and rover path
-# -----------------------------
-h1, h2 = st.columns([1.55, 1.45], gap="large")
-
-with h1:
-    st.markdown(
-        '<div class="section-card"><div class="card-title">Habitat Planning Recommendation</div>',
-        unsafe_allow_html=True,
-    )
-
-    hab_offset = max(115, active_body["safe_hazard_buffer_m"] * 2.5)
-    habitat_x = clamp(best_x + hab_offset, -480, 480)
-    habitat_y = clamp(best_y + hab_offset * 0.45, -480, 480)
-    power_x = clamp(best_x - 120, -480, 480)
-    power_y = clamp(best_y + 85, -480, 480)
-    comm_x = clamp(best_x + 180, -480, 480)
-    comm_y = clamp(best_y - 75, -480, 480)
-
-    plan_df = pd.DataFrame(
-        [
-            ["Primary Landing Zone", best_x, best_y, "Low aggregate risk from slope, hazards, illumination, and comm masking"],
-            ["Habitat Zone", habitat_x, habitat_y, "Offset from touchdown, dust, plume interaction, and landing dispersion"],
-            ["Power Zone", power_x, power_y, "Selected for relative illumination and terrain separation"],
-            ["Comms Relay", comm_x, comm_y, "Placed to improve local line of sight and relay geometry"],
-        ],
-        columns=["Element", "X m", "Y m", "Rationale"],
-    )
-
-    st.dataframe(plan_df, use_container_width=True, hide_index=True)
-
-    st.markdown(
-        f"""
-        **Engineering interpretation:** the selected site balances hazard clearance, slope, illumination,
-        communication visibility, and thermal risk for **{active_params["target_body"]}**. This is a
-        physics-informed conceptual assessment, not a certified flight design or terrain-relative navigation product.
-        """
-    )
-    st.markdown("</div>", unsafe_allow_html=True)
-
-with h2:
-    st.markdown('<div class="section-card"><div class="card-title">Mobility-Aware Rover Path Planning</div>', unsafe_allow_html=True)
-
-    px = [p[0] for p in path_points]
-    py = [p[1] for p in path_points]
-
-    path_fig = go.Figure()
-    path_fig.add_trace(
-        go.Heatmap(
-            x=x,
-            y=y,
-            z=suitability,
-            colorscale="Viridis",
-            colorbar=dict(thickness=10, title="LZ"),
-            hovertemplate="LZ Score: %{z:.1f}/100<extra></extra>",
-            name="Landing Suitability",
-        )
-    )
-    path_fig.add_trace(
-        go.Scatter(
-            x=px,
-            y=py,
-            mode="lines+markers",
-            line=dict(width=3),
-            marker=dict(size=6),
-            name="Hazard-Aware Rover Path",
-            hovertemplate="Rover Path<br>X: %{x:.1f} m<br>Y: %{y:.1f} m<extra></extra>",
-        )
-    )
-
-    path_fig.update_layout(
-        height=360,
-        margin=dict(l=0, r=0, t=10, b=0),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(color="#e6f1ff"),
-        xaxis=dict(gridcolor="#20324d"),
-        yaxis=dict(gridcolor="#20324d", scaleanchor="x", scaleratio=1),
-    )
-
-    st.plotly_chart(path_fig, use_container_width=True)
-    st.write(f"Survey path length: **{total_path_m / 1000:.2f} km**")
-    st.write(f"Effective rover speed: **{effective_speed:.2f} m/s**")
-    st.write(f"Estimated survey time: **{survey_time_hr:.2f} hr**")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-
-# -----------------------------
-# Recommendations and export
-# -----------------------------
-r1, r2 = st.columns([1.6, 1.0], gap="large")
-
-recommendations = [
-    "Select the identified landing zone only after orbital or descent imagery confirms local hazard clearance.",
-    "Keep habitat assets outside the touchdown zone to reduce plume, dust, ejecta, and landing-dispersion risk.",
-    "Validate illumination against local time, slope aspect, terrain shadowing, and mission duration.",
-    "Use LiDAR, stereo EO imagery, thermal sensing, and radar or ground-penetrating radar for final site verification.",
-    "Place relay assets where terrain masking is minimized and link geometry remains available during surface operations.",
-]
-
-with r1:
-    st.markdown('<div class="section-card"><div class="card-title">Mission Recommendations</div>', unsafe_allow_html=True)
-    for rec in recommendations:
-        st.success(rec)
-
-    st.markdown("<hr>", unsafe_allow_html=True)
-    st.markdown('<div class="card-title">LLM Hazard Advisor</div>', unsafe_allow_html=True)
-
-    if active_params.get("use_llm"):
-        packet = build_llm_hazard_packet(active_params, active_body, results)
-        try:
-            with st.spinner("Generating LLM hazard advisory..."):
-                llm_advisory = call_llm_hazard_advisor(packet, active_params.get("llm_model", "gpt-5.5-mini"))
-            st.info(llm_advisory)
-        except Exception as exc:
-            st.warning(deterministic_hazard_brief(active_params, active_body, results))
-            st.caption(f"LLM advisory failed or is not configured: {exc}")
-    else:
-        st.caption("Disabled. Enable this to add a generative mission-reasoning layer on top of the physics model.")
-
-    with st.expander("Model limitations and aerospace interpretation"):
-        st.write(
-            """
-            This app now uses body-specific gravity, solar flux, first-order Sun vector illumination,
-            terrain shadowing, line-of-sight communication masking, slope scoring, hazard buffering,
-            and mobility-aware path planning. It remains a conceptual trade-space tool. It does not replace
-            high-fidelity ephemeris analysis, LOLA or LROC terrain products, finite-element lander plume analysis,
-            flight software verification, or certified terrain-relative navigation.
-            """
-        )
-    st.markdown("</div>", unsafe_allow_html=True)
-
-with r2:
-    st.markdown('<div class="section-card"><div class="card-title">Mission Summary and Export</div>', unsafe_allow_html=True)
-
-    summary = {
-        "mission_id": active_params["mission_id"],
-        "target_body": active_params["target_body"],
-        "mission_profile": active_params["mission_profile"],
-        "timestamp_utc": st.session_state.get("assessment_timestamp", datetime.now(timezone.utc).isoformat()),
-        "body_model": {
-            "gravity_mps2": active_body["gravity"],
-            "solar_flux_w_m2": active_body["solar_flux"],
-            "atmosphere": active_body["atmosphere"],
-            "comm_mode": active_body["comm_mode"],
-            "slope_soft_limit_deg": active_body["slope_soft_limit"],
-            "slope_hard_limit_deg": active_body["slope_hard_limit"],
-        },
-        "geometry_inputs": {
-            "sun_azimuth_deg": active_params["sun_azimuth"],
-            "sun_elevation_deg": active_params["sun_elevation"],
-            "relay_azimuth_deg": active_params["relay_azimuth"],
-            "relay_elevation_deg": active_params["relay_elevation"],
-        },
-        "recommended_landing_zone": {"x_m": best_x, "y_m": best_y, "score": best_score},
-        "slope_deg": best_slope,
-        "illumination_index": best_solar,
-        "communication_index": best_comm,
-        "hazard_clearance_index": best_hazard,
-        "thermal_index": best_thermal,
-        "local_hazards": total_hazards,
-        "craters_modeled": len(craters),
-        "boulders_modeled": len(boulders),
-        "terrain_shadow_fraction": float(np.mean(shadow_map)),
-        "comm_blocked_fraction": float(np.mean(comm_blocked)),
-        "survey_path_km": total_path_m / 1000,
-        "effective_rover_speed_mps": effective_speed,
-        "estimated_survey_time_hr": survey_time_hr,
-        "survey_coverage_percent": survey_coverage,
-        "recommendations": recommendations,
-        "model_status": "Physics-informed conceptual trade-space tool, not flight-certified analysis",
-        "llm_advisory_enabled": bool(active_params.get("use_llm")),
-        "llm_model": active_params.get("llm_model"),
-        "ai_claim_boundary": "Hazard detection is physics-based. Optional LLM output is advisory mission reasoning, not certified autonomy.",
-    }
-
-    st.json(summary, expanded=False)
-
-    st.download_button(
-        "Export Mission Report JSON",
-        data=json.dumps(summary, indent=2),
-        file_name=f"{active_params['mission_id']}_mission_report.json",
-        mime="application/json",
-        use_container_width=True,
-    )
-
-    csv_df = pd.DataFrame(
-        [
-            {
-                "mission_id": active_params["mission_id"],
-                "target_body": active_params["target_body"],
-                "mission_profile": active_params["mission_profile"],
-                "timestamp_utc": summary["timestamp_utc"],
-                "gravity_mps2": active_body["gravity"],
-                "solar_flux_w_m2": active_body["solar_flux"],
-                "sun_azimuth_deg": active_params["sun_azimuth"],
-                "sun_elevation_deg": active_params["sun_elevation"],
-                "relay_azimuth_deg": active_params["relay_azimuth"],
-                "relay_elevation_deg": active_params["relay_elevation"],
-                "lz_x_m": best_x,
-                "lz_y_m": best_y,
-                "lz_score": best_score,
-                "slope_deg": best_slope,
-                "illumination_index": best_solar,
-                "communication_index": best_comm,
-                "hazard_clearance_index": best_hazard,
-                "local_hazards": total_hazards,
-                "craters_modeled": len(craters),
-                "boulders_modeled": len(boulders),
-                "terrain_shadow_fraction": float(np.mean(shadow_map)),
-                "comm_blocked_fraction": float(np.mean(comm_blocked)),
-                "survey_path_km": total_path_m / 1000,
-                "effective_rover_speed_mps": effective_speed,
-                "estimated_survey_time_hr": survey_time_hr,
-                "survey_coverage_percent": survey_coverage,
-            }
-        ]
-    )
-
-    st.download_button(
-        "Export Mission Summary CSV",
-        data=csv_df.to_csv(index=False),
-        file_name=f"{active_params['mission_id']}_mission_summary.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
-
-# -----------------------------
-# Footer
-# -----------------------------
-st.markdown(
-    """
-    <br>
-    <div class="muted" style="text-align:center; letter-spacing:0.20em; text-transform:uppercase;">
-        Autonomy | Illumination | Hazard Scoring | Mobility | Systems Engineering
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+st.markdown("---"); st.caption(f"Offshore Autonomous Blade Inspection Mission Simulator · Version {APP_VERSION}")
