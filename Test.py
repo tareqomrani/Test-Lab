@@ -1,389 +1,721 @@
-"""Offshore Autonomous Blade Inspection Mission Simulator V2.
 
-Concept-level systems-engineering simulator. Not a validated flight-dynamics,
-operational-safety, or defect-detection system.
-"""
-from __future__ import annotations
-
-import json, math
-from dataclasses import asdict, dataclass
-from datetime import datetime
-from typing import Dict, List, Tuple
+import json
+import math
+import os
+import heapq
+from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-st.set_page_config(page_title="Offshore UAS Blade Inspection V2", page_icon="🌊", layout="wide")
-APP_VERSION = "2.0.0"
-RNG_SEED = 42
-G = 9.80665
-RHO = 1.225
+st.set_page_config(
+    page_title="Mars Rover Digital Twin Mobility Assurance",
+    page_icon="🛰️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-st.markdown("""
-<style>
-.stApp{background:linear-gradient(180deg,#061827,#0b2638);color:#f4fbff}
-[data-testid="stSidebar"]{background:linear-gradient(180deg,#061624,#0a2234)}
-.hero{padding:1.25rem 1.45rem;border:1px solid rgba(117,224,255,.25);border-radius:18px;
-background:linear-gradient(135deg,rgba(19,82,114,.8),rgba(4,27,43,.94));margin-bottom:.8rem}
-.hero h1{margin:0;color:#effcff;font-size:clamp(1.9rem,4vw,3rem)}
-.hero p{color:#c8eaf4;max-width:1050px}.eyebrow{color:#7ef6be;font-weight:800;letter-spacing:.14em;text-transform:uppercase}
-.card{padding:.9rem;border:1px solid rgba(151,224,255,.2);border-radius:14px;background:rgba(8,35,52,.72)}
-.label{font-size:.75rem;color:#a8d6e5;text-transform:uppercase;letter-spacing:.08em}.value{font-size:1.4rem;font-weight:800}
-.note{padding:.75rem .9rem;border-left:4px solid #53e6aa;background:rgba(44,175,128,.08);border-radius:8px}
-</style>
-""", unsafe_allow_html=True)
+st.markdown(
+    """
+    <style>
+    .stApp { background: linear-gradient(180deg,#030711 0%,#07101f 100%); color:#e6f1ff; }
+    [data-testid="stSidebar"] { background:#08111f; border-right:1px solid #20324d; }
+    .title { font-size:2.1rem; font-weight:900; letter-spacing:.04em; color:#f4f8ff; }
+    .subtitle { color:#4db3ff; letter-spacing:.11em; text-transform:uppercase; margin-bottom:1rem; }
+    .panel { background:rgba(10,18,32,.9); border:1px solid rgba(77,179,255,.22); border-radius:14px; padding:.9rem 1rem; }
+    .panel-title { color:#4db3ff; font-weight:900; letter-spacing:.06em; text-transform:uppercase; }
+    div[data-testid="stMetric"] { background:rgba(12,23,40,.78); border:1px solid rgba(77,179,255,.18); padding:.7rem; border-radius:12px; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-@dataclass(frozen=True)
-class Inputs:
-    mission_id: str
-    turbine_rating_mw: float
-    annual_capacity_factor_pct: float
-    hub_height_m: float
-    rotor_diameter_m: float
-    blade_root_offset_m: float
-    blades_to_inspect: int
-    rotor_state: str
-    blade_rpm: float
-    mean_wind_ms: float
-    gust_ms: float
-    turbulence_intensity_pct: float
-    wave_height_m: float
-    visibility_km: float
-    precipitation: str
-    launch_platform: str
-    navigation_condition: str
-    uas_mass_kg: float
-    rotor_count: int
-    propeller_diameter_m: float
-    figure_of_merit: float
-    motor_esc_efficiency: float
-    drag_area_m2: float
-    max_continuous_power_w: float
-    battery_capacity_wh: float
-    initial_soc_pct: float
-    reserve_soc_pct: float
-    cruise_speed_ms: float
-    inspection_speed_ms: float
-    desired_standoff_m: float
-    launch_distance_m: float
-    camera_hfov_deg: float
-    camera_vfov_deg: float
-    camera_frame_rate_hz: float
-    optical_quality_pct: float
-    lidar_range_m: float
-    lidar_noise_cm: float
-    lidar_rate_hz: float
-    imu_quality_pct: float
-    sync_error_ms: float
-    required_overlap_pct: float
-    energy_price_per_mwh: float
-    assumed_aep_loss_pct: float
-    turbines_in_farm: int
+APP_VERSION = "0.2.0-physics-authoritative"
+MARS_GRAVITY = 3.71
+MAP_EXTENT_M = 1000.0
+
+LIMITS = {
+    "hard_slope_deg": 18.0,
+    "max_predicted_wheel_load_n": 950.0,
+    "max_measured_strain_ue": 1800.0,
+    "max_slip_ratio": 0.70,
+    "min_stability_margin": 0.18,
+}
 
 @dataclass
-class Summary:
-    disposition: str
-    reason: str
-    mission_duration_min: float
-    inspection_duration_min: float
-    distance_m: float
-    final_soc_pct: float
-    min_energy_margin_wh: float
-    coverage_pct: float
-    mean_overlap_pct: float
-    images: int
-    mean_standoff_m: float
-    p95_standoff_error_m: float
-    p95_nav_error_m: float
-    hazard_index: float
-    data_suitability_index: float
-    annual_generation_mwh: float
-    revenue_risk_per_turbine: float
-    revenue_risk_farm: float
-    terminated: bool
-    termination_phase: str
-    recommendations: List[str]
+class WheelState:
+    name: str
+    predicted_load_n: float = 0.0
+    measured_load_n: float = 0.0
+    predicted_strain_ue: float = 0.0
+    measured_strain_ue: float = 0.0
+    slip_ratio: float = 0.0
+    temperature_c: float = -20.0
+    vibration_index: float = 0.0
+    cumulative_fatigue: float = 0.0
+    puncture_exposure: float = 0.0
+    health_index: float = 1.0
+    rul_fraction: float = 1.0
 
-def clamp(x, lo, hi): return max(lo, min(hi, x))
-def pct(x): return f"{x:.1f}%"
-def money(x): return f"${x:,.0f}"
-def total_disk_area(i: Inputs): return i.rotor_count*math.pi*(i.propeller_diameter_m/2)**2
+@dataclass
+class RoverTwinState:
+    x_m: float
+    y_m: float
+    speed_mps: float
+    mission_mode: str
+    physics_gate: str
+    uncertainty: float
+    wheels: list
 
-def blade_line(i: Inputs, blade_idx: int, n=180):
-    ang=math.radians([90,210,330][blade_idx]); r=np.linspace(i.blade_root_offset_m,i.rotor_diameter_m/2,n)
-    chord=5.5+(1.1-5.5)*(r-r.min())/max(r.max()-r.min(),1e-6)
-    return pd.DataFrame({"blade_id":blade_idx+1,"r_m":r,"x_m":0.0,"y_m":r*np.cos(ang),
-                         "z_m":i.hub_height_m+r*np.sin(ang),"chord_m":chord,"azimuth_deg":math.degrees(ang)})
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
 
-def surface_grid(i: Inputs, blade_id: int):
-    line=blade_line(i,blade_id-1,80); rows=[]
-    for _,r in line.iterrows():
-        a=math.radians(r.azimuth_deg); cy=-math.sin(a); cz=math.cos(a)
-        for cf in np.linspace(-.5,.5,20):
-            rows.append({"blade_id":blade_id,"r_m":r.r_m,"x_m":0.0,
-                         "y_m":r.y_m+cf*r.chord_m*cy,"z_m":r.z_m+cf*r.chord_m*cz,
-                         "covered":False,"obs":0})
-    return pd.DataFrame(rows)
+def clamp_array(a, lo, hi):
+    return np.maximum(lo, np.minimum(hi, a))
 
-def add_seg(segs,phase,x,y,z,blade_id=0,pass_id=0):
-    segs.append(pd.DataFrame({"phase":phase,"x_m":x,"y_m":y,"z_m":z,"blade_id":blade_id,
-                              "pass_id":pass_id,"phase_progress":np.linspace(0,1,len(x))}))
+def generate_demo_mars_terrain(seed=42, grid_size=72):
+    rng = np.random.default_rng(seed)
+    x = np.linspace(-MAP_EXTENT_M/2, MAP_EXTENT_M/2, grid_size)
+    y = np.linspace(-MAP_EXTENT_M/2, MAP_EXTENT_M/2, grid_size)
+    xx, yy = np.meshgrid(x, y)
+    z = (
+        12*np.sin(xx/145) + 8*np.cos(yy/115) + 4*np.sin((xx+yy)/80)
+        + rng.normal(0,1.8,size=xx.shape)
+    )
+    z += 17*np.exp(-(((xx+110)/170)**2 + ((yy-50)/95)**2))
+    z -= 10*np.exp(-(((xx-180)/150)**2 + ((yy+120)/120)**2))
+    rock_proxy = np.zeros_like(z)
+    for _ in range(26):
+        bx, by = rng.uniform(-450,450,2)
+        r = rng.uniform(12,34)
+        h = rng.uniform(4,14)
+        d = np.sqrt((xx-bx)**2 + (yy-by)**2)
+        z += h*np.exp(-(d/r)**2)
+        rock_proxy += np.exp(-(d/(r*2.1))**2)
+    rock_proxy = clamp_array(rock_proxy/max(rock_proxy.max(),1e-6),0,1)
+    return x,y,xx,yy,z,rock_proxy
 
-def trans(a,b,n):
-    t=np.linspace(0,1,n,endpoint=False); s=3*t*t-2*t*t*t
-    return tuple(a[k]+(b[k]-a[k])*s for k in range(3))
+def load_uploaded_dem(file):
+    df = pd.read_csv(file)
+    lower = {c.lower(): c for c in df.columns}
+    if {"x","y","z"}.issubset(lower):
+        xc,yc,zc = lower["x"],lower["y"],lower["z"]
+        xs = np.sort(df[xc].unique())
+        ys = np.sort(df[yc].unique())
+        pivot = df.pivot(index=yc, columns=xc, values=zc).reindex(index=ys, columns=xs)
+        z = pivot.values.astype(float)
+        x = xs.astype(float)
+        y = ys.astype(float)
+    else:
+        z = df.select_dtypes(include=[np.number]).values.astype(float)
+        if z.shape[0] < 10 or z.shape[1] < 10:
+            raise ValueError("DEM matrix must be at least 10×10.")
+        x = np.linspace(-MAP_EXTENT_M/2, MAP_EXTENT_M/2, z.shape[1])
+        y = np.linspace(-MAP_EXTENT_M/2, MAP_EXTENT_M/2, z.shape[0])
+    xx,yy = np.meshgrid(x,y)
+    return x,y,xx,yy,z,np.zeros_like(z)
 
-def build_path(i: Inputs):
-    segs=[]; launch=(-i.launch_distance_m,-.12*i.launch_distance_m,2.0)
-    transit_alt=max(25,min(i.hub_height_m*.38,i.hub_height_m-20)); safe_x=-max(i.desired_standoff_m*4,20)
-    add_seg(segs,"Takeoff",np.full(36,launch[0]),np.full(36,launch[1]),np.linspace(2,transit_alt,36,endpoint=False))
-    x,y,z=trans((launch[0],launch[1],transit_alt),(safe_x,0,transit_alt),70); add_seg(segs,"Transit",x,y,z)
-    current=(x[-1],y[-1],z[-1])
-    for b in range(i.blades_to_inspect):
-        line=blade_line(i,b,160); ox=np.full(len(line),-i.desired_standoff_m); oy=line.y_m.to_numpy(); oz=line.z_m.to_numpy()
-        tx,ty,tz=trans(current,(ox[0],oy[0],oz[0]),36); add_seg(segs,"Blade transition",tx,ty,tz,b+1)
-        add_seg(segs,"Blade inspection",ox,oy,oz,b+1,1)
-        a=math.radians(line.azimuth_deg.iloc[0]); cy=-math.sin(a); cz=math.cos(a)
-        add_seg(segs,"Blade inspection",ox,oy[::-1]+.55*cy,oz[::-1]+.55*cz,b+1,2)
-        current=(ox[-1],oy[0]+.55*cy,oz[0]+.55*cz)
-        if b<i.blades_to_inspect-1:
-            clear=(-max(i.desired_standoff_m*2.4,12),0,i.hub_height_m)
-            tx,ty,tz=trans(current,clear,28); add_seg(segs,"Hub clearance",tx,ty,tz,b+1); current=clear
-    tx,ty,tz=trans(current,(safe_x,0,transit_alt),45); add_seg(segs,"Egress",tx,ty,tz)
-    tx,ty,tz=trans((safe_x,0,transit_alt),(launch[0],launch[1],transit_alt),70); add_seg(segs,"Return to launch",tx,ty,tz)
-    add_seg(segs,"Landing",np.full(34,launch[0]),np.full(34,launch[1]),np.linspace(transit_alt,2,34))
-    p=pd.concat(segs,ignore_index=True); p["step"]=np.arange(len(p));
-    d=p[["x_m","y_m","z_m"]].diff().fillna(0); p["segment_distance_m"]=np.sqrt((d*d).sum(axis=1))
-    speeds={"Takeoff":min(2.8,i.cruise_speed_ms*.35),"Transit":i.cruise_speed_ms,
-            "Blade transition":min(3.2,i.cruise_speed_ms*.45),"Blade inspection":i.inspection_speed_ms,
-            "Hub clearance":min(2.6,i.cruise_speed_ms*.35),"Egress":min(4,i.cruise_speed_ms*.5),
-            "Return to launch":i.cruise_speed_ms,"Landing":min(2.2,i.cruise_speed_ms*.3)}
-    p["commanded_speed_ms"]=p.phase.map(speeds).astype(float); p["dt_s"]=p.segment_distance_m/p.commanded_speed_ms.clip(lower=.2)
-    p.loc[0,"dt_s"]=.5; p["elapsed_s"]=p.dt_s.cumsum(); return p
+def terrain_layers(z,x,rock_proxy):
+    spacing = abs(x[1]-x[0])
+    gy,gx = np.gradient(z,spacing,spacing)
+    slope = np.degrees(np.arctan(np.sqrt(gx**2+gy**2)))
+    rough = np.sqrt(gx**2+gy**2)
+    rough = clamp_array((rough-rough.min())/max(1e-9,rough.max()-rough.min()),0,1)
+    hard = clamp_array(0.55*rough + 0.25*(slope/25) + 0.20*(1-rock_proxy),0,1)
+    sharp = clamp_array(0.72*rock_proxy + 0.28*rough,0,1)
+    yielding = clamp_array(1 - 0.65*hard - 0.55*sharp,0,1)
+    stack = np.stack([hard,sharp,yielding],axis=0)
+    sorted_probs = np.sort(stack,axis=0)
+    uncertainty = clamp_array(1-(sorted_probs[-1]-sorted_probs[-2]),0.05,0.95)
+    terrain_idx = np.argmax(stack,axis=0)
+    terrain_class = np.empty(z.shape,dtype=object)
+    terrain_class[terrain_idx==0] = "hard_bedrock"
+    terrain_class[terrain_idx==1] = "sharp_rock_field"
+    terrain_class[terrain_idx==2] = "yielding_soil"
+    return dict(
+        slope_deg=slope, roughness=rough, hard_bedrock_prob=hard,
+        sharp_rock_prob=sharp, yielding_prob=yielding,
+        uncertainty=uncertainty, terrain_class=terrain_class
+    )
 
-def nav_sigma(i: Inputs):
-    return {"RTK fixed":.04,"RTK float":.12,"Standard GNSS":.65,
-            "Multipath / degraded":1.4,"GNSS denied — alternate navigation":.85}[i.navigation_condition]
+def physics_engine(layers,wheel_health=0.97):
+    slope = layers["slope_deg"]
+    rough = layers["roughness"]
+    hard = layers["hard_bedrock_prob"]
+    sharp = layers["sharp_rock_prob"]
+    yielding = layers["yielding_prob"]
+    uncertainty = layers["uncertainty"]
 
-def fusion_credit(i: Inputs):
-    optical=i.optical_quality_pct/100; lidar=clamp(.72-.006*max(0,i.lidar_noise_cm-2)+.002*(i.lidar_rate_hz-10),.35,.95)
-    imu=i.imu_quality_pct/100; sync=clamp(1-i.sync_error_ms/120,.2,1); vis=clamp(i.visibility_km/8,.25,1)
-    rain={"None":1,"Light rain":.9,"Moderate rain":.72,"Heavy rain":.5}[i.precipitation]
-    return clamp(.34*optical+.30*lidar+.22*imu+.14*sync,.3,.94)*vis*rain
+    static_per_wheel_n = 900.0*MARS_GRAVITY/6.0
+    slope_rad = np.radians(slope)
+    health_penalty = 1.0 + 0.35*(1-wheel_health)
+    load_mult = (1 + 0.75*np.sin(slope_rad) + 0.65*rough + 0.50*sharp)*health_penalty
+    pred_load = static_per_wheel_n*load_mult
+    pred_strain = 1.55*pred_load*(0.65+0.55*hard)
 
-def power_w(i: Inputs,speed,phase):
-    area=total_disk_area(i); weight=i.uas_mass_kg*G; rel=math.sqrt(speed**2+i.mean_wind_ms**2)
-    drag=.5*RHO*i.drag_area_m2*rel**2; tilt=math.atan2(drag,weight); thrust=weight/max(math.cos(tilt),.3)
-    induced=thrust**1.5/math.sqrt(max(2*RHO*area,1e-9))/max(i.figure_of_merit,.35)
-    profile=.1*induced+28*i.rotor_count; parasitic=.5*RHO*i.drag_area_m2*speed**3
-    pf={"Takeoff":1.18,"Transit":1,"Blade transition":1.08,"Blade inspection":1.12,"Hub clearance":1.1,
-        "Egress":1.06,"Return to launch":1,"Landing":.92}[phase]
-    env=(1+.01*i.turbulence_intensity_pct)*(1+.022*max(0,i.gust_ms-i.mean_wind_ms))*{"None":1,"Light rain":1.03,"Moderate rain":1.08,"Heavy rain":1.15}[i.precipitation]
-    hotel=110+4*i.lidar_rate_hz+2*i.camera_frame_rate_hz
-    return min(i.max_continuous_power_w*1.25,(induced+profile+parasitic)/i.motor_esc_efficiency*pf*env+hotel)
+    slip = clamp_array(0.55*yielding + 0.35*(slope/LIMITS["hard_slope_deg"]) + 0.10*rough,0,1)
+    fatigue = clamp_array(0.55*hard + 0.25*rough + 0.20*(pred_strain/LIMITS["max_measured_strain_ue"]),0,1)
+    puncture = clamp_array(0.60*sharp + 0.30*(pred_load/LIMITS["max_predicted_wheel_load_n"]) + 0.10*rough,0,1)
+    stability = clamp_array(0.70 - 0.55*(slope/LIMITS["hard_slope_deg"]) - 0.12*rough,0,1)
+    energy = clamp_array(0.25 + 0.40*(slope/LIMITS["hard_slope_deg"]) + 0.20*rough + 0.15*slip,0,1.5)
 
-def return_energy(i: Inputs,row):
-    launch=np.array([-i.launch_distance_m,-.12*i.launch_distance_m,2.0]); p=np.array([row.x_m,row.y_m,row.z_m])
-    dist=np.linalg.norm((p-launch)[:2])+.35*abs(p[2]-launch[2]); t=dist/max(i.cruise_speed_ms,.5)+20
-    pw=power_w(i,i.cruise_speed_ms,"Return to launch"); return pw*t/3600+.35*pw*25/3600
+    no_go = (
+        (slope > LIMITS["hard_slope_deg"])
+        | (pred_load > LIMITS["max_predicted_wheel_load_n"])
+        | (pred_strain > LIMITS["max_measured_strain_ue"])
+        | (slip > LIMITS["max_slip_ratio"])
+        | (stability < LIMITS["min_stability_margin"])
+    )
 
-def annotate(i: Inputs,p: pd.DataFrame):
-    rng=np.random.default_rng(RNG_SEED); out=p.copy(); fusion=fusion_credit(i); base=nav_sigma(i)
-    moving=1 if i.rotor_state=="Parked and secured" else 1+.10*i.blade_rpm
-    phase_credit=out.phase.map({"Takeoff":.35,"Transit":.25,"Blade transition":.75,"Blade inspection":1,
-                                "Hub clearance":.8,"Egress":.65,"Return to launch":.25,"Landing":.35}).astype(float)
-    sigma=(base*(1-phase_credit*fusion)+.02+.012*i.mean_wind_ms+.025*max(0,i.gust_ms-i.mean_wind_ms)+.004*i.turbulence_intensity_pct)*moving
-    out["relative_nav_error_m"]=np.abs(rng.normal(0,np.maximum(sigma,.02)))
-    cache={k:blade_line(i,k-1,220) for k in (1,2,3)}; actual=[]
-    for _,r in out.iterrows():
-        if r.blade_id in cache:
-            pts=cache[int(r.blade_id)][["x_m","y_m","z_m"]].to_numpy(); q=np.array([r.x_m,r.y_m,r.z_m]); d=np.linalg.norm(pts-q,axis=1).min()
-        else: d=abs(r.x_m)
-        actual.append(d)
-    noise=rng.normal(0,.035+.012*i.mean_wind_ms+.02*max(0,i.gust_ms-i.mean_wind_ms)+.004*i.turbulence_intensity_pct,len(out))*moving
-    out["actual_standoff_m"]=np.maximum(.1,np.array(actual)+noise); out["standoff_error_m"]=abs(out.actual_standoff_m-i.desired_standoff_m)
-    out["power_w"]=[power_w(i,s,ph) for s,ph in zip(out.commanded_speed_ms,out.phase)]
-    out["energy_wh"]=out.power_w*out.dt_s/3600; out["cumulative_energy_wh"]=out.energy_wh.cumsum()
-    initial=i.battery_capacity_wh*i.initial_soc_pct/100; out["remaining_energy_wh"]=initial-out.cumulative_energy_wh
-    out["soc_pct_raw"]=100*out.remaining_energy_wh/i.battery_capacity_wh; reserve=i.battery_capacity_wh*i.reserve_soc_pct/100
-    out["predicted_return_energy_wh"]=[return_energy(i,r) for _,r in out.iterrows()]
-    out["energy_margin_wh"]=out.remaining_energy_wh-out.predicted_return_energy_wh-reserve
-    inspection=out.phase=="Blade inspection"; blur=.18*max(0,i.mean_wind_ms-8)+.35*max(0,i.gust_ms-i.mean_wind_ms)+.08*i.inspection_speed_ms**2+.25*i.blade_rpm
-    q=clamp(100-blur-1.8*max(0,4-i.visibility_km)-{"None":0,"Light rain":5,"Moderate rain":14,"Heavy rain":28}[i.precipitation],10,100)
-    out["image_overlap_pct"]=np.where(inspection,np.clip(i.required_overlap_pct-2*out.standoff_error_m-.04*(100-q)+rng.normal(0,1,len(out)),10,98),np.nan)
-    lq=100-2.2*i.lidar_noise_cm-.2*i.mean_wind_ms-.6*max(0,i.gust_ms-i.mean_wind_ms)-{"None":0,"Light rain":5,"Moderate rain":15,"Heavy rain":30}[i.precipitation]-8*out.relative_nav_error_m
-    out["lidar_quality_index"]=np.where(inspection,np.clip(lq,5,100),np.nan)
-    clearance=np.maximum(out.actual_standoff_m-.8,.1)
-    out["hazard_index"]=np.clip(8+1.7*i.mean_wind_ms+2.6*max(0,i.gust_ms-i.mean_wind_ms)+.9*i.turbulence_intensity_pct+11*out.relative_nav_error_m+20*out.standoff_error_m/clearance+7*max(0,i.blade_rpm-.3),0,100)
-    abort=(out.soc_pct_raw<=0)|(out.energy_margin_wh<0)|(out.power_w>i.max_continuous_power_w)
-    out["active"]=True
-    if abort.any(): out.loc[int(np.argmax(abort.to_numpy()))+1:,"active"]=False
-    out["soc_pct"]=np.clip(out.soc_pct_raw,0,100); return out
+    soft_cost = 0.24*fatigue + 0.24*puncture + 0.18*slip + 0.14*rough + 0.10*energy + 0.10*uncertainty
+    traversability = clamp_array(100*(1-soft_cost),0,100)
+    traversability = np.where(no_go,0,traversability)
 
-def camera_footprint(i: Inputs,rng_m):
-    return 2*rng_m*math.tan(math.radians(i.camera_hfov_deg/2)),2*rng_m*math.tan(math.radians(i.camera_vfov_deg/2))
+    return dict(
+        predicted_wheel_load_n=pred_load,
+        predicted_strain_ue=pred_strain,
+        slip_risk=slip,
+        fatigue_risk=fatigue,
+        puncture_risk=puncture,
+        stability_margin=stability,
+        energy_cost=energy,
+        uncertainty=uncertainty,
+        no_go=no_go,
+        soft_cost=soft_cost,
+        traversability=traversability,
+    )
 
-def coverage(i: Inputs,p: pd.DataFrame):
-    grids={b:surface_grid(i,b) for b in range(1,i.blades_to_inspect+1)}; insp=p[(p.active)&(p.phase=="Blade inspection")]
-    next_t=0; images=0
-    for _,r in insp.iterrows():
-        if r.elapsed_s<next_t: continue
-        next_t=r.elapsed_s+1/max(i.camera_frame_rate_hz,.1); images+=1; g=grids[int(r.blade_id)]
-        w,h=camera_footprint(i,max(r.actual_standoff_m,.5)); dy=abs(g.y_m-r.y_m); dz=abs(g.z_m-r.z_m)
-        d=np.linalg.norm(g[["x_m","y_m","z_m"]].to_numpy()-np.array([r.x_m,r.y_m,r.z_m]),axis=1)
-        ok=(r.image_overlap_pct>=max(45,i.required_overlap_pct-15)) and (r.lidar_quality_index>=45) and (r.relative_nav_error_m<=1.5)
-        if ok:
-            idx=np.where((dy<=w/2)&(dz<=h/2)&(d<=min(i.lidar_range_m,max(r.actual_standoff_m*2,3))))[0]
-            g.loc[idx,"covered"]=True; g.loc[idx,"obs"]+=1; grids[int(r.blade_id)]=g
-    total=sum(len(g) for g in grids.values()); cov=100*sum(int(g.covered.sum()) for g in grids.values())/max(total,1)
-    return cov,grids,images
+def nearest_idx(x,y,tx,ty):
+    return int(np.argmin(abs(y-ty))), int(np.argmin(abs(x-tx)))
 
-def summarize(i: Inputs,p: pd.DataFrame):
-    cov,grids,images=coverage(i,p); a=p[p.active]; insp=a[a.phase=="Blade inspection"]; term=len(a)<len(p)
-    ts="None" if not term else p[~p.active].phase.iloc[0]; final=float(a.soc_pct.iloc[-1]); margin=float(a.energy_margin_wh.min())
-    p95n=float(insp.relative_nav_error_m.quantile(.95)); p95s=float(insp.standoff_error_m.quantile(.95)); meanst=float(insp.actual_standoff_m.mean()); overlap=float(insp.image_overlap_pct.mean()); hz=float(insp.hazard_index.quantile(.95)); lq=float(insp.lidar_quality_index.mean())
-    suit=.30*cov+.20*clamp((overlap-40)/40*100,0,100)+.18*clamp(100-50*p95n,0,100)+.15*clamp(100-40*p95s,0,100)+.12*lq+.05*clamp((final-i.reserve_soc_pct)*3+55,0,100)
-    if term: disp="SIMULATED MISSION INFEASIBLE"; reason=f"Mission terminated during {ts} because energy or power feasibility was violated."
-    elif hz>=80 or p95n>1.5: disp="SIMULATED MISSION INFEASIBLE"; reason="Relative-navigation or rotor-proximity criteria were exceeded."
-    elif cov<90 or final<i.reserve_soc_pct or hz>=55: disp="SIMULATED MISSION CONDITIONAL"; reason="One or more concept-level acceptance criteria were not fully satisfied."
-    else: disp="SIMULATED MISSION ACCEPTABLE"; reason="Modeled coverage, energy, navigation, and hazard criteria were satisfied."
-    annual=i.turbine_rating_mw*8760*i.annual_capacity_factor_pct/100; rev=annual*i.assumed_aep_loss_pct/100*i.energy_price_per_mwh
-    rec=[]
-    if term or margin<0: rec.append("Reduce mission scope, shorten launch distance, or increase battery capacity.")
-    if hz>=55: rec.append("Increase stand-off distance or postpone the mission until gust exposure is lower.")
-    if p95n>.5: rec.append("Improve blade-relative navigation before close-proximity inspection.")
-    if cov<95: rec.append("Add a targeted rescan or reduce inspection speed to improve geometric coverage.")
-    if i.rotor_state!="Parked and secured": rec.append("Treat rotating-rotor results as stress cases only; blade tracking is not modeled.")
-    if not rec: rec=["The modeled mission satisfies the current concept-level criteria."]
-    return Summary(disp,reason,float(a.elapsed_s.iloc[-1]/60),float(insp.dt_s.sum()/60),float(a.segment_distance_m.sum()),final,margin,cov,overlap,images,meanst,p95s,p95n,hz,suit,annual,rev,rev*i.turbines_in_farm,term,str(ts),rec)
+def astar(cost_map,no_go,start,goal):
+    rows,cols = cost_map.shape
+    sr,sc = start
+    gr,gc = goal
+    if no_go[sr,sc] or no_go[gr,gc]:
+        return []
+    def h(r,c):
+        return math.hypot(r-gr,c-gc)
+    q=[(h(sr,sc),0.0,sr,sc)]
+    gscore={(sr,sc):0.0}
+    came={}
+    nbrs=[(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)]
+    while q:
+        _,g,r,c = heapq.heappop(q)
+        if (r,c)==(gr,gc):
+            out=[(r,c)]
+            while (r,c) in came:
+                r,c = came[(r,c)]
+                out.append((r,c))
+            return list(reversed(out))
+        for dr,dc in nbrs:
+            nr,nc=r+dr,c+dc
+            if not (0<=nr<rows and 0<=nc<cols) or no_go[nr,nc]:
+                continue
+            step=math.sqrt(2) if dr and dc else 1
+            ng=g+step*float(cost_map[nr,nc])
+            if ng < gscore.get((nr,nc),float("inf")):
+                gscore[(nr,nc)] = ng
+                came[(nr,nc)] = (r,c)
+                heapq.heappush(q,(ng+h(nr,nc),ng,nr,nc))
+    return []
 
-def turbine_traces(i: Inputs):
-    tr=[go.Scatter3d(x=[0,0],y=[0,0],z=[0,i.hub_height_m],mode="lines",line=dict(width=10,color="#dceaf0"),name="Tower")]
-    for b in range(3):
-        l=blade_line(i,b,120); tr.append(go.Scatter3d(x=l.x_m,y=l.y_m,z=l.z_m,mode="lines",line=dict(width=11,color="#f6fbfd"),name=f"Blade {b+1}"))
-    return tr
+def planner_cost(physics,science_map,weights):
+    return (
+        weights["wheel"]*physics["soft_cost"]
+        + weights["uncertainty"]*physics["uncertainty"]
+        + weights["energy"]*physics["energy_cost"]
+        + weights["science"]*(1-science_map)
+        + 0.15
+    )
 
-def mission_fig(i: Inputs,p: pd.DataFrame):
-    fig=go.Figure();
-    span=max(i.launch_distance_m*1.15,i.rotor_diameter_m*1.15,220); x=np.linspace(-span,span*.45,32); y=np.linspace(-span*.58,span*.58,32); xx,yy=np.meshgrid(x,y); zz=min(2,i.wave_height_m/2)*(.55*np.sin(xx/18+yy/30)+.45*np.cos(yy/14))
-    fig.add_trace(go.Surface(x=xx,y=yy,z=zz,colorscale=[[0,"#063954"],[1,"#0a6b88"]],opacity=.72,showscale=False,name="Ocean"))
-    for t in turbine_traces(i): fig.add_trace(t)
-    colors={"Takeoff":"#78f0bb","Transit":"#63b9ff","Blade transition":"#ffd166","Blade inspection":"#51f6a6","Hub clearance":"#ffb86c","Egress":"#e89bff","Return to launch":"#b99cff","Landing":"#7dd3fc"}
-    for ph,g in p[p.active].groupby("phase",sort=False): fig.add_trace(go.Scatter3d(x=g.x_m,y=g.y_m,z=g.z_m,mode="lines",line=dict(width=6,color=colors[ph]),name=ph))
-    fig.update_layout(height=690,margin=dict(l=0,r=0,t=35,b=0),paper_bgcolor="rgba(0,0,0,0)",scene=dict(bgcolor="rgba(5,25,39,.35)",xaxis_title="Along-track (m)",yaxis_title="Cross-track (m)",zaxis_title="Height above local water datum (m)",camera=dict(eye=dict(x=1.7,y=-1.75,z=1.15)),aspectmode="manual",aspectratio=dict(x=1.55,y=1,z=1.25)))
+WHEEL_NAMES=["LF","LM","LR","RF","RM","RR"]
+
+def initialize_twin(start_x,start_y):
+    return RoverTwinState(
+        x_m=float(start_x), y_m=float(start_y), speed_mps=0.0,
+        mission_mode="STANDBY", physics_gate="NOT EVALUATED",
+        uncertainty=0.25, wheels=[WheelState(name=w) for w in WHEEL_NAMES]
+    )
+
+def simulate_measurement(pred_load,pred_strain,slip,terrain_key,step_idx,wheel_idx):
+    rng=np.random.default_rng(1000+step_idx*37+wheel_idx*11)
+    hard = 0.9 if terrain_key=="hard_bedrock" else 0.5
+    sharp = 0.9 if terrain_key=="sharp_rock_field" else 0.2
+    sink = 0.8 if terrain_key=="yielding_soil" else 0.15
+    measured_load = pred_load*(1+0.12*hard+0.16*sharp+rng.normal(0,0.035))
+    measured_strain = pred_strain*(1+0.10*hard+rng.normal(0,0.04))
+    measured_slip = clamp(slip+0.18*sink+rng.normal(0,0.025),0,1)
+    temp = -25+7*measured_slip+rng.normal(0,1.2)
+    vibration = clamp(0.18+0.75*sharp+rng.normal(0,0.04),0,1)
+    return measured_load,measured_strain,measured_slip,temp,vibration
+
+def update_health(wheel):
+    strain_frac=clamp(wheel.measured_strain_ue/LIMITS["max_measured_strain_ue"],0,2)
+    load_frac=clamp(wheel.measured_load_n/LIMITS["max_predicted_wheel_load_n"],0,2)
+    wheel.cumulative_fatigue=clamp(wheel.cumulative_fatigue+max(0,strain_frac-0.45)*0.0015,0,1)
+    wheel.puncture_exposure=clamp(wheel.puncture_exposure+max(0,load_frac-0.55)*wheel.vibration_index*0.0012,0,1)
+    degradation=0.72*wheel.cumulative_fatigue+0.28*wheel.puncture_exposure
+    wheel.health_index=clamp(1-degradation,0,1)
+    wheel.rul_fraction=clamp(1-1.15*degradation,0,1)
+
+def terrain_figure(x,y,z,traversability,path_xy,start_xy,goal_xy):
+    fig=go.Figure()
+    fig.add_trace(go.Surface(
+        x=x,y=y,z=z,surfacecolor=traversability,
+        colorscale=[[0,"#5b0000"],[.25,"#b12e2e"],[.5,"#d79b2b"],[.72,"#8abd4f"],[1,"#32e47a"]],
+        colorbar=dict(title="Traversability",thickness=12),opacity=.97
+    ))
+    if path_xy:
+        px=[p[0] for p in path_xy]; py=[p[1] for p in path_xy]; pz=[]
+        for xx0,yy0 in path_xy:
+            iy=int(np.argmin(abs(y-yy0))); ix=int(np.argmin(abs(x-xx0)))
+            pz.append(z[iy,ix]+4)
+        fig.add_trace(go.Scatter3d(x=px,y=py,z=pz,mode="lines",line=dict(width=7,color="white"),name="Selected Risk-Aware Path"))
+    for label,pt,color in [("START",start_xy,"#4db3ff"),("GOAL",goal_xy,"#5cff8d")]:
+        iy=int(np.argmin(abs(y-pt[1]))); ix=int(np.argmin(abs(x-pt[0])))
+        fig.add_trace(go.Scatter3d(x=[pt[0]],y=[pt[1]],z=[z[iy,ix]+12],mode="markers+text",
+                                   marker=dict(size=7,color=color),text=[label],textposition="top center",name=label))
+    fig.update_layout(height=590,margin=dict(l=0,r=0,t=10,b=0),
+        paper_bgcolor="rgba(0,0,0,0)",font=dict(color="#e6f1ff"),
+        scene=dict(bgcolor="rgba(0,0,0,0)",camera=dict(eye=dict(x=1.55,y=-1.55,z=.9)),
+                   aspectratio=dict(x=1.25,y=1.25,z=.32)))
     return fig
 
-def telemetry_fig(i: Inputs,p: pd.DataFrame):
-    a=p[p.active]; t=a.elapsed_s/60; fig=go.Figure(); fig.add_trace(go.Scatter(x=t,y=a.soc_pct,name="State of charge")); fig.add_hline(y=i.reserve_soc_pct,line_dash="dash",annotation_text="Reserve")
-    fig.add_trace(go.Scatter(x=t,y=a.hazard_index,name="Rotor-proximity hazard index")); fig.update_layout(height=420,xaxis_title="Elapsed time (min)",yaxis_title="Percent / index",yaxis_range=[0,105],paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(6,27,42,.55)",hovermode="x unified"); return fig
+def heatmap(x,y,arr,title,colorscale,path_xy):
+    fig=go.Figure(go.Heatmap(x=x,y=y,z=arr,colorscale=colorscale,colorbar=dict(thickness=10)))
+    if path_xy:
+        fig.add_trace(go.Scatter(x=[p[0] for p in path_xy],y=[p[1] for p in path_xy],
+                                 mode="lines",line=dict(width=3,color="white"),name="Path"))
+    fig.update_layout(title=title,height=320,margin=dict(l=0,r=0,t=40,b=0),
+                      paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(0,0,0,0)",
+                      font=dict(color="#e6f1ff"),yaxis=dict(scaleanchor="x",scaleratio=1))
+    return fig
 
-def coverage_fig(i: Inputs,p: pd.DataFrame):
-    _,grids,_=coverage(i,p); rows=[]
-    for bid,g in grids.items(): rows.append(g.groupby("r_m").covered.mean().reset_index().assign(blade_id=bid))
-    d=pd.concat(rows); piv=d.pivot(index="blade_id",columns="r_m",values="covered")
-    fig=go.Figure(go.Heatmap(z=100*piv.to_numpy(),x=piv.columns,y=[f"Blade {x}" for x in piv.index],zmin=0,zmax=100,colorbar=dict(title="Covered %")))
-    fig.update_layout(height=360,xaxis_title="Radial distance from hub (m)",paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(6,27,42,.55)"); return fig
 
-def card(label,value,note=""):
-    st.markdown(f'<div class="card"><div class="label">{label}</div><div class="value">{value}</div><div>{note}</div></div>',unsafe_allow_html=True)
+def route_physics_summary(bundle):
+    """Summarize the authoritative physics envelope along the selected path."""
+    p = bundle["physics"]
+    idx = bundle["path_idx"]
+    if not idx:
+        return {
+            "verdict": "REJECT",
+            "peak_load_n": float("nan"),
+            "peak_strain_ue": float("nan"),
+            "peak_slip": float("nan"),
+            "min_stability": float("nan"),
+            "max_slope_deg": float("nan"),
+            "max_fatigue": float("nan"),
+            "max_puncture": float("nan"),
+        }
 
-def report(i: Inputs,s: Summary):
-    rec="\n".join(f"- {x}" for x in s.recommendations)
-    return f"""# Offshore Autonomous Blade Inspection Mission Report\n\n**Mission ID:** {i.mission_id}  \n**Generated:** {datetime.now():%Y-%m-%d %H:%M}  \n**Simulator:** {APP_VERSION}  \n**Disposition:** {s.disposition}\n\n{s.reason}\n\n## Results\n- Geometric blade-surface coverage: {s.coverage_pct:.1f}%\n- Final state of charge: {s.final_soc_pct:.1f}%\n- Minimum dynamic energy margin: {s.min_energy_margin_wh:.0f} Wh\n- P95 stand-off error: {s.p95_standoff_error_m:.2f} m\n- P95 relative-navigation error: {s.p95_nav_error_m:.2f} m\n- Rotor-proximity hazard index: {s.hazard_index:.1f}/100\n- Inspection-data-suitability index: {s.data_suitability_index:.1f}/100\n\n## Economics\n- Annual capacity factor assumption: {i.annual_capacity_factor_pct:.1f}%\n- Estimated annual generation: {s.annual_generation_mwh:,.0f} MWh\n- Revenue at risk per turbine-year: {money(s.revenue_risk_per_turbine)}\n- Revenue at risk for {i.turbines_in_farm} turbines: {money(s.revenue_risk_farm)}\n\nThese are scenario-dependent values, not guaranteed UAS savings.\n\n## Recommendations\n{rec}\n\n## Limitations\nConcept-level model only. No full 6-DOF dynamics, calibrated collision probability, validated defect detector, or time-dependent rotating-blade tracking.\n"""
+    vals = lambda key: [float(p[key][r, c]) for r, c in idx]
+    return {
+        "verdict": "PASS",
+        "peak_load_n": max(vals("predicted_wheel_load_n")),
+        "peak_strain_ue": max(vals("predicted_strain_ue")),
+        "peak_slip": max(vals("slip_risk")),
+        "min_stability": min(vals("stability_margin")),
+        "max_slope_deg": max(float(bundle["layers"]["slope_deg"][r, c]) for r, c in idx),
+        "max_fatigue": max(vals("fatigue_risk")),
+        "max_puncture": max(vals("puncture_risk")),
+    }
 
-for k in ("path","summary","inputs"):
-    if k not in st.session_state: st.session_state[k]=None
 
-st.markdown('<div class="hero"><div class="eyebrow">Concept-Level Offshore Inspection Digital-Twin Prototype</div><h1>Offshore Wind Turbine Blade Inspection Mission Simulator</h1><p>Blade-by-blade autonomous inspection, geometric coverage, blade-relative navigation, energy-aware return logic, offshore environmental effects, and systems-engineering outputs.</p></div>',unsafe_allow_html=True)
-st.caption("Academic concept demonstrator; not validated operational software.")
+def current_physics_state(bundle):
+    """Return the authoritative local physics state reflected by the digital twin."""
+    if not bundle["path_idx"]:
+        return None
+    i = min(bundle["step"], len(bundle["path_idx"]) - 1)
+    r, c = bundle["path_idx"][i]
+    p = bundle["physics"]
+    layers = bundle["layers"]
+    return {
+        "step": i,
+        "x_m": float(bundle["x"][c]),
+        "y_m": float(bundle["y"][r]),
+        "terrain_class": str(layers["terrain_class"][r, c]),
+        "slope_deg": float(layers["slope_deg"][r, c]),
+        "roughness": float(layers["roughness"][r, c]),
+        "predicted_wheel_load_n": float(p["predicted_wheel_load_n"][r, c]),
+        "predicted_strain_ue": float(p["predicted_strain_ue"][r, c]),
+        "slip_risk": float(p["slip_risk"][r, c]),
+        "fatigue_risk": float(p["fatigue_risk"][r, c]),
+        "puncture_risk": float(p["puncture_risk"][r, c]),
+        "stability_margin": float(p["stability_margin"][r, c]),
+        "energy_cost": float(p["energy_cost"][r, c]),
+        "uncertainty": float(p["uncertainty"][r, c]),
+        "no_go": bool(p["no_go"][r, c]),
+        "traversability": float(p["traversability"][r, c]),
+    }
+
+
+def physics_verdict(local):
+    """Hard-gate local motion using authoritative physics constraints."""
+    if local is None:
+        return "REJECT", ["No valid route state."]
+    violations = []
+    if local["no_go"]:
+        violations.append("Cell is marked NO-GO by the physics engine.")
+    if local["slope_deg"] > LIMITS["hard_slope_deg"]:
+        violations.append("Slope exceeds hard limit.")
+    if local["predicted_wheel_load_n"] > LIMITS["max_predicted_wheel_load_n"]:
+        violations.append("Predicted wheel load exceeds hard limit.")
+    if local["predicted_strain_ue"] > LIMITS["max_measured_strain_ue"]:
+        violations.append("Predicted wheel strain exceeds hard limit.")
+    if local["slip_risk"] > LIMITS["max_slip_ratio"]:
+        violations.append("Slip risk exceeds hard limit.")
+    if local["stability_margin"] < LIMITS["min_stability_margin"]:
+        violations.append("Stability margin is below hard limit.")
+    return ("REJECT" if violations else "PASS"), violations
+
+
+def render_physics_engine_console(bundle):
+    """Top-level authoritative engine panel. This is the primary system-of-record."""
+    summary = route_physics_summary(bundle)
+    local = current_physics_state(bundle)
+    verdict, violations = physics_verdict(local)
+
+    st.markdown("## ⚙️ Authoritative Physics Engine")
+    st.caption(
+        "SYSTEM OF RECORD: The digital twin mirrors this engine. "
+        "AI/ML may estimate terrain and risk, but cannot authorize motion that violates these physics constraints."
+    )
+
+    q1, q2, q3, q4, q5, q6 = st.columns(6)
+    q1.metric("Route Gate", summary["verdict"])
+    q2.metric("Peak Wheel Load", "N/A" if not bundle["path_idx"] else f"{summary['peak_load_n']:.0f} N")
+    q3.metric("Peak Strain", "N/A" if not bundle["path_idx"] else f"{summary['peak_strain_ue']:.0f} µε")
+    q4.metric("Peak Slip Risk", "N/A" if not bundle["path_idx"] else f"{summary['peak_slip']:.2f}")
+    q5.metric("Min Stability", "N/A" if not bundle["path_idx"] else f"{summary['min_stability']:.2f}")
+    q6.metric("Max Route Slope", "N/A" if not bundle["path_idx"] else f"{summary['max_slope_deg']:.1f}°")
+
+    p1, p2 = st.columns([1.25, 1.0], gap="large")
+    with p1:
+        st.markdown(
+            """
+            <div class="panel">
+            <div class="panel-title">Authoritative Model Stack</div>
+            <b>Terrain geometry:</b> DEM, local slope, roughness<br>
+            <b>Wheel-terrain interaction:</b> predicted normal load, strain, slip, fatigue and puncture exposure<br>
+            <b>Vehicle mechanics:</b> load transfer and stability margin<br>
+            <b>Mobility:</b> energy cost and traversability<br>
+            <b>Smart-wheel constraints:</b> health-dependent operating envelope<br><br>
+            <b>Hard constraints:</b> NO-GO if slope, wheel load, strain, slip, or stability limits are violated.<br>
+            <b>Soft costs:</b> fatigue, puncture, energy, roughness, uncertainty, and science value may be optimized only inside the feasible region.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with p2:
+        st.markdown('<div class="panel"><div class="panel-title">Current Physics State Reflected by the Twin</div>', unsafe_allow_html=True)
+        if local is None:
+            st.error("No authoritative local state. Route rejected.")
+        else:
+            state_df = pd.DataFrame(
+                {
+                    "Physics Variable": [
+                        "Terrain class", "Slope", "Roughness", "Predicted wheel load",
+                        "Predicted strain", "Slip risk", "Fatigue risk", "Puncture risk",
+                        "Stability margin", "Traversability", "Model uncertainty"
+                    ],
+                    "Authoritative Value": [
+                        local["terrain_class"], f"{local['slope_deg']:.2f}°", f"{local['roughness']:.3f}",
+                        f"{local['predicted_wheel_load_n']:.1f} N", f"{local['predicted_strain_ue']:.1f} µε",
+                        f"{local['slip_risk']:.3f}", f"{local['fatigue_risk']:.3f}",
+                        f"{local['puncture_risk']:.3f}", f"{local['stability_margin']:.3f}",
+                        f"{local['traversability']:.1f}/100", f"{local['uncertainty']:.3f}"
+                    ],
+                }
+            )
+            st.dataframe(state_df, use_container_width=True, hide_index=True)
+            if verdict == "PASS":
+                st.success("LOCAL MOTION GATE: PASS")
+            else:
+                st.error("LOCAL MOTION GATE: REJECT")
+                for v in violations:
+                    st.write(f"• {v}")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with st.expander("Physics equations and assurance assumptions"):
+        st.markdown(
+            r"""
+            **Conceptual demonstrator equations**
+
+            Static load per wheel:
+
+            \[
+            F_{static}=\frac{m g_{Mars}}{6}
+            \]
+
+            Predicted peak wheel load uses a simplified load multiplier driven by slope, roughness,
+            sharp-rock exposure, and wheel-health degradation:
+
+            \[
+            F_{wheel}=F_{static}\,M(\theta,r,hazard,health)
+            \]
+
+            Wheel strain is represented by a calibrated structural proxy:
+
+            \[
+            \epsilon_{wheel}=k\,F_{wheel}\,H_{terrain}
+            \]
+
+            The route planner may optimize soft costs only where all hard physics constraints pass.
+
+            **Important:** these equations are conceptual. A mission implementation would replace them
+            with validated terramechanics, wheel finite-element/structural models, rocker-bogie load transfer,
+            motor/drive-train models, thermal models, and validated uncertainty bounds.
+            """
+        )
 
 with st.sidebar:
-    st.header("Mission configuration")
-    mission_id=st.text_input("Mission ID","OW-UAS-V2-001")
-    with st.expander("Turbine",True):
-        turbine_rating_mw=st.slider("Turbine rating (MW)",6.0,25.0,15.0,.5); annual_capacity_factor_pct=st.slider("Annual capacity factor (%)",30,65,48)
-        hub_height_m=st.slider("Hub height above water datum (m)",80,180,135,5); rotor_diameter_m=st.slider("Rotor diameter (m)",120,280,236,4)
-        blade_root_offset_m=st.slider("Hub-to-blade-root offset (m)",1.0,8.0,3.0,.5); blades_to_inspect=st.select_slider("Blades to inspect",[1,2,3],3)
-        rotor_state=st.selectbox("Rotor state",["Parked and secured","Slow rotation — exploratory stress case","Operational rotation — unsupported stress case"])
-        blade_rpm=st.slider("Rotor speed (rpm)",0.0,8.0,0.0 if rotor_state=="Parked and secured" else 1.0,.1)
-    with st.expander("Environment",True):
-        mean_wind_ms=st.slider("Mean wind (m/s)",2.0,20.0,9.0,.5); gust_ms=st.slider("Peak gust (m/s)",float(mean_wind_ms),26.0,float(max(12,mean_wind_ms+3)),.5)
-        turbulence_intensity_pct=st.slider("Turbulence intensity (%)",2,30,10); wave_height_m=st.slider("Significant wave height (m)",.2,6.0,1.5,.1)
-        visibility_km=st.slider("Visibility (km)",.5,20.0,10.0,.5); precipitation=st.selectbox("Precipitation",["None","Light rain","Moderate rain","Heavy rain"])
-        launch_platform=st.selectbox("Launch platform",["Fixed turbine platform","Service vessel","Offshore substation"])
-        navigation_condition=st.selectbox("Navigation condition",["RTK fixed","RTK float","Standard GNSS","Multipath / degraded","GNSS denied — alternate navigation"],index=3)
-    with st.expander("UAS and energy",True):
-        uas_mass_kg=st.slider("Takeoff mass (kg)",6.0,35.0,14.5,.5); rotor_count=st.select_slider("Rotor count",[4,6,8],4); propeller_diameter_m=st.slider("Propeller diameter (m)",.35,1.1,.65,.05)
-        figure_of_merit=st.slider("Rotor figure of merit",.45,.85,.68,.01); motor_esc_efficiency=st.slider("Motor/ESC efficiency",.70,.95,.88,.01); drag_area_m2=st.slider("Equivalent drag area CdA (m²)",.10,1.2,.42,.02)
-        max_continuous_power_w=st.slider("Max continuous power (W)",1500,14000,6500,250); battery_capacity_wh=st.slider("Battery capacity (Wh)",700,7000,3200,100)
-        initial_soc_pct=st.slider("Initial state of charge (%)",50,100,100); reserve_soc_pct=st.slider("Required landing reserve (%)",15,40,30)
-        cruise_speed_ms=st.slider("Cruise speed (m/s)",3.0,15.0,8.0,.5); inspection_speed_ms=st.slider("Inspection speed (m/s)",.3,4.0,1.2,.1)
-        desired_standoff_m=st.slider("Desired stand-off (m)",2.0,12.0,5.0,.5); launch_distance_m=st.slider("Launch distance (m)",50,1000,250,25)
-    with st.expander("Sensors",True):
-        camera_hfov_deg=st.slider("Camera horizontal FOV (deg)",30,100,70,2); camera_vfov_deg=st.slider("Camera vertical FOV (deg)",20,80,50,2); camera_frame_rate_hz=st.slider("Image capture rate (Hz)",.5,10.0,2.0,.5)
-        optical_quality_pct=st.slider("Optical tracking quality (%)",30,100,82); lidar_range_m=st.slider("LiDAR range (m)",20,120,60,5); lidar_noise_cm=st.slider("LiDAR range noise (cm)",.5,15.0,2.0,.5)
-        lidar_rate_hz=st.slider("LiDAR update rate (Hz)",5,50,20); imu_quality_pct=st.slider("IMU quality index (%)",30,100,82); sync_error_ms=st.slider("Sensor synchronization error (ms)",1,100,12)
-        required_overlap_pct=st.slider("Required image overlap (%)",50,90,75)
-    with st.expander("Economics",False):
-        energy_price_per_mwh=st.number_input("Electricity value ($/MWh)",20.0,300.0,80.0,5.0); assumed_aep_loss_pct=st.slider("Assumed AEP-loss scenario (%)",.1,8.0,1.5,.1); turbines_in_farm=st.slider("Turbines in wind farm",1,200,100)
-    run=st.button("Run autonomous inspection",type="primary",use_container_width=True)
+    st.markdown("## 🛰️ Digital Twin Controls")
+    mission_id=st.text_input("Mission ID","MARS-DT-2026-001")
+    terrain_mode=st.radio("Terrain Package",["Demo Mars Terrain","Upload Preloaded DEM CSV"])
+    uploaded=None
+    if terrain_mode=="Upload Preloaded DEM CSV":
+        uploaded=st.file_uploader("Upload DEM CSV",type=["csv"])
+    seed=st.number_input("Demo Terrain Seed",1,9999,42)
+    grid_size=st.slider("Demo Grid Resolution",40,110,72,2)
 
-i=Inputs(mission_id,turbine_rating_mw,annual_capacity_factor_pct,hub_height_m,rotor_diameter_m,blade_root_offset_m,blades_to_inspect,rotor_state,blade_rpm,mean_wind_ms,gust_ms,turbulence_intensity_pct,wave_height_m,visibility_km,precipitation,launch_platform,navigation_condition,uas_mass_kg,rotor_count,propeller_diameter_m,figure_of_merit,motor_esc_efficiency,drag_area_m2,max_continuous_power_w,battery_capacity_wh,initial_soc_pct,reserve_soc_pct,cruise_speed_ms,inspection_speed_ms,desired_standoff_m,launch_distance_m,camera_hfov_deg,camera_vfov_deg,camera_frame_rate_hz,optical_quality_pct,lidar_range_m,lidar_noise_cm,lidar_rate_hz,imu_quality_pct,sync_error_ms,required_overlap_pct,energy_price_per_mwh,assumed_aep_loss_pct,turbines_in_farm)
+    st.markdown("### Start / Goal")
+    start_x=st.slider("Start X (m)",-450,450,-360,10)
+    start_y=st.slider("Start Y (m)",-450,450,-330,10)
+    goal_x=st.slider("Goal X (m)",-450,450,320,10)
+    goal_y=st.slider("Goal Y (m)",-450,450,300,10)
 
-clearance=i.hub_height_m-i.rotor_diameter_m/2
-if clearance<15: st.error(f"Invalid turbine geometry: lower tip clearance is {clearance:.1f} m; at least 15 m is required.")
-if i.rotor_state!="Parked and secured": st.warning("Rotating-rotor cases are stress scenarios only; time-dependent blade tracking is not implemented.")
-if i.uas_mass_kg>=24.95: st.info("Selected mass is at or above approximately 55 lb (24.95 kg), outside the usual U.S. Part 107 small-UAS weight range.")
-if i.hub_height_m+i.rotor_diameter_m/2>121.9: st.info("The simulated inspection volume can exceed 400 ft above the local water datum; real operations may require specific authorization.")
+    st.markdown("### Planner Weights")
+    w_wheel=st.slider("Wheel Preservation",0.10,0.60,0.40,0.01)
+    w_unc=st.slider("Uncertainty",0.05,0.35,0.20,0.01)
+    w_energy=st.slider("Energy",0.05,0.30,0.15,0.01)
+    w_science=st.slider("Science Opportunity",0.05,0.35,0.25,0.01)
 
-if run and clearance>=15:
-    with st.spinner("Simulating blade-by-blade mission..."):
-        p=annotate(i,build_path(i)); s=summarize(i,p); st.session_state.path=p; st.session_state.summary=s; st.session_state.inputs=i
+    st.markdown("### Human Supervisory Control")
+    require_approval=st.checkbox("Require route approval",True)
+    auto_hold=st.checkbox("Auto-HOLD on high discrepancy",True)
 
-if st.session_state.path is None:
-    st.info("Configure the scenario and select **Run autonomous inspection**.")
-    st.stop()
+    build=st.button("Build / Rebuild Digital Twin",use_container_width=True)
 
-i=st.session_state.inputs; p=st.session_state.path; s=st.session_state.summary
-st.subheader(s.disposition); st.caption(s.reason)
+if build or "bundle" not in st.session_state:
+    if terrain_mode=="Upload Preloaded DEM CSV" and uploaded is not None:
+        try:
+            x,y,xx,yy,z,rock_proxy=load_uploaded_dem(uploaded)
+            package_name=uploaded.name
+        except Exception as exc:
+            st.error(str(exc)); st.stop()
+    else:
+        x,y,xx,yy,z,rock_proxy=generate_demo_mars_terrain(int(seed),int(grid_size))
+        package_name="Synthetic Mars demo terrain"
+
+    layers=terrain_layers(z,x,rock_proxy)
+    physics=physics_engine(layers)
+    science=clamp_array(.55+.18*np.sin(xx/155)+.18*np.cos(yy/170)+.15*layers["roughness"],0,1)
+    weights={"wheel":w_wheel,"uncertainty":w_unc,"energy":w_energy,"science":w_science}
+    cost=planner_cost(physics,science,weights)
+    start_idx=nearest_idx(x,y,start_x,start_y)
+    goal_idx=nearest_idx(x,y,goal_x,goal_y)
+    idx_path=astar(cost,physics["no_go"],start_idx,goal_idx)
+    path_xy=[(float(x[c]),float(y[r])) for r,c in idx_path]
+    twin=initialize_twin(start_x,start_y)
+    twin.physics_gate="PASS" if idx_path else "REJECT"
+    twin.mission_mode="ROUTE READY" if idx_path else "NO FEASIBLE ROUTE"
+    st.session_state["bundle"]=dict(
+        mission_id=mission_id,package_name=package_name,x=x,y=y,xx=xx,yy=yy,z=z,
+        layers=layers,physics=physics,science=science,weights=weights,cost=cost,
+        path_idx=idx_path,path_xy=path_xy,twin=twin,step=0,history=[],
+        supervisory_action="HOLD" if require_approval else "APPROVED",
+        timestamp_utc=datetime.now(timezone.utc).isoformat()
+    )
+
+b=st.session_state["bundle"]
+x,y,z=b["x"],b["y"],b["z"]
+layers,physics=b["layers"],b["physics"]
+path_xy,twin=b["path_xy"],b["twin"]
+
+st.markdown('<div class="title">AUTHORITATIVE PHYSICS ENGINE + MARS ROVER DIGITAL TWIN</div>',unsafe_allow_html=True)
+st.markdown('<div class="subtitle">Physics governs feasibility • the digital twin mirrors predicted and measured rover state • AI/ML remains advisory</div>',unsafe_allow_html=True)
+st.info("Concept demonstrator only. AUTHORITATIVE HIERARCHY: Physics engine → digital twin state → planner/controller execution. AI/ML is advisory/predictive and cannot override hard constraints or human mission authority.")
+
+render_physics_engine_console(b)
+
+st.markdown("### Human Supervisory Control")
+c1,c2,c3,c4=st.columns(4)
+if c1.button("✅ APPROVE ROUTE",use_container_width=True): b["supervisory_action"]="APPROVED"
+if c2.button("🟡 REPLAN",use_container_width=True): b["supervisory_action"]="REPLAN REQUESTED"
+if c3.button("⏸ HOLD",use_container_width=True): b["supervisory_action"]="HOLD"
+if c4.button("🛑 SAFE STATE",use_container_width=True): b["supervisory_action"]="SAFE"
+st.write(f"Supervisory state: **{b['supervisory_action']}**")
+
+m1,m2,m3,m4,m5=st.columns(5)
+m1.metric("Physics Gate",twin.physics_gate)
+m2.metric("Path Cells",len(b["path_idx"]))
+m3.metric("No-Go Fraction",f"{100*np.mean(physics['no_go']):.1f}%")
+m4.metric("Mean Uncertainty",f"{100*np.mean(physics['uncertainty']):.1f}%")
+m5.metric("Twin Step",b["step"])
+
+left,right=st.columns([2.9,1.1],gap="large")
+with left:
+    st.plotly_chart(terrain_figure(x,y,z,physics["traversability"],path_xy,(start_x,start_y),(goal_x,goal_y)),use_container_width=True)
+with right:
+    st.markdown('<div class="panel"><div class="panel-title">Route-Level Physics Summary</div>',unsafe_allow_html=True)
+    if path_xy:
+        max_load=max(float(physics["predicted_wheel_load_n"][r,c]) for r,c in b["path_idx"])
+        max_strain=max(float(physics["predicted_strain_ue"][r,c]) for r,c in b["path_idx"])
+        min_stab=min(float(physics["stability_margin"][r,c]) for r,c in b["path_idx"])
+        st.success("PASS: route remains inside conceptual hard limits.")
+        st.write(f"Peak predicted load: **{max_load:.0f} N**")
+        st.write(f"Peak predicted strain: **{max_strain:.0f} µε**")
+        st.write(f"Minimum stability margin: **{min_stab:.2f}**")
+    else:
+        st.error("REJECT: no feasible route.")
+    st.write("**Hard constraints are not planner weights.**")
+    st.write("• Excess slope → NO-GO")
+    st.write("• Excess wheel load → NO-GO")
+    st.write("• Excess strain → NO-GO")
+    st.write("• Low stability margin → NO-GO")
+    st.markdown("</div>",unsafe_allow_html=True)
+
+a,bm,c=st.columns(3)
+with a:
+    st.plotly_chart(heatmap(x,y,physics["fatigue_risk"],"Fatigue / Flexure Risk","Inferno",path_xy),use_container_width=True)
+with bm:
+    st.plotly_chart(heatmap(x,y,physics["puncture_risk"],"Puncture Risk","YlOrRd",path_xy),use_container_width=True)
+with c:
+    st.plotly_chart(heatmap(x,y,physics["uncertainty"],"Model Uncertainty","Viridis",path_xy),use_container_width=True)
+
+st.markdown("## 🧩 Digital Twin: Live Reflection of the Physics Engine")
+st.caption("The twin does not define independent physics. At every step it inherits the authoritative predicted state, then overlays smart-wheel measurements and model discrepancy.")
+can_execute=bool(path_xy) and b["supervisory_action"]=="APPROVED" and twin.physics_gate=="PASS"
+if not can_execute:
+    st.warning("Execution inhibited until the route is physics-approved and human-supervisor approved.")
+
+if st.button("▶ Execute Next Twin Step",disabled=not can_execute,use_container_width=True):
+    i=min(b["step"],len(b["path_idx"])-1)
+    r,c=b["path_idx"][i]
+    twin.x_m=float(x[c]); twin.y_m=float(y[r]); twin.speed_mps=.12; twin.mission_mode="EXECUTING"
+    local_state=current_physics_state(b)
+    local_gate, local_violations = physics_verdict(local_state)
+    if local_gate != "PASS":
+        b["supervisory_action"]="HOLD"
+        twin.mission_mode="HOLD - PHYSICS GATE"
+        st.error("Authoritative physics engine rejected the next motion state.")
+        for violation in local_violations:
+            st.write(f"• {violation}")
+        st.stop()
+
+    terrain_key=layers["terrain_class"][r,c]
+    pred_load=float(physics["predicted_wheel_load_n"][r,c])
+    pred_strain=float(physics["predicted_strain_ue"][r,c])
+    pred_slip=float(physics["slip_risk"][r,c])
+    discrepancies=[]
+    for wi,w in enumerate(twin.wheels):
+        load,strain,slip,temp,vib=simulate_measurement(pred_load,pred_strain,pred_slip,terrain_key,i,wi)
+        w.predicted_load_n=pred_load; w.measured_load_n=load
+        w.predicted_strain_ue=pred_strain; w.measured_strain_ue=strain
+        w.slip_ratio=slip; w.temperature_c=temp; w.vibration_index=vib
+        update_health(w)
+        discrepancies.append(abs(load-pred_load)/max(pred_load,1e-6))
+    discrepancy=float(np.mean(discrepancies))
+    twin.uncertainty=clamp(.75*twin.uncertainty+.70*discrepancy,.05,.95)
+    b["history"].append(dict(
+        step=i,x_m=twin.x_m,y_m=twin.y_m,terrain_class=terrain_key,
+        predicted_load_n=pred_load,
+        mean_measured_load_n=float(np.mean([w.measured_load_n for w in twin.wheels])),
+        predicted_strain_ue=pred_strain,
+        mean_measured_strain_ue=float(np.mean([w.measured_strain_ue for w in twin.wheels])),
+        mean_slip=float(np.mean([w.slip_ratio for w in twin.wheels])),
+        model_discrepancy=discrepancy,uncertainty=twin.uncertainty,
+        min_wheel_health=float(min(w.health_index for w in twin.wheels)),
+        authoritative_slope_deg=float(layers["slope_deg"][r,c]),
+        authoritative_fatigue_risk=float(physics["fatigue_risk"][r,c]),
+        authoritative_puncture_risk=float(physics["puncture_risk"][r,c]),
+        authoritative_stability_margin=float(physics["stability_margin"][r,c]),
+        authoritative_traversability=float(physics["traversability"][r,c]),
+        physics_gate="PASS"
+    ))
+    b["step"]+=1
+    if auto_hold and (discrepancy>.22 or twin.uncertainty>.58):
+        b["supervisory_action"]="HOLD"
+        twin.mission_mode="HOLD - MODEL DISCREPANCY"
+    st.rerun()
+
+st.markdown("## 🔁 Physics Engine ↔ Digital Twin Reconciliation")
+st.caption("Predicted physics is compared with measured smart-wheel response. Disagreement increases uncertainty and can trigger HOLD, replanning, or ground review.")
+if b["history"]:
+    hist=pd.DataFrame(b["history"])
+    fig=go.Figure()
+    fig.add_trace(go.Scatter(x=hist["step"],y=hist["predicted_load_n"],mode="lines+markers",name="Predicted"))
+    fig.add_trace(go.Scatter(x=hist["step"],y=hist["mean_measured_load_n"],mode="lines+markers",name="Measured"))
+    fig.update_layout(height=320,paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(0,0,0,0)",font=dict(color="#e6f1ff"))
+    st.plotly_chart(fig,use_container_width=True)
+    st.dataframe(hist,use_container_width=True,hide_index=True)
+else:
+    st.info("Execute the twin to populate prediction-versus-measurement history.")
+
+st.markdown("### Model Assurance & Configuration Control")
 cols=st.columns(6)
-with cols[0]: card("Geometric coverage",pct(s.coverage_pct),"Simplified blade-surface grid")
-with cols[1]: card("Final state of charge",pct(s.final_soc_pct),f"Reserve {i.reserve_soc_pct:.0f}%")
-with cols[2]: card("Mission time",f"{s.mission_duration_min:.1f} min",f"Inspection {s.inspection_duration_min:.1f} min")
-with cols[3]: card("P95 stand-off error",f"{s.p95_standoff_error_m:.2f} m","Blade-relative")
-with cols[4]: card("P95 nav error",f"{s.p95_nav_error_m:.2f} m","Illustrative target 0.50 m")
-with cols[5]: card("Data suitability",f"{s.data_suitability_index:.0f}/100","Uncalibrated index")
+steps=[
+    ("1. Data Curation","Heritage data, analog tests, onboard observations"),
+    ("2. Training / Calibration","AI/ML and physics parameters"),
+    ("3. Verification","Software and numerical checks"),
+    ("4. Validation","Representative terrain / wheel-response evidence"),
+    ("5. Review & Approval","Engineering and mission authority"),
+    ("6. Versioned Deployment","Controlled operational baseline"),
+]
+for col,(title,text) in zip(cols,steps):
+    with col:
+        st.markdown(f"**{title}**")
+        st.caption(text)
 
-tabs=st.tabs(["Mission Prototype","Telemetry","Coverage and Data","Safety","Economics","Systems Engineering","Report and Export"])
-with tabs[0]:
-    st.plotly_chart(mission_fig(i,p),use_container_width=True)
-    st.caption("Blade-by-blade stationary-rotor concept trajectory; not a full six-degree-of-freedom simulation.")
-with tabs[1]:
-    st.plotly_chart(telemetry_fig(i,p),use_container_width=True)
-    st.dataframe(p[p.active][["elapsed_s","phase","blade_id","actual_standoff_m","relative_nav_error_m","power_w","soc_pct","energy_margin_wh","hazard_index"]].round(2),use_container_width=True,hide_index=True)
-with tabs[2]:
-    st.plotly_chart(coverage_fig(i,p),use_container_width=True)
-    st.markdown('<div class="note">Coverage is computed from a simplified blade-surface grid and camera footprint. The data-suitability index is not a defect-detection probability.</div>',unsafe_allow_html=True)
-with tabs[3]:
-    st.metric("Rotor-proximity hazard index",f"{s.hazard_index:.1f}/100")
-    st.caption("Ordinal and uncalibrated; not a collision probability.")
-    for r in s.recommendations: st.markdown(f"- {r}")
-with tabs[4]:
-    ec=st.columns(4); ec[0].metric("Annual capacity factor",pct(i.annual_capacity_factor_pct)); ec[1].metric("Annual generation",f"{s.annual_generation_mwh:,.0f} MWh"); ec[2].metric("Revenue at risk per turbine-year",money(s.revenue_risk_per_turbine)); ec[3].metric("Wind-farm revenue at risk",money(s.revenue_risk_farm))
-    st.markdown('<div class="note">Annual capacity factor is a user assumption, not inferred from mission-day weather. Revenue at risk is not guaranteed UAS savings.</div>',unsafe_allow_html=True)
-with tabs[5]:
-    trace=pd.DataFrame([
-        ["SN-01","SYS-1.1","The UAS shall conduct remote blade inspection without personnel entering the rotor inspection envelope.","ConOps review and demonstration"],
-        ["SN-02","NAV-1.1","The UAS shall maintain P95 blade-relative position error no greater than 0.50 m under the defined degraded-GNSS test condition.","HIL and controlled flight test"],
-        ["SN-03","INS-1.1","The UAS shall achieve at least 90% geometric coverage of the defined blade inspection surface.","Simulation and reference-target inspection"],
-        ["SN-04","ENE-1.1","The UAS shall preserve energy for predicted return, landing, and the selected reserve.","Energy analysis and flight-log review"],
-    ],columns=["Need ID","Requirement ID","Requirement","Verification"])
-    st.dataframe(trace,use_container_width=True,hide_index=True)
-with tabs[6]:
-    text=report(i,s); st.text_area("Report preview",text,height=500,disabled=True)
-    payload={"inputs":asdict(i),"summary":asdict(s),"model":{"version":APP_VERSION,"seed":RNG_SEED}}
-    d=st.columns(3); d[0].download_button("Download report",text.encode(),f"{i.mission_id}_report.md","text/markdown",use_container_width=True); d[1].download_button("Download telemetry",p.to_csv(index=False).encode(),f"{i.mission_id}_telemetry.csv","text/csv",use_container_width=True); d[2].download_button("Download JSON",json.dumps(payload,indent=2).encode(),f"{i.mission_id}_simulation.json","application/json",use_container_width=True)
+export=dict(
+    app_version=APP_VERSION,mission_id=b["mission_id"],timestamp_utc=b["timestamp_utc"],
+    terrain_package=b["package_name"],
+    physics_manifest=route_physics_summary(b),
+    current_authoritative_state=current_physics_state(b),
+    architecture=dict(
+        ai_ml_role="terrain interpretation and risk prediction",
+        physics_role="authoritative feasibility and safety gate",
+        planner_role="risk-aware optimization inside hard constraints",
+        controller_role="deterministic fast-loop mobility execution",
+        smart_wheels_role="proprioceptive measurement and health estimation",
+        human_role="mission-level supervisory authority",
+        model_update_policy="controlled, verified, validated, reviewed, versioned",
+    ),
+    limits_conceptual=LIMITS,supervisory_action=b["supervisory_action"],
+    twin_state=dict(
+        x_m=twin.x_m,y_m=twin.y_m,mission_mode=twin.mission_mode,
+        uncertainty=twin.uncertainty,wheels=[asdict(w) for w in twin.wheels]
+    ),
+    history=b["history"],
+    claim_boundary="Concept demonstrator. Not NASA-approved or flight-certified."
+)
 
-st.markdown("---"); st.caption(f"Offshore Autonomous Blade Inspection Mission Simulator · Version {APP_VERSION}")
+st.download_button(
+    "Download Digital Twin Mission State (JSON)",
+    data=json.dumps(export,indent=2),
+    file_name=f"{b['mission_id']}_digital_twin.json",
+    mime="application/json",
+    use_container_width=True
+)
+
+if b["history"]:
+    st.download_button(
+        "Download Twin Telemetry History (CSV)",
+        data=pd.DataFrame(b["history"]).to_csv(index=False),
+        file_name=f"{b['mission_id']}_twin_history.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+
+with st.expander("Technology and data foundations"):
+    st.write(
+        "The authoritative physics engine is the system-of-record for rover feasibility, and the digital twin is its synchronized state representation. The architecture is designed to accept preloaded Mars terrain products and heritage mission observations, "
+        "including MOLA/HiRISE/CTX/THEMIS-derived products and rover observations. The built-in demo terrain is synthetic. "
+        "The smart-wheel layer is conceptual and intended to represent strain/load/slip/temperature/vibration feedback. "
+        "Replace the simplified terramechanics and structural equations with validated mission-specific models before any real-world use."
+    )
