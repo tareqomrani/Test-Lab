@@ -33,7 +33,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-APP_VERSION = "0.2.0-physics-authoritative"
+APP_VERSION = "0.3.0-smart-wheel-emphasis"
 MARS_GRAVITY = 3.71
 MAP_EXTENT_M = 1000.0
 
@@ -473,6 +473,214 @@ def render_physics_engine_console(bundle):
             """
         )
 
+
+def smart_wheel_status_table(twin):
+    rows = []
+    for w in twin.wheels:
+        rows.append({
+            "Wheel": w.name,
+            "Pred Load (N)": round(w.predicted_load_n, 1),
+            "Measured Load (N)": round(w.measured_load_n, 1),
+            "Pred Strain (µε)": round(w.predicted_strain_ue, 1),
+            "Measured Strain (µε)": round(w.measured_strain_ue, 1),
+            "Slip": round(w.slip_ratio, 3),
+            "Temp (°C)": round(w.temperature_c, 1),
+            "Vibration": round(w.vibration_index, 3),
+            "Fatigue": round(w.cumulative_fatigue, 4),
+            "Puncture Exposure": round(w.puncture_exposure, 4),
+            "Health (%)": round(100*w.health_index, 1),
+            "RUL (%)": round(100*w.rul_fraction, 1),
+        })
+    return pd.DataFrame(rows)
+
+
+def smart_wheel_health_figure(twin):
+    names = [w.name for w in twin.wheels]
+    health = [100*w.health_index for w in twin.wheels]
+    rul = [100*w.rul_fraction for w in twin.wheels]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=names, y=health, name="Health Index"))
+    fig.add_trace(go.Bar(x=names, y=rul, name="RUL Estimate"))
+    fig.update_layout(
+        barmode="group",
+        title="Six-Wheel Health / RUL Digital Twin",
+        yaxis=dict(title="Percent", range=[0,100]),
+        height=340,
+        margin=dict(l=0,r=0,t=45,b=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#e6f1ff"),
+    )
+    return fig
+
+
+def smart_wheel_load_figure(twin):
+    names = [w.name for w in twin.wheels]
+    pred = [w.predicted_load_n for w in twin.wheels]
+    meas = [w.measured_load_n for w in twin.wheels]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=names, y=pred, name="Physics Prediction"))
+    fig.add_trace(go.Bar(x=names, y=meas, name="Smart-Wheel Measurement"))
+    fig.add_hline(
+        y=LIMITS["max_predicted_wheel_load_n"],
+        line_dash="dash",
+        annotation_text="Conceptual Load Limit",
+    )
+    fig.update_layout(
+        barmode="group",
+        title="Predicted vs Measured Wheel Load",
+        yaxis_title="Normal Wheel Load (N)",
+        height=340,
+        margin=dict(l=0,r=0,t=45,b=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#e6f1ff"),
+    )
+    return fig
+
+
+def smart_wheel_strain_figure(twin):
+    names = [w.name for w in twin.wheels]
+    pred = [w.predicted_strain_ue for w in twin.wheels]
+    meas = [w.measured_strain_ue for w in twin.wheels]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=names, y=pred, name="Physics Prediction"))
+    fig.add_trace(go.Bar(x=names, y=meas, name="Smart-Wheel Measurement"))
+    fig.add_hline(
+        y=LIMITS["max_measured_strain_ue"],
+        line_dash="dash",
+        annotation_text="Conceptual Strain Limit",
+    )
+    fig.update_layout(
+        barmode="group",
+        title="Predicted vs Measured Wheel Strain",
+        yaxis_title="Strain (µε)",
+        height=340,
+        margin=dict(l=0,r=0,t=45,b=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#e6f1ff"),
+    )
+    return fig
+
+
+def selected_wheel_history_figure(history, wheel_name):
+    if not history:
+        return None
+    rows = []
+    for h in history:
+        wheel_data = h.get("wheel_states", {}).get(wheel_name)
+        if wheel_data:
+            rows.append({
+                "step": h["step"],
+                "load_n": wheel_data["measured_load_n"],
+                "strain_ue": wheel_data["measured_strain_ue"],
+                "slip": wheel_data["slip_ratio"],
+                "health_pct": 100*wheel_data["health_index"],
+            })
+    if not rows:
+        return None
+    df = pd.DataFrame(rows)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df["step"], y=df["health_pct"], mode="lines+markers", name="Health %"))
+    fig.add_trace(go.Scatter(x=df["step"], y=100*df["slip"], mode="lines+markers", name="Slip ×100"))
+    fig.update_layout(
+        title=f"{wheel_name} Wheel Trend",
+        yaxis_title="Health / Slip Scaled",
+        height=320,
+        margin=dict(l=0,r=0,t=45,b=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#e6f1ff"),
+    )
+    return fig
+
+
+def wheel_protection_recommendation(twin):
+    worst = min(twin.wheels, key=lambda w: w.health_index)
+    high_load = max(w.measured_load_n for w in twin.wheels)
+    high_strain = max(w.measured_strain_ue for w in twin.wheels)
+    high_slip = max(w.slip_ratio for w in twin.wheels)
+
+    actions = []
+    if high_load > 0.85*LIMITS["max_predicted_wheel_load_n"]:
+        actions.append("Reduce commanded rover speed and individual wheel-speed aggressiveness.")
+    if high_strain > 0.80*LIMITS["max_measured_strain_ue"]:
+        actions.append("Increase wheel-preservation route cost and avoid repeated hard-bedrock exposure.")
+    if high_slip > 0.45:
+        actions.append("Apply conservative traction control and reassess yielding terrain.")
+    if worst.health_index < 0.90:
+        actions.append(f"Protect {worst.name}: tighten allowable operating envelope and prefer lower-load terrain.")
+    if not actions:
+        actions.append("Continue nominal smart-wheel monitoring inside the physics-approved envelope.")
+    return worst.name, actions
+
+
+def wheel_preservation_index(twin):
+    if not twin.wheels:
+        return 1.0
+    return float(np.mean([0.65*w.health_index + 0.35*w.rul_fraction for w in twin.wheels]))
+
+
+def render_smart_wheel_command_center(bundle):
+    twin = bundle["twin"]
+    st.markdown("## 🛞 Smart-Wheel Mobility & Health Command Center")
+    st.caption(
+        "Each wheel is modeled as an instrumented cyber-physical subsystem. "
+        "The authoritative physics engine predicts wheel response; the digital twin overlays smart-wheel measurements, health, and RUL."
+    )
+
+    worst_name, actions = wheel_protection_recommendation(twin)
+    preservation = wheel_preservation_index(twin)
+
+    k1,k2,k3,k4,k5,k6 = st.columns(6)
+    k1.metric("Wheel Preservation Index", f"{100*preservation:.1f}%")
+    k2.metric("Worst Wheel", worst_name)
+    k3.metric("Peak Measured Load", f"{max(w.measured_load_n for w in twin.wheels):.0f} N")
+    k4.metric("Peak Measured Strain", f"{max(w.measured_strain_ue for w in twin.wheels):.0f} µε")
+    k5.metric("Peak Slip", f"{max(w.slip_ratio for w in twin.wheels):.2f}")
+    k6.metric("Min RUL", f"{100*min(w.rul_fraction for w in twin.wheels):.1f}%")
+
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "Wheel Health",
+        "Loads & Strain",
+        "Per-Wheel Inspector",
+        "Protection Logic",
+    ])
+
+    with tab1:
+        st.plotly_chart(smart_wheel_health_figure(twin), use_container_width=True)
+        st.dataframe(smart_wheel_status_table(twin), use_container_width=True, hide_index=True)
+
+    with tab2:
+        l1,l2 = st.columns(2)
+        with l1:
+            st.plotly_chart(smart_wheel_load_figure(twin), use_container_width=True)
+        with l2:
+            st.plotly_chart(smart_wheel_strain_figure(twin), use_container_width=True)
+
+    with tab3:
+        wheel_name = st.selectbox("Inspect Wheel", WHEEL_NAMES, key="smart_wheel_inspector")
+        wheel = next(w for w in twin.wheels if w.name == wheel_name)
+        c1,c2,c3,c4 = st.columns(4)
+        c1.metric("Health", f"{100*wheel.health_index:.1f}%")
+        c2.metric("RUL", f"{100*wheel.rul_fraction:.1f}%")
+        c3.metric("Fatigue Exposure", f"{100*wheel.cumulative_fatigue:.2f}%")
+        c4.metric("Puncture Exposure", f"{100*wheel.puncture_exposure:.2f}%")
+        hist_fig = selected_wheel_history_figure(bundle["history"], wheel_name)
+        if hist_fig is not None:
+            st.plotly_chart(hist_fig, use_container_width=True)
+        else:
+            st.info("Execute twin steps to populate per-wheel trend history.")
+
+    with tab4:
+        st.markdown("**Fast deterministic protection logic**")
+        st.write("Smart-wheel sensing → state estimation → physics-envelope check → traction/speed adjustment → measurement feedback")
+        for action in actions:
+            st.success(action)
+        st.markdown("**Authority boundary:** smart-wheel sensing may trigger protection, HOLD, or replanning, but does not bypass the authoritative physics engine.")
+
+
 with st.sidebar:
     st.markdown("## 🛰️ Digital Twin Controls")
     mission_id=st.text_input("Mission ID","MARS-DT-2026-001")
@@ -537,11 +745,13 @@ x,y,z=b["x"],b["y"],b["z"]
 layers,physics=b["layers"],b["physics"]
 path_xy,twin=b["path_xy"],b["twin"]
 
-st.markdown('<div class="title">AUTHORITATIVE PHYSICS ENGINE + MARS ROVER DIGITAL TWIN</div>',unsafe_allow_html=True)
-st.markdown('<div class="subtitle">Physics governs feasibility • the digital twin mirrors predicted and measured rover state • AI/ML remains advisory</div>',unsafe_allow_html=True)
+st.markdown('<div class="title">AUTHORITATIVE PHYSICS ENGINE + SMART-WHEEL MARS ROVER DIGITAL TWIN</div>',unsafe_allow_html=True)
+st.markdown('<div class="subtitle">Physics governs feasibility • six instrumented smart wheels close the mobility feedback loop • the digital twin reconciles prediction and measurement</div>',unsafe_allow_html=True)
 st.info("Concept demonstrator only. AUTHORITATIVE HIERARCHY: Physics engine → digital twin state → planner/controller execution. AI/ML is advisory/predictive and cannot override hard constraints or human mission authority.")
 
 render_physics_engine_console(b)
+
+render_smart_wheel_command_center(b)
 
 st.markdown("### Human Supervisory Control")
 c1,c2,c3,c4=st.columns(4)
@@ -551,12 +761,13 @@ if c3.button("⏸ HOLD",use_container_width=True): b["supervisory_action"]="HOLD
 if c4.button("🛑 SAFE STATE",use_container_width=True): b["supervisory_action"]="SAFE"
 st.write(f"Supervisory state: **{b['supervisory_action']}**")
 
-m1,m2,m3,m4,m5=st.columns(5)
+m1,m2,m3,m4,m5,m6=st.columns(6)
 m1.metric("Physics Gate",twin.physics_gate)
 m2.metric("Path Cells",len(b["path_idx"]))
 m3.metric("No-Go Fraction",f"{100*np.mean(physics['no_go']):.1f}%")
 m4.metric("Mean Uncertainty",f"{100*np.mean(physics['uncertainty']):.1f}%")
-m5.metric("Twin Step",b["step"])
+m5.metric("Wheel Preservation", f"{100*wheel_preservation_index(twin):.1f}%")
+m6.metric("Twin Step",b["step"])
 
 left,right=st.columns([2.9,1.1],gap="large")
 with left:
@@ -636,12 +847,19 @@ if st.button("▶ Execute Next Twin Step",disabled=not can_execute,use_container
         authoritative_puncture_risk=float(physics["puncture_risk"][r,c]),
         authoritative_stability_margin=float(physics["stability_margin"][r,c]),
         authoritative_traversability=float(physics["traversability"][r,c]),
-        physics_gate="PASS"
+        physics_gate="PASS",
+        wheel_states={w.name: asdict(w) for w in twin.wheels}
     ))
     b["step"]+=1
-    if auto_hold and (discrepancy>.22 or twin.uncertainty>.58):
+    smart_wheel_limit_exceeded = any(
+        (w.measured_load_n > LIMITS["max_predicted_wheel_load_n"])
+        or (w.measured_strain_ue > LIMITS["max_measured_strain_ue"])
+        or (w.slip_ratio > LIMITS["max_slip_ratio"])
+        for w in twin.wheels
+    )
+    if auto_hold and (discrepancy>.22 or twin.uncertainty>.58 or smart_wheel_limit_exceeded):
         b["supervisory_action"]="HOLD"
-        twin.mission_mode="HOLD - MODEL DISCREPANCY"
+        twin.mission_mode="HOLD - SMART WHEEL / MODEL DISCREPANCY"
     st.rerun()
 
 st.markdown("## 🔁 Physics Engine ↔ Digital Twin Reconciliation")
@@ -656,6 +874,24 @@ if b["history"]:
     st.dataframe(hist,use_container_width=True,hide_index=True)
 else:
     st.info("Execute the twin to populate prediction-versus-measurement history.")
+
+
+st.markdown("## 🧠 Smart-Wheel Lifecycle Feedback")
+st.caption(
+    "Wheel-health trends modify the allowable mobility envelope and future route costs. "
+    "Operational measurements may inform controlled ground calibration, but no unverified model update enters the operational baseline."
+)
+if b["history"]:
+    hist = pd.DataFrame(b["history"])
+    lc1, lc2, lc3 = st.columns(3)
+    with lc1:
+        st.metric("Lowest Recorded Wheel Health", f"{100*hist['min_wheel_health'].min():.1f}%")
+    with lc2:
+        st.metric("Peak Model Discrepancy", f"{100*hist['model_discrepancy'].max():.1f}%")
+    with lc3:
+        st.metric("Peak Twin Uncertainty", f"{100*hist['uncertainty'].max():.1f}%")
+else:
+    st.info("Execute the digital twin to accumulate wheel-health and reconciliation history.")
 
 st.markdown("### Model Assurance & Configuration Control")
 cols=st.columns(6)
@@ -682,7 +918,7 @@ export=dict(
         physics_role="authoritative feasibility and safety gate",
         planner_role="risk-aware optimization inside hard constraints",
         controller_role="deterministic fast-loop mobility execution",
-        smart_wheels_role="proprioceptive measurement and health estimation",
+        smart_wheels_role="six-wheel proprioceptive sensing, per-wheel health/RUL estimation, traction-protection feedback, and physics/twin reconciliation",
         human_role="mission-level supervisory authority",
         model_update_policy="controlled, verified, validated, reviewed, versioned",
     ),
@@ -716,6 +952,6 @@ with st.expander("Technology and data foundations"):
     st.write(
         "The authoritative physics engine is the system-of-record for rover feasibility, and the digital twin is its synchronized state representation. The architecture is designed to accept preloaded Mars terrain products and heritage mission observations, "
         "including MOLA/HiRISE/CTX/THEMIS-derived products and rover observations. The built-in demo terrain is synthetic. "
-        "The smart-wheel layer is conceptual and intended to represent strain/load/slip/temperature/vibration feedback. "
+        "The smart-wheel layer is deliberately prominent and represents six independently tracked instrumented wheels with strain, normal load, slip, temperature, vibration, fatigue exposure, puncture exposure, health, and RUL state. "
         "Replace the simplified terramechanics and structural equations with validated mission-specific models before any real-world use."
     )
