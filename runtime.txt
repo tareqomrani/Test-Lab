@@ -1,5 +1,6 @@
-streamlit>=1.46.0
-plotly>=6.0.0
-pandas>=2.2.0
-numpy>=2.0.0
-openpyxl>=3.1.5
+streamlit>=1.40
+pandas>=2.2
+networkx>=3.2
+matplotlib>=3.8
+tabulate>=0.9
+streamlit-agraph>=0.0.45
