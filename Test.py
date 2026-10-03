@@ -1,4 +1,4 @@
-# UAV Battery Efficiency Estimator - Standalone v0.5 Expansion
+# UAV Battery Efficiency Estimator - Standalone v0.8 Physics + V&V
 # Single-file deployment build
 # Built by Tareq Omrani
 #
@@ -282,6 +282,7 @@ from typing import Dict, Any
 class EnvironmentState:
     rho_kgm3: float = 1.225
     temperature_c: float = 15.0
+    sea_level_temp_c: float = 15.0
     wind_north_ms: float = 0.0
     wind_east_ms: float = 0.0
     wind_down_ms: float = 0.0
@@ -376,6 +377,19 @@ class TwinState:
     sensor_health: float = 1.0
 
     power_draw_w: float = 0.0
+
+    # Physics/V&V telemetry.
+    atmosphere_rho_kgm3: float = 1.225
+    ambient_temperature_c: float = 15.0
+    propulsion_thrust_n: float = 0.0
+    propulsion_shaft_power_w: float = 0.0
+    propulsion_input_power_w: float = 0.0
+    propulsive_efficiency: float = 0.0
+
+    # ICE/fuel state. Battery fields remain authoritative for electric UAVs.
+    fuel_l: float = 0.0
+    fuel_burn_lph: float = 0.0
+
     active_waypoint: int = 0
     distance_to_waypoint_m: float = 0.0
     flight_mode: str = "WAYPOINT"
@@ -391,6 +405,7 @@ class TwinState:
 from dataclasses import dataclass
 from typing import Dict, Any
 import math
+import numpy as np
 
 
 @dataclass
@@ -442,25 +457,70 @@ class VehicleDynamicsParams:
 
     alpha_stall_deg: float = 16.0
 
+    # Model metadata and propulsion coupling.
+    power_system: str = "Battery"
+    oswald_e: float = 0.80
+    prop_eff: float = 0.75
+    cl_max: float = 1.45
+    drag_multiplier: float = 1.0
+    max_shaft_power_w: float = 500.0
+    hotel_w: float = 15.0
+    motor_efficiency: float = 0.90
+    esc_efficiency: float = 0.97
+    rotor_disk_area_m2: float = 0.20
+    hover_power_w_ref: float = 150.0
+
+    # ICE bridge for first-order fuel propagation.
+    bsfc_gpkwh: float = 0.0
+    fuel_density_kgpl: float = 0.75
+    fuel_tank_l: float = 0.0
+
+    model_quality: str = "Generic / unvalidated aerodynamic derivatives"
+
 
 def build_dynamics_params(
     profile: Dict[str, Any],
     total_mass_kg: float,
 ) -> VehicleDynamicsParams:
+    """
+    Build a low-order dynamics parameter set.
+
+    Geometry, drag polar and CLmax are profile-specific where supplied.
+    Stability/control derivatives and inertias remain engineering estimates
+    unless the profile is later replaced with validated type-specific data.
+    """
     m = max(0.10, float(total_mass_kg))
     vehicle_type = str(profile.get("type", "rotor"))
+    power_system = str(profile.get("power_system", "Battery"))
 
     if vehicle_type == "fixed":
         s = max(0.08, float(profile.get("wing_area_m2", 0.5)))
         b = max(0.4, float(profile.get("wingspan_m", 2.0)))
         c = max(0.08, s / b)
+        ar = max(2.0, b * b / s)
+        e = max(0.45, min(0.95, float(profile.get("oswald_e", 0.80))))
+        induced_k = 1.0 / (math.pi * e * ar)
 
         ix = max(0.02, 0.055 * m * b * b)
         iy = max(0.03, 0.080 * m * (0.55 * b) ** 2)
         iz = max(ix * 1.05, 0.095 * m * b * b)
 
         weight_n = m * 9.80665
-        max_thrust = max(6.0, 0.75 * weight_n)
+
+        # Generic installed-shaft-power estimate used only when no calibrated
+        # propulsion map is supplied. The value scales sensibly from small UAS
+        # through Predator/Reaper-class aircraft.
+        max_shaft_power = max(
+            120.0,
+            float(profile.get("max_shaft_power_w", 90.0 * m)),
+        )
+
+        # Static thrust is only a cap. In flight, thrust is obtained from
+        # available shaft power, airspeed and propulsive efficiency.
+        max_thrust = max(
+            6.0,
+            float(profile.get("max_thrust_n", 0.75 * weight_n)),
+        )
 
         return VehicleDynamicsParams(
             vehicle_type=vehicle_type,
@@ -475,7 +535,19 @@ def build_dynamics_params(
             max_roll_moment_nm=max(0.8, 0.12 * weight_n * b),
             max_pitch_moment_nm=max(0.8, 0.10 * weight_n * c),
             max_yaw_moment_nm=max(0.6, 0.06 * weight_n * b),
-            cd0=max(0.025, float(profile.get("cd0", 0.035))),
+            cd0=max(0.018, float(profile.get("cd0", 0.035))),
+            induced_k=induced_k,
+            power_system=power_system,
+            oswald_e=e,
+            prop_eff=max(0.35, min(0.90, float(profile.get("prop_eff", 0.75)))),
+            cl_max=max(0.80, float(profile.get("cl_max", 1.45))),
+            max_shaft_power_w=max_shaft_power,
+            hotel_w=max(0.0, float(profile.get("hotel_W", profile.get("draw_watt", 15.0) * 0.10))),
+            motor_efficiency=0.90,
+            esc_efficiency=0.97,
+            bsfc_gpkwh=max(0.0, float(profile.get("bsfc_gpkwh", 0.0))),
+            fuel_density_kgpl=max(0.1, float(profile.get("fuel_density_kgpl", 0.75))),
+            fuel_tank_l=max(0.0, float(profile.get("fuel_tank_l", 0.0))),
         )
 
     # Generic multirotor geometry.
@@ -484,6 +556,30 @@ def build_dynamics_params(
     iy = ix
     iz = max(0.020, 0.30 * m * characteristic ** 2)
     weight_n = m * 9.80665
+
+    hover_power = max(
+        40.0,
+        float(profile.get("hover_power_W_ref", profile.get("draw_watt", 150.0))),
+    )
+    max_shaft_power = max(
+        120.0,
+        float(profile.get("max_shaft_power_w", 2.2 * hover_power)),
+    )
+
+    # Infer a total effective rotor disk area from momentum theory at hover.
+    # This is a low-order estimate, not a geometric rotor database.
+    hover_shaft = max(1.0, 0.86 * hover_power)
+    inferred_area = (
+        weight_n ** 3
+        / max(1e-6, 2.0 * 1.225 * hover_shaft ** 2)
+    )
+    rotor_area = max(
+        0.04,
+        min(
+            12.0,
+            float(profile.get("rotor_disk_area_m2", inferred_area)),
+        ),
+    )
 
     return VehicleDynamicsParams(
         vehicle_type=vehicle_type,
@@ -494,10 +590,20 @@ def build_dynamics_params(
         wing_area_m2=max(0.05, characteristic ** 2),
         wingspan_m=max(0.30, 2.0 * characteristic),
         mean_chord_m=max(0.15, characteristic),
-        max_thrust_n=2.2 * weight_n,
+        max_thrust_n=max(
+            1.6 * weight_n,
+            float(profile.get("max_thrust_n", 2.2 * weight_n)),
+        ),
         max_roll_moment_nm=max(0.5, 0.35 * weight_n * characteristic),
         max_pitch_moment_nm=max(0.5, 0.35 * weight_n * characteristic),
         max_yaw_moment_nm=max(0.3, 0.12 * weight_n * characteristic),
+        power_system=power_system,
+        max_shaft_power_w=max_shaft_power,
+        hotel_w=max(0.0, float(profile.get("hotel_W", 8.0))),
+        motor_efficiency=0.90,
+        esc_efficiency=0.97,
+        rotor_disk_area_m2=rotor_area,
+        hover_power_w_ref=hover_power,
     )
 
 
@@ -506,23 +612,32 @@ def estimate_trim_alpha_deg(
     rho_kgm3: float,
     speed_ms: float,
 ) -> float:
-    """Approximate level-flight angle of attack from L=W."""
+    """Lift-equals-weight initial guess for the nonlinear trim solver."""
     if params.vehicle_type != "fixed":
         return 0.0
 
     v = max(4.0, float(speed_ms))
     qbar = 0.5 * max(0.2, rho_kgm3) * v * v
-    cl_required = (params.mass_kg * 9.80665) / max(1e-6, qbar * params.wing_area_m2)
-    # The 6-DOF aero model uses CL = CL_max*tanh(CL_linear/CL_max),
-    # so invert that same smooth saturation for a consistent trim estimate.
-    cl_max = 1.45
+    cl_required = (
+        params.mass_kg * 9.80665
+        / max(1e-6, qbar * params.wing_area_m2)
+    )
+
+    cl_max = max(0.8, params.cl_max)
     ratio = max(-0.95, min(0.95, cl_required / cl_max))
     cl_linear_required = cl_max * math.atanh(ratio)
-    alpha_rad = (cl_linear_required - params.cl0) / max(0.5, params.cl_alpha)
-    alpha_limit = math.radians(min(13.5, params.alpha_stall_deg - 1.5))
-    alpha_rad = max(math.radians(-3.0), min(alpha_limit, alpha_rad))
-    return math.degrees(alpha_rad)
+    alpha_rad = (
+        cl_linear_required - params.cl0
+    ) / max(0.5, params.cl_alpha)
 
+    alpha_limit = math.radians(
+        min(13.5, params.alpha_stall_deg - 1.5)
+    )
+    alpha_rad = max(
+        math.radians(-3.0),
+        min(alpha_limit, alpha_rad),
+    )
+    return math.degrees(alpha_rad)
 
 
 # ==============================================================================
@@ -537,19 +652,69 @@ R_AIR = 287.05
 G0 = 9.80665
 
 
-def air_density(alt_m: float, sea_level_temp_c: float = 15.0) -> float:
+def isa_atmosphere(
+    alt_m: float,
+    sea_level_temp_c: float = 15.0,
+):
+    """
+    Tropospheric ISA-style atmosphere with a user-selectable sea-level
+    temperature offset. Returns density, local ambient temperature and pressure.
+    """
     alt_m = max(0.0, float(alt_m))
-    t0 = sea_level_temp_c + 273.15
-    t = max(1.0, t0 - LAPSE * alt_m)
-    base = max(1e-6, 1.0 - (LAPSE * alt_m) / t0)
-    p = P0 * base ** (G0 / (R_AIR * LAPSE))
-    return p / (R_AIR * t)
+    t0_k = max(180.0, float(sea_level_temp_c) + 273.15)
+    t_k = max(180.0, t0_k - LAPSE * alt_m)
+    base = max(
+        1e-8,
+        1.0 - (LAPSE * alt_m) / t0_k,
+    )
+    exponent = G0 / (R_AIR * LAPSE)
+    pressure_pa = P0 * base ** exponent
+    rho = pressure_pa / (R_AIR * t_k)
+
+    return (
+        float(rho),
+        float(t_k - 273.15),
+        float(pressure_pa),
+    )
 
 
-def density_ratio(alt_m: float, sea_level_temp_c: float = 15.0):
-    rho = air_density(alt_m, sea_level_temp_c)
+def air_density(
+    alt_m: float,
+    sea_level_temp_c: float = 15.0,
+) -> float:
+    return isa_atmosphere(
+        alt_m,
+        sea_level_temp_c,
+    )[0]
+
+
+def density_ratio(
+    alt_m: float,
+    sea_level_temp_c: float = 15.0,
+):
+    rho = air_density(
+        alt_m,
+        sea_level_temp_c,
+    )
     return rho, rho / RHO0
 
+
+def environment_at_altitude(
+    env: EnvironmentState,
+    altitude_m: float,
+) -> EnvironmentState:
+    rho, local_temp_c, _ = isa_atmosphere(
+        altitude_m,
+        env.sea_level_temp_c,
+    )
+    return EnvironmentState(
+        rho_kgm3=rho,
+        temperature_c=local_temp_c,
+        sea_level_temp_c=env.sea_level_temp_c,
+        wind_north_ms=env.wind_north_ms,
+        wind_east_ms=env.wind_east_ms,
+        wind_down_ms=env.wind_down_ms,
+    )
 
 
 # ==============================================================================
@@ -782,7 +947,7 @@ def _coefficient_at_alpha(alpha_deg, params):
     abs_alpha = abs(alpha)
 
     linear_cl = params.cl0 + params.cl_alpha * alpha
-    cl_max = 1.45
+    cl_max = max(0.8, float(params.cl_max))
     attached_cl = cl_max * np.tanh(linear_cl / cl_max)
 
     attached_cd = (
@@ -954,6 +1119,7 @@ class DrydenStyleTurbulence:
         return EnvironmentState(
             rho_kgm3=base_environment.rho_kgm3,
             temperature_c=base_environment.temperature_c,
+            sea_level_temp_c=base_environment.sea_level_temp_c,
             wind_north_ms=(
                 base_environment.wind_north_ms
                 + self.state.gust_north_ms
@@ -1097,7 +1263,7 @@ class FaultConfig:
 from dataclasses import dataclass, asdict
 from typing import Optional, Dict, Any
 import numpy as np
-
+import math
 
 
 @dataclass
@@ -1114,9 +1280,12 @@ class SensorPacket:
     baro_altitude_m: float
     airspeed_ms: float
 
+    # Body-axis accelerometer specific force, not navigation acceleration.
     imu_ax_ms2: float
     imu_ay_ms2: float
     imu_az_ms2: float
+
+    # Heading-like aid plus body-rate gyro outputs.
     imu_yaw_deg: float
     gyro_p_rad_s: float
     gyro_q_rad_s: float
@@ -1127,6 +1296,14 @@ class SensorPacket:
 
 
 class SensorSuite:
+    """
+    Synthetic sensor suite.
+
+    Accelerometers report body-frame specific force:
+        f_b = F_non_gravity_body / m
+    which is the quantity an ideal accelerometer senses.
+    """
+
     def __init__(
         self,
         seed: int = 42,
@@ -1149,47 +1326,43 @@ class SensorSuite:
         self.imu_yaw_sigma_deg = imu_yaw_sigma_deg
         self.gyro_sigma_rad_s = gyro_sigma_rad_s
 
-        self.prev_vn = 0.0
-        self.prev_ve = 0.0
-        self.prev_vd = 0.0
-        self.prev_time = None
-
-    def measure(self, truth, faults: FaultConfig) -> SensorPacket:
+    def measure(
+        self,
+        truth,
+        faults: FaultConfig,
+        params: VehicleDynamicsParams,
+    ) -> SensorPacket:
         t = float(truth.time_s)
-
-        if self.prev_time is None:
-            dt = 0.1
-        else:
-            dt = max(1e-3, t - self.prev_time)
-
-        ax_n = (truth.velocity_north_ms - self.prev_vn) / dt
-        ay_e = (truth.velocity_east_ms - self.prev_ve) / dt
-        az_d = (truth.velocity_down_ms - self.prev_vd) / dt
-
-        self.prev_vn = truth.velocity_north_ms
-        self.prev_ve = truth.velocity_east_ms
-        self.prev_vd = truth.velocity_down_ms
-        self.prev_time = t
+        mass = max(0.05, float(params.mass_kg))
 
         accel_bias = (
             faults.imu_accel_bias_ms2
             if faults.imu_bias_enabled
             else 0.0
         )
+
+        # TwinState force telemetry is body-axis non-gravitational force.
+        # Accelerometer output is specific force, therefore F_body / mass.
+        imu_ax = (
+            float(truth.fx_n) / mass
+            + accel_bias
+            + self.rng.normal(0.0, self.imu_accel_sigma_ms2)
+        )
+        imu_ay = (
+            float(truth.fy_n) / mass
+            + 0.5 * accel_bias
+            + self.rng.normal(0.0, self.imu_accel_sigma_ms2)
+        )
+        imu_az = (
+            float(truth.fz_n) / mass
+            - 0.35 * accel_bias
+            + self.rng.normal(0.0, self.imu_accel_sigma_ms2)
+        )
+
         yaw_bias = (
             faults.imu_yaw_bias_deg
             if faults.imu_bias_enabled
             else 0.0
-        )
-
-        imu_ax = ax_n + accel_bias + self.rng.normal(
-            0.0, self.imu_accel_sigma_ms2
-        )
-        imu_ay = ay_e + accel_bias + self.rng.normal(
-            0.0, self.imu_accel_sigma_ms2
-        )
-        imu_az = az_d + accel_bias + self.rng.normal(
-            0.0, self.imu_accel_sigma_ms2
         )
         imu_yaw = (
             truth.yaw_deg
@@ -1197,15 +1370,25 @@ class SensorSuite:
             + self.rng.normal(0.0, self.imu_yaw_sigma_deg)
         ) % 360.0
 
-        gyro_bias = 0.002 if faults.imu_bias_enabled else 0.0
-        gp = truth.p_rad_s + gyro_bias + self.rng.normal(
-            0.0, self.gyro_sigma_rad_s
+        gyro_bias = (
+            math.radians(0.08)
+            if faults.imu_bias_enabled
+            else 0.0
         )
-        gq = truth.q_rad_s + gyro_bias + self.rng.normal(
-            0.0, self.gyro_sigma_rad_s
+        gp = (
+            truth.p_rad_s
+            + gyro_bias
+            + self.rng.normal(0.0, self.gyro_sigma_rad_s)
         )
-        gr = truth.r_rad_s + gyro_bias + self.rng.normal(
-            0.0, self.gyro_sigma_rad_s
+        gq = (
+            truth.q_rad_s
+            - 0.6 * gyro_bias
+            + self.rng.normal(0.0, self.gyro_sigma_rad_s)
+        )
+        gr = (
+            truth.r_rad_s
+            + 0.4 * gyro_bias
+            + self.rng.normal(0.0, self.gyro_sigma_rad_s)
         )
 
         baro_bias = (
@@ -1245,20 +1428,27 @@ class SensorSuite:
                 else 0.0
             )
 
-            gps_n = truth.north_m + nb + self.rng.normal(
-                0.0, self.gps_pos_sigma_m
+            gps_n = (
+                truth.north_m
+                + nb
+                + self.rng.normal(0.0, self.gps_pos_sigma_m)
             )
-            gps_e = truth.east_m + eb + self.rng.normal(
-                0.0, self.gps_pos_sigma_m
+            gps_e = (
+                truth.east_m
+                + eb
+                + self.rng.normal(0.0, self.gps_pos_sigma_m)
             )
-            gps_a = truth.altitude_m + self.rng.normal(
-                0.0, self.gps_alt_sigma_m
+            gps_a = (
+                truth.altitude_m
+                + self.rng.normal(0.0, self.gps_alt_sigma_m)
             )
-            gps_vn = truth.velocity_north_ms + self.rng.normal(
-                0.0, self.gps_vel_sigma_ms
+            gps_vn = (
+                truth.velocity_north_ms
+                + self.rng.normal(0.0, self.gps_vel_sigma_ms)
             )
-            gps_ve = truth.velocity_east_ms + self.rng.normal(
-                0.0, self.gps_vel_sigma_ms
+            gps_ve = (
+                truth.velocity_east_ms
+                + self.rng.normal(0.0, self.gps_vel_sigma_ms)
             )
         else:
             gps_n = gps_e = gps_a = None
@@ -1284,96 +1474,337 @@ class SensorSuite:
         )
 
 
+class AttitudeEstimator:
+    """
+    Lightweight quaternion attitude estimator.
+
+    Gyros provide propagation. Accelerometer gravity direction provides
+    low-frequency roll/pitch correction only when specific-force magnitude
+    is near 1 g. The heading-like measurement provides a low-frequency yaw aid.
+    """
+
+    def __init__(
+        self,
+        initial_roll_deg=0.0,
+        initial_pitch_deg=0.0,
+        initial_yaw_deg=0.0,
+    ):
+        self.q = quaternion_from_euler(
+            math.radians(initial_roll_deg),
+            math.radians(initial_pitch_deg),
+            math.radians(initial_yaw_deg),
+        )
+
+    @staticmethod
+    def _blend_angle_deg(current, measured, gain):
+        error = (
+            measured - current + 180.0
+        ) % 360.0 - 180.0
+        return current + gain * error
+
+    def update(self, packet: SensorPacket, dt: float):
+        self.q = integrate_quaternion(
+            self.q,
+            packet.gyro_p_rad_s,
+            packet.gyro_q_rad_s,
+            packet.gyro_r_rad_s,
+            dt,
+        )
+
+        roll, pitch, yaw = euler_from_quaternion(self.q)
+        roll_deg = math.degrees(roll)
+        pitch_deg = math.degrees(pitch)
+        yaw_deg = math.degrees(yaw) % 360.0
+
+        f = np.array(
+            [
+                packet.imu_ax_ms2,
+                packet.imu_ay_ms2,
+                packet.imu_az_ms2,
+            ],
+            dtype=float,
+        )
+        fmag = float(np.linalg.norm(f))
+
+        angular_rate_mag = math.sqrt(
+            packet.gyro_p_rad_s**2
+            + packet.gyro_q_rad_s**2
+            + packet.gyro_r_rad_s**2
+        )
+
+        # Accelerometer-based gravity correction is only trusted during
+        # low-dynamic, low-rate periods. A coordinated turn can have |f|≈g
+        # while the force direction is not a pure gravity reference.
+        if (
+            abs(fmag - G0) <= 0.08 * G0
+            and angular_rate_mag <= 0.12
+        ):
+            roll_acc = math.degrees(
+                math.atan2(
+                    -f[1],
+                    max(1e-6, -f[2]),
+                )
+            )
+            pitch_acc = math.degrees(
+                math.atan2(
+                    f[0],
+                    max(
+                        1e-6,
+                        math.sqrt(f[1]**2 + f[2]**2),
+                    ),
+                )
+            )
+            roll_deg = (
+                0.998 * roll_deg
+                + 0.002 * roll_acc
+            )
+            pitch_deg = (
+                0.998 * pitch_deg
+                + 0.002 * pitch_acc
+            )
+
+        yaw_deg = self._blend_angle_deg(
+            yaw_deg,
+            packet.imu_yaw_deg,
+            0.010,
+        )
+
+        self.q = quaternion_from_euler(
+            math.radians(roll_deg),
+            math.radians(pitch_deg),
+            math.radians(yaw_deg),
+        )
+        return self.q
+
+    def rotation_body_to_ned(self):
+        return rotation_body_to_ned(self.q)
+
+    def euler_deg(self):
+        roll, pitch, yaw = euler_from_quaternion(self.q)
+        return (
+            math.degrees(roll),
+            math.degrees(pitch),
+            math.degrees(yaw) % 360.0,
+        )
+
+    def state_dict(self):
+        roll, pitch, yaw = self.euler_deg()
+        return {
+            "est_roll_deg": float(roll),
+            "est_pitch_deg": float(pitch),
+            "est_yaw_deg": float(yaw),
+            "est_qw": float(self.q[0]),
+            "est_qx": float(self.q[1]),
+            "est_qy": float(self.q[2]),
+            "est_qz": float(self.q[3]),
+        }
+
 
 # ==============================================================================
 # estimation/ekf_bias.py
 # ==============================================================================
 import numpy as np
+import copy
+import math
 
 
 class BiasAwareNavigationEKF:
     """
+    Navigation-state EKF.
+
     State:
-    [N, E, h, Vn, Ve, Vh, b_ax, b_ay, b_baro]
+    [N, E, h, Vn, Ve, Vh, b_ax, b_ay, b_az_up, b_baro]
+
+    Attitude is propagated separately by AttitudeEstimator. The EKF consumes
+    navigation-frame acceleration reconstructed from body specific force using
+    that estimated attitude.
     """
 
-    def __init__(self, initial_altitude_m=0.0):
-        self.x = np.zeros((9, 1), dtype=float)
+    def __init__(
+        self,
+        initial_altitude_m=0.0,
+        initial_vn_ms=0.0,
+        initial_ve_ms=0.0,
+        initial_vh_ms=0.0,
+    ):
+        self.x = np.zeros((10, 1), dtype=float)
         self.x[2, 0] = float(initial_altitude_m)
+        self.x[3, 0] = float(initial_vn_ms)
+        self.x[4, 0] = float(initial_ve_ms)
+        self.x[5, 0] = float(initial_vh_ms)
+
         self.P = np.diag([
             25.0, 25.0, 16.0,
             4.0, 4.0, 2.0,
-            0.05**2, 0.05**2, 3.0**2,
+            0.05**2, 0.05**2, 0.08**2,
+            3.0**2,
         ])
 
-    def predict(self, dt, accel_n_ms2, accel_e_ms2):
+    def predict(
+        self,
+        dt,
+        accel_n_ms2,
+        accel_e_ms2,
+        accel_up_ms2,
+    ):
         dt = max(1e-4, float(dt))
+
         bax = self.x[6, 0]
         bay = self.x[7, 0]
+        baz = self.x[8, 0]
+
         ax = float(accel_n_ms2) - bax
         ay = float(accel_e_ms2) - bay
+        az_up = float(accel_up_ms2) - baz
 
         self.x[0, 0] += self.x[3, 0]*dt + 0.5*ax*dt*dt
         self.x[1, 0] += self.x[4, 0]*dt + 0.5*ay*dt*dt
-        self.x[2, 0] += self.x[5, 0]*dt
+        self.x[2, 0] += self.x[5, 0]*dt + 0.5*az_up*dt*dt
+
         self.x[3, 0] += ax*dt
         self.x[4, 0] += ay*dt
+        self.x[5, 0] += az_up*dt
 
-        F = np.eye(9)
+        F = np.eye(10)
         F[0, 3] = dt
         F[1, 4] = dt
         F[2, 5] = dt
+
         F[0, 6] = -0.5*dt*dt
         F[1, 7] = -0.5*dt*dt
+        F[2, 8] = -0.5*dt*dt
+
         F[3, 6] = -dt
         F[4, 7] = -dt
+        F[5, 8] = -dt
 
         Q = np.diag([
-            0.06*dt, 0.06*dt, 0.06*dt,
-            0.22*dt, 0.22*dt, 0.18*dt,
-            2e-5*dt, 2e-5*dt, 4e-4*dt,
+            0.05*dt, 0.05*dt, 0.05*dt,
+            0.18*dt, 0.18*dt, 0.15*dt,
+            2e-5*dt, 2e-5*dt, 3e-5*dt,
+            4e-4*dt,
         ])
 
         self.P = F @ self.P @ F.T + Q
+        self.P = 0.5 * (self.P + self.P.T)
 
     def _update(self, z, H, R):
         z = np.asarray(z, dtype=float).reshape(-1, 1)
         H = np.asarray(H, dtype=float)
         R = np.asarray(R, dtype=float)
+
         innovation = z - H @ self.x
         S = H @ self.P @ H.T + R
         K = self.P @ H.T @ np.linalg.inv(S)
+
         self.x = self.x + K @ innovation
-        I = np.eye(9)
+
+        # Joseph stabilized covariance update.
+        I = np.eye(10)
         A = I - K @ H
-        self.P = A @ self.P @ A.T + K @ R @ K.T
+        self.P = (
+            A @ self.P @ A.T
+            + K @ R @ K.T
+        )
+        self.P = 0.5 * (self.P + self.P.T)
+
         return innovation.flatten(), S
 
-    def update_gps(self, north_m, east_m, altitude_m, vn_ms, ve_ms):
-        H = np.zeros((5, 9), dtype=float)
+    def update_gps(
+        self,
+        north_m,
+        east_m,
+        altitude_m,
+        vn_ms,
+        ve_ms,
+    ):
+        H = np.zeros((5, 10), dtype=float)
         H[0, 0] = 1.0
         H[1, 1] = 1.0
         H[2, 2] = 1.0
         H[3, 3] = 1.0
         H[4, 4] = 1.0
+
         R = np.diag([
-            2.5**2, 2.5**2, 4.0**2,
-            0.25**2, 0.25**2,
+            2.5**2,
+            2.5**2,
+            4.0**2,
+            0.25**2,
+            0.25**2,
         ])
+
         return self._update(
             [north_m, east_m, altitude_m, vn_ms, ve_ms],
-            H, R,
+            H,
+            R,
         )
 
     def update_baro(self, baro_altitude_m):
-        H = np.zeros((1, 9), dtype=float)
+        H = np.zeros((1, 10), dtype=float)
         H[0, 2] = 1.0
-        H[0, 8] = 1.0
+        H[0, 9] = 1.0
         R = np.array([[1.2**2]], dtype=float)
-        return self._update([baro_altitude_m], H, R)
+        return self._update(
+            [baro_altitude_m],
+            H,
+            R,
+        )
+
+    def update_airspeed_heading(
+        self,
+        airspeed_ms,
+        heading_deg,
+        sigma_ms=3.0,
+    ):
+        """
+        Loose dead-reckoning velocity aid for GPS outages.
+
+        This treats measured airspeed projected by estimated heading as a noisy
+        groundspeed proxy. Large covariance deliberately acknowledges unknown
+        wind rather than pretending it is GPS-equivalent.
+        """
+        speed = max(
+            0.0,
+            float(airspeed_ms),
+        )
+        heading = math.radians(
+            float(heading_deg)
+        )
+
+        vn = speed * math.cos(heading)
+        ve = speed * math.sin(heading)
+
+        H = np.zeros((2, 10), dtype=float)
+        H[0, 3] = 1.0
+        H[1, 4] = 1.0
+
+        sigma = max(
+            1.0,
+            float(sigma_ms),
+        )
+        R = np.diag(
+            [
+                sigma**2,
+                sigma**2,
+            ]
+        )
+
+        return self._update(
+            [vn, ve],
+            H,
+            R,
+        )
 
     def state_dict(self):
         d = np.diag(self.P)
+        min_eig = float(
+            np.min(
+                np.linalg.eigvalsh(
+                    0.5 * (self.P + self.P.T)
+                )
+            )
+        )
+
         return {
             "est_north_m": float(self.x[0, 0]),
             "est_east_m": float(self.x[1, 0]),
@@ -1383,15 +1814,110 @@ class BiasAwareNavigationEKF:
             "est_vertical_speed_ms": float(self.x[5, 0]),
             "est_accel_bias_n_ms2": float(self.x[6, 0]),
             "est_accel_bias_e_ms2": float(self.x[7, 0]),
-            "est_baro_bias_m": float(self.x[8, 0]),
-            "sigma_north_m": float(np.sqrt(max(0.0, d[0]))),
-            "sigma_east_m": float(np.sqrt(max(0.0, d[1]))),
-            "sigma_altitude_m": float(np.sqrt(max(0.0, d[2]))),
-            "sigma_accel_bias_n_ms2": float(np.sqrt(max(0.0, d[6]))),
-            "sigma_accel_bias_e_ms2": float(np.sqrt(max(0.0, d[7]))),
-            "sigma_baro_bias_m": float(np.sqrt(max(0.0, d[8]))),
+            "est_accel_bias_up_ms2": float(self.x[8, 0]),
+            "est_baro_bias_m": float(self.x[9, 0]),
+            "sigma_north_m": float(math.sqrt(max(0.0, d[0]))),
+            "sigma_east_m": float(math.sqrt(max(0.0, d[1]))),
+            "sigma_altitude_m": float(math.sqrt(max(0.0, d[2]))),
+            "sigma_vn_ms": float(math.sqrt(max(0.0, d[3]))),
+            "sigma_ve_ms": float(math.sqrt(max(0.0, d[4]))),
+            "sigma_vertical_speed_ms": float(math.sqrt(max(0.0, d[5]))),
+            "ekf_min_cov_eig": min_eig,
         }
 
+
+def nav_acceleration_from_specific_force(
+    packet: SensorPacket,
+    attitude_estimator: AttitudeEstimator,
+):
+    """
+    Convert body specific force to navigation acceleration:
+        a_n = R_bn f_b + g_n
+    NED convention is used; the returned vertical acceleration is positive up.
+    """
+    f_body = np.array(
+        [
+            packet.imu_ax_ms2,
+            packet.imu_ay_ms2,
+            packet.imu_az_ms2,
+        ],
+        dtype=float,
+    )
+
+    r_bn = attitude_estimator.rotation_body_to_ned()
+    a_ned = (
+        r_bn @ f_body
+        + np.array(
+            [0.0, 0.0, G0],
+            dtype=float,
+        )
+    )
+
+    return (
+        float(a_ned[0]),
+        float(a_ned[1]),
+        float(-a_ned[2]),
+    )
+
+
+def build_estimated_control_state(
+    truth: TwinState,
+    ekf: BiasAwareNavigationEKF,
+    attitude_estimator: AttitudeEstimator,
+    packet: SensorPacket,
+) -> TwinState:
+    """
+    Construct the state available to onboard guidance/control.
+
+    This deliberately prevents waypoint guidance and the autopilot from reading
+    truth position/velocity/attitude directly.
+    """
+    s = copy.copy(truth)
+    e = ekf.state_dict()
+    roll_deg, pitch_deg, yaw_deg = attitude_estimator.euler_deg()
+
+    s.north_m = e["est_north_m"]
+    s.east_m = e["est_east_m"]
+    s.altitude_m = max(0.0, e["est_altitude_m"])
+    s.down_m = -s.altitude_m
+
+    s.velocity_north_ms = e["est_vn_ms"]
+    s.velocity_east_ms = e["est_ve_ms"]
+    s.vertical_speed_ms = e["est_vertical_speed_ms"]
+    s.velocity_down_ms = -s.vertical_speed_ms
+
+    s.ground_speed_ms = math.hypot(
+        s.velocity_north_ms,
+        s.velocity_east_ms,
+    )
+    s.airspeed_ms = max(0.0, float(packet.airspeed_ms))
+
+    s.roll_deg = float(roll_deg)
+    s.pitch_deg = float(pitch_deg)
+    s.yaw_deg = float(yaw_deg)
+
+    q_est = attitude_estimator.q
+    s.qw = float(q_est[0])
+    s.qx = float(q_est[1])
+    s.qy = float(q_est[2])
+    s.qz = float(q_est[3])
+
+    s.p_rad_s = float(packet.gyro_p_rad_s)
+    s.q_rad_s = float(packet.gyro_q_rad_s)
+    s.r_rad_s = float(packet.gyro_r_rad_s)
+
+    flight_path_deg = math.degrees(
+        math.atan2(
+            s.vertical_speed_ms,
+            max(0.5, s.ground_speed_ms),
+        )
+    )
+    s.angle_of_attack_deg = (
+        s.pitch_deg - flight_path_deg
+    )
+    s.sideslip_deg = 0.0
+
+    return s
 
 
 # ==============================================================================
@@ -1544,19 +2070,40 @@ class Autopilot:
         self,
         params: VehicleDynamicsParams,
         trim_pitch_deg: float = 0.0,
+        trim_elevator: float = None,
+        trim_throttle: float = 0.46,
     ):
         self.params = params
         self.trim_pitch_deg = float(trim_pitch_deg)
         trim_alpha_rad = math.radians(self.trim_pitch_deg)
+
         if params.vehicle_type == "fixed":
-            numerator = -(params.cm0 + params.cm_alpha * trim_alpha_rad)
-            self.trim_elevator = clamp(
-                numerator / params.cm_de if abs(params.cm_de) > 1e-6 else 0.0,
-                -0.45,
-                0.45,
+            if trim_elevator is None:
+                numerator = -(
+                    params.cm0
+                    + params.cm_alpha * trim_alpha_rad
+                )
+                self.trim_elevator = clamp(
+                    numerator / params.cm_de
+                    if abs(params.cm_de) > 1e-6
+                    else 0.0,
+                    -0.45,
+                    0.45,
+                )
+            else:
+                self.trim_elevator = clamp(
+                    float(trim_elevator),
+                    -0.65,
+                    0.65,
+                )
+            self.trim_throttle = clamp(
+                float(trim_throttle),
+                0.02,
+                1.0,
             )
         else:
             self.trim_elevator = 0.0
+            self.trim_throttle = 0.46
 
         if params.vehicle_type == "fixed":
             self.roll_pid = PID(0.035, 0.003, 0.008, 6.0)
@@ -1620,8 +2167,9 @@ class Autopilot:
             )
 
             throttle = clamp(
-                0.46 + self.speed_pid.step(speed_error, dt),
-                0.05,
+                self.trim_throttle
+                + self.speed_pid.step(speed_error, dt),
+                0.02,
                 1.0,
             )
 
@@ -1887,7 +2435,6 @@ import math
 import numpy as np
 
 
-
 G0 = 9.80665
 
 
@@ -1902,28 +2449,32 @@ def state_quaternion(state: TwinState):
     )
 
 
-def aerodynamic_forces_moments(
+def relative_air_state(
     state: TwinState,
     env: EnvironmentState,
-    params: VehicleDynamicsParams,
-    controls: ControlInput,
 ):
     r_bn = rotation_body_to_ned(
         state_quaternion(state)
     )
 
-    wind_ned = np.array([
-        env.wind_north_ms,
-        env.wind_east_ms,
-        env.wind_down_ms,
-    ], dtype=float)
+    wind_ned = np.array(
+        [
+            env.wind_north_ms,
+            env.wind_east_ms,
+            env.wind_down_ms,
+        ],
+        dtype=float,
+    )
     wind_body = r_bn.T @ wind_ned
 
-    rel = np.array([
-        state.u_ms,
-        state.v_ms,
-        state.w_ms,
-    ], dtype=float) - wind_body
+    rel = np.array(
+        [
+            state.u_ms,
+            state.v_ms,
+            state.w_ms,
+        ],
+        dtype=float,
+    ) - wind_body
 
     ur, vr, wr = rel.tolist()
     v_air = max(
@@ -1943,11 +2494,234 @@ def aerodynamic_forces_moments(
         )
     )
 
+    return r_bn, rel, v_air, alpha, beta
+
+
+def propulsion_state(
+    state: TwinState,
+    env: EnvironmentState,
+    params: VehicleDynamicsParams,
+    controls: ControlInput,
+):
+    """
+    Energy-consistent low-order propulsion model.
+
+    Fixed wing:
+        throttle -> shaft power -> propulsive power -> thrust.
+    Rotorcraft:
+        collective -> thrust request -> momentum/profile/parasite shaft power.
+
+    Returned input_power_w is electrical input for battery aircraft and shaft
+    power for ICE aircraft. The battery digital twin limits this power upstream.
+    """
+    _, rel, v_air, _, _ = relative_air_state(
+        state,
+        env,
+    )
+
+    throttle = clamp(
+        controls.throttle,
+        0.0,
+        1.0,
+    )
+    health = clamp(
+        state.motor_health,
+        0.20,
+        1.0,
+    )
+
+    if params.vehicle_type == "fixed":
+        shaft_power = (
+            throttle
+            * params.max_shaft_power_w
+            * health
+        )
+
+        # Power-derived thrust with a static-thrust cap. The regularized
+        # denominator avoids the singularity of T = eta P / V near V=0.
+        equivalent_speed = max(
+            4.0,
+            float(v_air),
+        )
+        power_thrust = (
+            params.prop_eff
+            * shaft_power
+            / equivalent_speed
+        )
+        static_cap = (
+            params.max_thrust_n
+            * math.sqrt(
+                max(0.0, throttle)
+            )
+            * health
+        )
+        thrust_n = min(
+            static_cap,
+            max(0.0, power_thrust),
+        )
+
+        if params.power_system == "Battery":
+            input_power = (
+                shaft_power
+                / max(
+                    0.40,
+                    params.motor_efficiency
+                    * params.esc_efficiency,
+                )
+                + params.hotel_w
+            )
+        else:
+            input_power = shaft_power
+
+        propulsive_power = thrust_n * v_air
+        effective_eta = (
+            propulsive_power
+            / shaft_power
+            if shaft_power > 1e-6
+            else 0.0
+        )
+
+        return {
+            "thrust_n": float(thrust_n),
+            "shaft_power_w": float(shaft_power),
+            "input_power_w": float(max(0.0, input_power)),
+            "propulsive_efficiency": float(
+                max(0.0, min(1.0, effective_eta))
+            ),
+        }
+
+    # Rotorcraft.
+    requested_thrust = (
+        throttle
+        * params.max_thrust_n
+        * health
+    )
+    rho = max(
+        0.25,
+        float(env.rho_kgm3),
+    )
+    area = max(
+        0.03,
+        params.rotor_disk_area_m2,
+    )
+
+    # Momentum-theory induced power with a generic figure of merit.
+    figure_of_merit = 0.72
+    induced_power = (
+        requested_thrust ** 1.5
+        / max(
+            1e-6,
+            math.sqrt(
+                2.0 * rho * area
+            )
+            * figure_of_merit,
+        )
+    )
+
+    horizontal_speed = math.hypot(
+        rel[0],
+        rel[1],
+    )
+    profile_power = (
+        0.12
+        * params.hover_power_w_ref
+        * (
+            0.35
+            + 0.65 * throttle
+        )
+    )
+    parasite_power = (
+        0.5
+        * rho
+        * 1.0
+        * max(0.02, params.wing_area_m2)
+        * horizontal_speed ** 3
+    )
+
+    shaft_power = (
+        induced_power
+        + profile_power
+        + parasite_power
+    )
+
+    # Enforce installed shaft-power limit by reducing thrust consistently
+    # with T^(3/2) induced-power scaling.
+    if (
+        shaft_power > params.max_shaft_power_w
+        and requested_thrust > 0.0
+    ):
+        scale = (
+            params.max_shaft_power_w
+            / max(1e-6, shaft_power)
+        ) ** (2.0 / 3.0)
+        requested_thrust *= clamp(
+            scale,
+            0.0,
+            1.0,
+        )
+
+        induced_power = (
+            requested_thrust ** 1.5
+            / max(
+                1e-6,
+                math.sqrt(2.0 * rho * area)
+                * figure_of_merit,
+            )
+        )
+        shaft_power = min(
+            params.max_shaft_power_w,
+            induced_power
+            + profile_power
+            + parasite_power,
+        )
+
+    if params.power_system == "Battery":
+        input_power = (
+            shaft_power
+            / max(
+                0.40,
+                params.motor_efficiency
+                * params.esc_efficiency,
+            )
+            + params.hotel_w
+        )
+    else:
+        input_power = shaft_power
+
+    return {
+        "thrust_n": float(requested_thrust),
+        "shaft_power_w": float(shaft_power),
+        "input_power_w": float(max(0.0, input_power)),
+        "propulsive_efficiency": float(figure_of_merit),
+    }
+
+
+def aerodynamic_forces_moments(
+    state: TwinState,
+    env: EnvironmentState,
+    params: VehicleDynamicsParams,
+    controls: ControlInput,
+):
+    r_bn, rel, v_air, alpha, beta = (
+        relative_air_state(
+            state,
+            env,
+        )
+    )
+    ur, vr, wr = rel.tolist()
+
     qbar = (
         0.5
         * env.rho_kgm3
         * v_air
         * v_air
+    )
+
+    prop = propulsion_state(
+        state,
+        env,
+        params,
+        controls,
     )
 
     if params.vehicle_type == "fixed":
@@ -1985,8 +2759,16 @@ def aerodynamic_forces_moments(
             + params.cl_q * q_hat
             + params.cl_de * controls.elevator
         )
+
+        # Signature-management drag is applied as incremental parasite drag,
+        # not by multiplying the induced component.
         cd = (
             cd_table
+            + params.cd0
+            * max(
+                0.0,
+                params.drag_multiplier - 1.0,
+            )
             + 0.012 * controls.elevator**2
         )
 
@@ -2034,32 +2816,15 @@ def aerodynamic_forces_moments(
         m_m = qbar * s * c * cm_pitch
         n_m = qbar * s * b * cn_yaw
 
-        thrust = (
-            clamp(
-                controls.throttle,
-                0.0,
-                1.0,
-            )
-            * params.max_thrust_n
-            * state.motor_health
-        )
-        fx += thrust
+        fx += prop["thrust_n"]
 
     else:
-        collective = clamp(
-            controls.throttle,
-            0.0,
-            1.0,
-        )
-        thrust = (
-            collective
-            * params.max_thrust_n
-            * state.motor_health
-        )
+        thrust = prop["thrust_n"]
 
         drag_k = (
             0.16
             * params.mass_kg
+            * params.drag_multiplier
         )
         fx = (
             -drag_k
@@ -2117,6 +2882,10 @@ def aerodynamic_forces_moments(
         "alpha": float(alpha),
         "beta": float(beta),
         "r_bn": r_bn,
+        "thrust_n": prop["thrust_n"],
+        "shaft_power_w": prop["shaft_power_w"],
+        "input_power_w": prop["input_power_w"],
+        "propulsive_efficiency": prop["propulsive_efficiency"],
     }
 
 
@@ -2207,6 +2976,13 @@ def derivatives(
         )
     )
 
+    quat_dot = quaternion_derivative(
+        state_quaternion(state),
+        p,
+        q,
+        r,
+    )
+
     return {
         "u_dot": float(u_dot),
         "v_dot": float(v_dot),
@@ -2217,6 +2993,10 @@ def derivatives(
         "north_dot": float(vel_ned[0]),
         "east_dot": float(vel_ned[1]),
         "down_dot": float(vel_ned[2]),
+        "qw_dot": float(quat_dot[0]),
+        "qx_dot": float(quat_dot[1]),
+        "qy_dot": float(quat_dot[2]),
+        "qz_dot": float(quat_dot[3]),
         "fx": fm["fx"],
         "fy": fm["fy"],
         "fz": fm["fz"],
@@ -2226,9 +3006,227 @@ def derivatives(
         "airspeed": fm["airspeed"],
         "alpha": fm["alpha"],
         "beta": fm["beta"],
+        "thrust_n": fm["thrust_n"],
+        "shaft_power_w": fm["shaft_power_w"],
+        "input_power_w": fm["input_power_w"],
+        "propulsive_efficiency": fm["propulsive_efficiency"],
     }
 
 
+def solve_fixedwing_trim(
+    params: VehicleDynamicsParams,
+    environment: EnvironmentState,
+    speed_ms: float,
+    max_iterations: int = 24,
+):
+    """
+    Solve a straight-and-level fixed-wing trim point for:
+        alpha, elevator, throttle
+
+    Residuals are body-axis u_dot, w_dot and pitch-rate derivative q_dot.
+    A damped finite-difference Newton/least-squares method avoids a SciPy
+    dependency and provides a measurable trim residual for V&V.
+    """
+    if params.vehicle_type != "fixed":
+        return {
+            "converged": True,
+            "alpha_deg": 0.0,
+            "pitch_deg": 0.0,
+            "elevator": 0.0,
+            "throttle": 0.46,
+            "residual_norm": 0.0,
+            "iterations": 0,
+        }
+
+    v = max(4.0, float(speed_ms))
+    rho = max(0.2, float(environment.rho_kgm3))
+
+    alpha0_deg = estimate_trim_alpha_deg(
+        params,
+        rho,
+        v,
+    )
+    alpha0_rad = math.radians(alpha0_deg)
+
+    elevator0 = clamp(
+        -(
+            params.cm0
+            + params.cm_alpha * alpha0_rad
+        ) / max(1e-6, params.cm_de),
+        -0.45,
+        0.45,
+    )
+
+    qbar = 0.5 * rho * v * v
+    cl_guess = (
+        params.cl0
+        + params.cl_alpha * alpha0_rad
+    )
+    cd_guess = (
+        params.cd0
+        + params.induced_k * cl_guess * cl_guess
+        + params.cd0
+        * max(
+            0.0,
+            params.drag_multiplier - 1.0,
+        )
+    )
+    drag_guess = (
+        qbar
+        * params.wing_area_m2
+        * max(0.01, cd_guess)
+    )
+    shaft_needed = (
+        drag_guess
+        * v
+        / max(0.35, params.prop_eff)
+    )
+    throttle0 = clamp(
+        shaft_needed
+        / max(1.0, params.max_shaft_power_w),
+        0.03,
+        0.95,
+    )
+
+    x = np.array(
+        [
+            alpha0_deg,
+            elevator0,
+            throttle0,
+        ],
+        dtype=float,
+    )
+
+    def residual(x_vec):
+        alpha_deg, elevator, throttle = x_vec.tolist()
+        alpha = math.radians(alpha_deg)
+
+        q_att = quaternion_from_euler(
+            0.0,
+            alpha,
+            0.0,
+        )
+
+        state = TwinState(
+            altitude_m=100.0,
+            down_m=-100.0,
+            qw=float(q_att[0]),
+            qx=float(q_att[1]),
+            qy=float(q_att[2]),
+            qz=float(q_att[3]),
+            pitch_deg=float(alpha_deg),
+            u_ms=v * math.cos(alpha),
+            w_ms=v * math.sin(alpha),
+            airspeed_ms=v,
+            motor_health=1.0,
+        )
+
+        controls = ControlInput(
+            throttle=float(throttle),
+            elevator=float(elevator),
+        )
+
+        d = derivatives(
+            state,
+            environment,
+            params,
+            controls,
+        )
+        return np.array(
+            [
+                d["u_dot"],
+                d["w_dot"],
+                2.0 * d["q_dot"],
+            ],
+            dtype=float,
+        )
+
+    converged = False
+    iterations = 0
+
+    for iteration in range(max_iterations):
+        iterations = iteration + 1
+        r0 = residual(x)
+        norm = float(np.linalg.norm(r0))
+
+        if norm < 0.025:
+            converged = True
+            break
+
+        steps = np.array(
+            [0.05, 0.002, 0.003],
+            dtype=float,
+        )
+        J = np.zeros((3, 3), dtype=float)
+
+        for j in range(3):
+            xp = x.copy()
+            xm = x.copy()
+            xp[j] += steps[j]
+            xm[j] -= steps[j]
+            J[:, j] = (
+                residual(xp)
+                - residual(xm)
+            ) / (
+                2.0 * steps[j]
+            )
+
+        try:
+            dx = np.linalg.lstsq(
+                J,
+                -r0,
+                rcond=None,
+            )[0]
+        except np.linalg.LinAlgError:
+            break
+
+        # Damping protects the generic aero model from large Newton jumps.
+        dx = np.clip(
+            dx,
+            [-1.5, -0.08, -0.12],
+            [1.5, 0.08, 0.12],
+        )
+        x += 0.70 * dx
+
+        x[0] = np.clip(
+            x[0],
+            -4.0,
+            max(
+                4.0,
+                params.alpha_stall_deg - 1.5,
+            ),
+        )
+        x[1] = np.clip(
+            x[1],
+            -0.65,
+            0.65,
+        )
+        x[2] = np.clip(
+            x[2],
+            0.02,
+            1.0,
+        )
+
+    final_residual = residual(x)
+    residual_norm = float(
+        np.linalg.norm(final_residual)
+    )
+
+    return {
+        "converged": bool(
+            converged
+            or residual_norm < 0.05
+        ),
+        "alpha_deg": float(x[0]),
+        "pitch_deg": float(x[0]),
+        "elevator": float(x[1]),
+        "throttle": float(x[2]),
+        "residual_norm": residual_norm,
+        "u_dot_ms2": float(final_residual[0]),
+        "w_dot_ms2": float(final_residual[1]),
+        "q_dot_scaled": float(final_residual[2]),
+        "iterations": int(iterations),
+    }
 
 
 # ==============================================================================
@@ -3175,8 +4173,8 @@ def infer_battery_pack_voltage(
 # twin/engine.py
 # ==============================================================================
 import math
+import copy
 from typing import Callable
-
 
 
 def clamp(x, lo, hi):
@@ -3184,6 +4182,15 @@ def clamp(x, lo, hi):
 
 
 class DigitalTwinEngine:
+    """
+    6-DOF rigid-body integrator with fourth-order Runge-Kutta propagation.
+
+    State vector:
+        [N,E,D,u,v,w,qw,qx,qy,qz,p,q,r]
+
+    Propulsion power is coupled to thrust before rigid-body propagation.
+    """
+
     def __init__(
         self,
         params: VehicleDynamicsParams,
@@ -3195,6 +4202,7 @@ class DigitalTwinEngine:
         initial_pitch_deg: float = 0.0,
         initial_alpha_deg: float = 0.0,
         battery_twin=None,
+        initial_fuel_l: float = None,
     ):
         self.params = params
         self.capacity_wh = max(
@@ -3205,6 +4213,18 @@ class DigitalTwinEngine:
         self.battery_twin = battery_twin
         self.actuators = ActuatorModel(
             params.vehicle_type
+        )
+
+        self.initial_fuel_l = (
+            max(
+                0.0,
+                float(initial_fuel_l),
+            )
+            if initial_fuel_l is not None
+            else max(
+                0.0,
+                params.fuel_tank_l,
+            )
         )
 
         alpha = math.radians(
@@ -3258,136 +4278,213 @@ class DigitalTwinEngine:
                 initial_alpha_deg
             ),
             battery_wh=(
-                float(self.battery_twin.remaining_wh)
+                float(
+                    self.battery_twin.remaining_wh
+                )
                 if self.battery_twin is not None
                 else self.capacity_wh
             ),
             battery_soc=(
-                float(self.battery_twin.soc)
+                float(
+                    self.battery_twin.soc
+                )
                 if self.battery_twin is not None
                 else 1.0
             ),
             battery_temp_c=(
-                float(self.battery_twin.temperature_c)
+                float(
+                    self.battery_twin.temperature_c
+                )
                 if self.battery_twin is not None
                 else 25.0
             ),
+            fuel_l=self.initial_fuel_l,
         )
 
-    def _integrate_rigid_body(
-        self,
-        d,
-        dt,
+    @staticmethod
+    def _state_vector(s: TwinState):
+        return np.array(
+            [
+                s.north_m,
+                s.east_m,
+                s.down_m,
+                s.u_ms,
+                s.v_ms,
+                s.w_ms,
+                s.qw,
+                s.qx,
+                s.qy,
+                s.qz,
+                s.p_rad_s,
+                s.q_rad_s,
+                s.r_rad_s,
+            ],
+            dtype=float,
+        )
+
+    @staticmethod
+    def _assign_vector(
+        s: TwinState,
+        y,
     ):
-        s = self.state
-
-        s.u_ms += d["u_dot"] * dt
-        s.v_ms += d["v_dot"] * dt
-        s.w_ms += d["w_dot"] * dt
-
-        s.u_ms = clamp(
+        (
+            s.north_m,
+            s.east_m,
+            s.down_m,
             s.u_ms,
-            -30.0,
-            120.0,
-        )
-        s.v_ms = clamp(
             s.v_ms,
-            -50.0,
-            50.0,
-        )
-        s.w_ms = clamp(
             s.w_ms,
-            -50.0,
-            50.0,
-        )
-
-        s.p_rad_s += (
-            d["p_dot"] * dt
-        )
-        s.q_rad_s += (
-            d["q_dot"] * dt
-        )
-        s.r_rad_s += (
-            d["r_dot"] * dt
-        )
-
-        s.p_rad_s = clamp(
+            s.qw,
+            s.qx,
+            s.qy,
+            s.qz,
             s.p_rad_s,
-            -5.0,
-            5.0,
-        )
-        s.q_rad_s = clamp(
             s.q_rad_s,
-            -5.0,
-            5.0,
-        )
-        s.r_rad_s = clamp(
             s.r_rad_s,
-            -5.0,
-            5.0,
-        )
+        ) = map(float, y)
 
-        q_new = integrate_quaternion(
+        qn = normalize_quaternion(
             [
                 s.qw,
                 s.qx,
                 s.qy,
                 s.qz,
-            ],
-            s.p_rad_s,
-            s.q_rad_s,
-            s.r_rad_s,
-            dt,
+            ]
         )
-
         (
             s.qw,
             s.qx,
             s.qy,
             s.qz,
-        ) = map(
-            float,
-            q_new,
-        )
+        ) = map(float, qn)
 
-        (
-            roll,
-            pitch,
-            yaw,
-        ) = euler_from_quaternion(
-            q_new
+        roll, pitch, yaw = (
+            euler_from_quaternion(qn)
         )
-
-        s.roll_deg = math.degrees(
-            roll
-        )
-        s.pitch_deg = math.degrees(
-            pitch
-        )
+        s.roll_deg = math.degrees(roll)
+        s.pitch_deg = math.degrees(pitch)
         s.yaw_deg = (
             math.degrees(yaw)
             % 360.0
         )
-
-        s.north_m += (
-            d["north_dot"] * dt
-        )
-        s.east_m += (
-            d["east_dot"] * dt
-        )
-        s.down_m += (
-            d["down_dot"] * dt
-        )
-
-        if s.down_m > 0.0:
-            s.down_m = 0.0
-            if s.w_ms > 0.0:
-                s.w_ms *= 0.25
-
         s.altitude_m = max(
             0.0,
             -s.down_m,
         )
+
+    def _temporary_state(
+        self,
+        base_state,
+        y,
+    ):
+        temp = copy.copy(base_state)
+        self._assign_vector(
+            temp,
+            y,
+        )
+        return temp
+
+    def _vector_derivative(
+        self,
+        y,
+        base_state,
+        environment,
+        controls,
+    ):
+        temp = self._temporary_state(
+            base_state,
+            y,
+        )
+
+        env_local = environment_at_altitude(
+            environment,
+            temp.altitude_m,
+        )
+
+        d = derivatives(
+            temp,
+            env_local,
+            self.params,
+            controls,
+        )
+
+        return np.array(
+            [
+                d["north_dot"],
+                d["east_dot"],
+                d["down_dot"],
+                d["u_dot"],
+                d["v_dot"],
+                d["w_dot"],
+                d["qw_dot"],
+                d["qx_dot"],
+                d["qy_dot"],
+                d["qz_dot"],
+                d["p_dot"],
+                d["q_dot"],
+                d["r_dot"],
+            ],
+            dtype=float,
+        )
+
+    def _integrate_rigid_body_rk4(
+        self,
+        environment,
+        controls,
+        dt,
+    ):
+        s = self.state
+        y0 = self._state_vector(s)
+
+        k1 = self._vector_derivative(
+            y0,
+            s,
+            environment,
+            controls,
+        )
+        k2 = self._vector_derivative(
+            y0 + 0.5 * dt * k1,
+            s,
+            environment,
+            controls,
+        )
+        k3 = self._vector_derivative(
+            y0 + 0.5 * dt * k2,
+            s,
+            environment,
+            controls,
+        )
+        k4 = self._vector_derivative(
+            y0 + dt * k3,
+            s,
+            environment,
+            controls,
+        )
+
+        y_new = (
+            y0
+            + (dt / 6.0)
+            * (
+                k1
+                + 2.0 * k2
+                + 2.0 * k3
+                + k4
+            )
+        )
+
+        self._assign_vector(
+            s,
+            y_new,
+        )
+
+        # Ground contact is a physical boundary, not a general state clamp.
+        if s.down_m > 0.0:
+            s.down_m = 0.0
+            s.altitude_m = 0.0
+            if s.w_ms > 0.0:
+                s.w_ms *= 0.20
+
+        return s
 
     def update_energy(
         self,
@@ -3396,7 +4493,7 @@ class DigitalTwinEngine:
     ):
         s = self.state
         used_wh = (
-            power_w
+            max(0.0, power_w)
             * dt
             / 3600.0
         )
@@ -3411,6 +4508,56 @@ class DigitalTwinEngine:
             1.0,
         )
 
+    def update_fuel(
+        self,
+        shaft_power_w,
+        dt,
+    ):
+        s = self.state
+
+        if (
+            self.params.bsfc_gpkwh <= 0.0
+            or self.params.fuel_density_kgpl <= 0.0
+            or self.initial_fuel_l <= 0.0
+        ):
+            s.fuel_burn_lph = 0.0
+            s.battery_soc = 1.0
+            return
+
+        shaft_kw = max(
+            0.0,
+            shaft_power_w,
+        ) / 1000.0
+
+        fuel_kgph = (
+            self.params.bsfc_gpkwh
+            * shaft_kw
+            / 1000.0
+        )
+        fuel_lph = (
+            fuel_kgph
+            / self.params.fuel_density_kgpl
+        )
+
+        s.fuel_burn_lph = float(
+            fuel_lph
+        )
+        s.fuel_l = max(
+            0.0,
+            s.fuel_l
+            - fuel_lph * dt / 3600.0,
+        )
+
+        s.battery_soc = clamp(
+            s.fuel_l
+            / max(
+                1e-9,
+                self.initial_fuel_l,
+            ),
+            0.0,
+            1.0,
+        )
+
     def update_thermal(
         self,
         power_w,
@@ -3419,41 +4566,119 @@ class DigitalTwinEngine:
     ):
         s = self.state
 
-        motor_gain = (
-            0.0020
-            * power_w
-        )
-        motor_cooling = (
-            0.050
-            * max(
-                0.0,
-                s.motor_temp_c
-                - ambient_c,
+        motor_loss_w = (
+            max(0.0, power_w)
+            * (
+                1.0
+                - self.params.motor_efficiency
+                * self.params.esc_efficiency
             )
+            if self.params.power_system == "Battery"
+            else 0.12 * max(0.0, power_w)
         )
 
-        battery_gain = (
-            0.0007
-            * power_w
+        motor_thermal_capacity = max(
+            250.0,
+            350.0 * self.params.mass_kg ** 0.45,
         )
-        battery_cooling = (
-            0.020
-            * max(
-                0.0,
-                s.battery_temp_c
-                - ambient_c,
-            )
+        motor_rth = max(
+            0.08,
+            0.50 / max(
+                0.6,
+                self.params.mass_kg ** 0.25,
+            ),
         )
+
+        cooling_w = (
+            s.motor_temp_c
+            - ambient_c
+        ) / motor_rth
 
         s.motor_temp_c += (
-            motor_gain
-            - motor_cooling
-        ) * dt
+            motor_loss_w - cooling_w
+        ) / motor_thermal_capacity * dt
 
-        s.battery_temp_c += (
-            battery_gain
-            - battery_cooling
-        ) * dt
+        # Battery temperature is authoritative in BatteryDigitalTwin.
+        if self.battery_twin is None:
+            battery_loss_w = (
+                0.03
+                * max(0.0, power_w)
+            )
+            battery_capacity = max(
+                300.0,
+                8.0 * self.capacity_wh,
+            )
+            battery_rth = 0.35
+            battery_cooling = (
+                s.battery_temp_c
+                - ambient_c
+            ) / battery_rth
+
+            s.battery_temp_c += (
+                battery_loss_w
+                - battery_cooling
+            ) / battery_capacity * dt
+
+    def _limit_controls_by_available_power(
+        self,
+        actual,
+        environment,
+    ):
+        if self.battery_twin is None:
+            return actual
+
+        s = self.state
+        env_local = environment_at_altitude(
+            environment,
+            s.altitude_m,
+        )
+
+        request = propulsion_state(
+            s,
+            env_local,
+            self.params,
+            actual,
+        )
+        demanded = max(
+            0.0,
+            request["input_power_w"],
+        )
+
+        factor = (
+            self.battery_twin
+            .power_availability_factor(
+                demanded
+            )
+        )
+
+        if factor >= 0.999:
+            return actual
+
+        if self.params.vehicle_type == "fixed":
+            throttle_scale = factor
+        else:
+            throttle_scale = factor ** (2.0 / 3.0)
+
+        return ControlInput(
+            throttle=clamp(
+                actual.throttle
+                * throttle_scale,
+                0.0,
+                1.0,
+            ),
+            aileron=actual.aileron,
+            elevator=actual.elevator,
+            rudder=actual.rudder,
+            commanded_heading_deg=(
+                actual.commanded_heading_deg
+            ),
+            commanded_altitude_m=(
+                actual.commanded_altitude_m
+            ),
+            commanded_speed_ms=(
+                actual.commanded_speed_ms
+            ),
+        )
 
     def step(
         self,
@@ -3463,7 +4688,10 @@ class DigitalTwinEngine:
     ):
         dt = max(
             0.002,
-            float(dt),
+            min(
+                0.05,
+                float(dt),
+            ),
         )
         s = self.state
 
@@ -3471,85 +4699,27 @@ class DigitalTwinEngine:
             command,
             dt,
         )
+        actual = self._limit_controls_by_available_power(
+            actual,
+            environment,
+        )
 
-        # Battery-powered aircraft can become propulsion-power limited.
-        if self.battery_twin is not None:
-            preview_modeled_power = float(
-                self.power_model(
-                    max(
-                        1.0,
-                        s.airspeed_ms,
-                    )
-                )
-            )
+        self._integrate_rigid_body_rk4(
+            environment,
+            actual,
+            dt,
+        )
 
-            preview_actuator_factor = (
-                1.0
-                + 0.06
-                * (
-                    abs(actual.aileron)
-                    + abs(actual.elevator)
-                    + abs(actual.rudder)
-                )
-            )
-
-            preview_throttle_factor = (
-                0.45
-                + 0.80
-                * actual.throttle
-            )
-
-            preview_demand_w = (
-                preview_modeled_power
-                * preview_actuator_factor
-                * preview_throttle_factor
-                / max(
-                    0.40,
-                    s.motor_health,
-                )
-            )
-
-            battery_power_factor = (
-                self.battery_twin
-                .power_availability_factor(
-                    preview_demand_w
-                )
-            )
-
-            if battery_power_factor < 0.999:
-                actual = ControlInput(
-                    throttle=max(
-                        0.0,
-                        min(
-                            1.0,
-                            actual.throttle
-                            * battery_power_factor,
-                        ),
-                    ),
-                    aileron=actual.aileron,
-                    elevator=actual.elevator,
-                    rudder=actual.rudder,
-                    commanded_heading_deg=(
-                        actual.commanded_heading_deg
-                    ),
-                    commanded_altitude_m=(
-                        actual.commanded_altitude_m
-                    ),
-                    commanded_speed_ms=(
-                        actual.commanded_speed_ms
-                    ),
-                )
+        env_final = environment_at_altitude(
+            environment,
+            s.altitude_m,
+        )
 
         d = derivatives(
             s,
-            environment,
+            env_final,
             self.params,
             actual,
-        )
-
-        self._integrate_rigid_body(
-            d,
-            dt,
         )
 
         s.fx_n = d["fx"]
@@ -3572,14 +4742,29 @@ class DigitalTwinEngine:
             )
         )
 
-        s.velocity_north_ms = (
-            d["north_dot"]
+        r_bn = rotation_body_to_ned(
+            state_quaternion(s)
         )
-        s.velocity_east_ms = (
-            d["east_dot"]
+        vel_ned = (
+            r_bn
+            @ np.array(
+                [
+                    s.u_ms,
+                    s.v_ms,
+                    s.w_ms,
+                ],
+                dtype=float,
+            )
         )
-        s.velocity_down_ms = (
-            d["down_dot"]
+
+        s.velocity_north_ms = float(
+            vel_ned[0]
+        )
+        s.velocity_east_ms = float(
+            vel_ned[1]
+        )
+        s.velocity_down_ms = float(
+            vel_ned[2]
         )
 
         s.ground_speed_ms = math.hypot(
@@ -3590,64 +4775,34 @@ class DigitalTwinEngine:
             -s.velocity_down_ms
         )
 
-        s.throttle_cmd = (
-            command.throttle
+        s.throttle_cmd = command.throttle
+        s.aileron_cmd = command.aileron
+        s.elevator_cmd = command.elevator
+        s.rudder_cmd = command.rudder
+
+        s.throttle_actual = actual.throttle
+        s.aileron_actual = actual.aileron
+        s.elevator_actual = actual.elevator
+        s.rudder_actual = actual.rudder
+
+        s.atmosphere_rho_kgm3 = float(
+            env_final.rho_kgm3
         )
-        s.aileron_cmd = (
-            command.aileron
-        )
-        s.elevator_cmd = (
-            command.elevator
-        )
-        s.rudder_cmd = (
-            command.rudder
+        s.ambient_temperature_c = float(
+            env_final.temperature_c
         )
 
-        s.throttle_actual = (
-            actual.throttle
+        s.propulsion_thrust_n = float(
+            d["thrust_n"]
         )
-        s.aileron_actual = (
-            actual.aileron
+        s.propulsion_shaft_power_w = float(
+            d["shaft_power_w"]
         )
-        s.elevator_actual = (
-            actual.elevator
+        s.propulsion_input_power_w = float(
+            d["input_power_w"]
         )
-        s.rudder_actual = (
-            actual.rudder
-        )
-
-        modeled_power = float(
-            self.power_model(
-                max(
-                    1.0,
-                    s.airspeed_ms,
-                )
-            )
-        )
-
-        actuator_factor = (
-            1.0
-            + 0.06
-            * (
-                abs(actual.aileron)
-                + abs(actual.elevator)
-                + abs(actual.rudder)
-            )
-        )
-        throttle_factor = (
-            0.45
-            + 0.80
-            * actual.throttle
-        )
-
-        power_w = (
-            modeled_power
-            * actuator_factor
-            * throttle_factor
-            / max(
-                0.40,
-                s.motor_health,
-            )
+        s.propulsive_efficiency = float(
+            d["propulsive_efficiency"]
         )
 
         if self.battery_twin is not None:
@@ -3655,10 +4810,10 @@ class DigitalTwinEngine:
                 self.battery_twin.step(
                     demanded_power_w=max(
                         0.0,
-                        power_w,
+                        d["input_power_w"],
                     ),
                     ambient_temperature_c=(
-                        environment.temperature_c
+                        env_final.temperature_c
                     ),
                     dt=dt,
                 )
@@ -3677,35 +4832,46 @@ class DigitalTwinEngine:
                 battery_snapshot.soh
             )
 
-            # Preserve motor thermal dynamics while battery temperature is
-            # authoritative from the battery digital twin.
             self.update_thermal(
                 s.power_draw_w,
-                environment.temperature_c,
+                env_final.temperature_c,
                 dt,
             )
             s.battery_temp_c = float(
                 battery_snapshot.temperature_c
             )
+
+        elif self.params.power_system == "ICE":
+            s.power_draw_w = float(
+                d["shaft_power_w"]
+            )
+            self.update_fuel(
+                d["shaft_power_w"],
+                dt,
+            )
+            self.update_thermal(
+                d["shaft_power_w"],
+                env_final.temperature_c,
+                dt,
+            )
+
         else:
             s.power_draw_w = max(
                 0.0,
-                power_w,
+                d["input_power_w"],
             )
-
             self.update_energy(
                 s.power_draw_w,
                 dt,
             )
             self.update_thermal(
                 s.power_draw_w,
-                environment.temperature_c,
+                env_final.temperature_c,
                 dt,
             )
 
         s.time_s += dt
         return s
-
 
 
 # ==============================================================================
@@ -5878,6 +7044,334 @@ def compute_stealth_tradeoff(
 
 
 
+
+# ==============================================================================
+# v0.8 VERIFICATION / VALIDATION SUPPORT
+# ==============================================================================
+
+def _hover_trim_throttle(
+    params: VehicleDynamicsParams,
+):
+    return clamp(
+        params.mass_kg * G0
+        / max(1e-6, params.max_thrust_n),
+        0.05,
+        0.95,
+    )
+
+
+def quick_timestep_convergence_check(
+    params: VehicleDynamicsParams,
+    environment: EnvironmentState,
+    trim_solution: dict,
+    speed_ms: float,
+    duration_s: float = 12.0,
+):
+    """Compare deterministic RK4 solutions at dt=0.02 and 0.05 s."""
+
+    def run(dt):
+        if params.vehicle_type == "fixed":
+            alpha = float(trim_solution.get("alpha_deg", 0.0))
+            pitch = float(trim_solution.get("pitch_deg", alpha))
+            throttle = float(trim_solution.get("throttle", 0.46))
+            elevator = float(trim_solution.get("elevator", 0.0))
+            initial_speed = float(speed_ms)
+        else:
+            alpha = 0.0
+            pitch = 0.0
+            throttle = _hover_trim_throttle(params)
+            elevator = 0.0
+            initial_speed = 0.0
+
+        control = ControlInput(
+            throttle=throttle,
+            elevator=elevator,
+        )
+
+        engine = DigitalTwinEngine(
+            params=params,
+            battery_capacity_wh=1e9,
+            power_model=lambda _: 0.0,
+            initial_altitude_m=100.0,
+            initial_heading_deg=0.0,
+            initial_speed_ms=initial_speed,
+            initial_pitch_deg=pitch,
+            initial_alpha_deg=alpha,
+            battery_twin=None,
+            initial_fuel_l=max(0.0, params.fuel_tank_l),
+        )
+
+        engine.actuators.throttle.value = throttle
+        engine.actuators.elevator.value = elevator
+
+        for _ in range(max(1, int(duration_s / dt))):
+            state = engine.step(
+                control,
+                environment,
+                dt,
+            )
+            vals = [
+                state.north_m,
+                state.east_m,
+                state.altitude_m,
+                state.airspeed_ms,
+                state.roll_deg,
+                state.pitch_deg,
+                state.yaw_deg,
+            ]
+            if not all(
+                math.isfinite(float(v))
+                for v in vals
+            ):
+                return None
+
+        return {
+            "north_m": float(state.north_m),
+            "east_m": float(state.east_m),
+            "altitude_m": float(state.altitude_m),
+            "airspeed_ms": float(state.airspeed_ms),
+            "roll_deg": float(state.roll_deg),
+            "pitch_deg": float(state.pitch_deg),
+            "yaw_deg": float(state.yaw_deg),
+        }
+
+    fine = run(0.02)
+    coarse = run(0.05)
+
+    if fine is None or coarse is None:
+        return {
+            "pass": False,
+            "reason": "Non-finite state",
+        }
+
+    position_delta_m = math.sqrt(
+        (fine["north_m"] - coarse["north_m"])**2
+        + (fine["east_m"] - coarse["east_m"])**2
+        + (fine["altitude_m"] - coarse["altitude_m"])**2
+    )
+    airspeed_delta_ms = abs(
+        fine["airspeed_ms"] - coarse["airspeed_ms"]
+    )
+    pitch_delta_deg = abs(
+        fine["pitch_deg"] - coarse["pitch_deg"]
+    )
+
+    return {
+        "pass": bool(
+            position_delta_m < 1.0
+            and airspeed_delta_ms < 0.25
+            and pitch_delta_deg < 0.50
+        ),
+        "position_delta_m": float(position_delta_m),
+        "airspeed_delta_ms": float(airspeed_delta_ms),
+        "pitch_delta_deg": float(pitch_delta_deg),
+        "dt_fine_s": 0.02,
+        "dt_coarse_s": 0.05,
+        "duration_s": float(duration_s),
+    }
+
+
+def build_vv_report(
+    telemetry: pd.DataFrame,
+    trim_solution: dict,
+    dt: float,
+    profile: dict,
+    params: VehicleDynamicsParams,
+    battery_twin,
+    convergence_result: dict,
+):
+    tests = []
+
+    def add_test(
+        name,
+        passed,
+        value,
+        criterion,
+        note="",
+    ):
+        tests.append(
+            {
+                "Test": name,
+                "Status": "PASS" if passed else "CHECK",
+                "Measured": value,
+                "Criterion": criterion,
+                "Engineering note": note,
+            }
+        )
+
+    finite_columns = [
+        "north_m", "east_m", "altitude_m",
+        "u_ms", "v_ms", "w_ms",
+        "qw", "qx", "qy", "qz",
+        "p_rad_s", "q_rad_s", "r_rad_s",
+    ]
+    finite_state = bool(
+        np.isfinite(
+            telemetry[finite_columns].to_numpy(dtype=float)
+        ).all()
+    )
+    add_test(
+        "Finite rigid-body state",
+        finite_state,
+        "Finite" if finite_state else "NaN/Inf detected",
+        "All propagated rigid-body states finite",
+    )
+
+    qnorm = np.sqrt(
+        telemetry["qw"]**2
+        + telemetry["qx"]**2
+        + telemetry["qy"]**2
+        + telemetry["qz"]**2
+    )
+    max_q_error = float(
+        np.max(np.abs(qnorm - 1.0))
+    )
+    add_test(
+        "Quaternion normalization",
+        max_q_error < 1e-8,
+        f"{max_q_error:.2e}",
+        "< 1e-8 maximum norm error",
+    )
+
+    add_test(
+        "Integrator timestep",
+        float(dt) <= 0.05,
+        f"{float(dt):.3f} s",
+        "dt <= 0.05 s",
+        "Previously unstable 0.10/0.20 s choices are removed.",
+    )
+
+    if profile.get("type") == "fixed":
+        trim_residual = float(
+            trim_solution.get("residual_norm", 999.0)
+        )
+        trim_ok = bool(
+            trim_solution.get("converged", False)
+            and trim_residual < 0.05
+        )
+        add_test(
+            "Nonlinear trim equilibrium",
+            trim_ok,
+            f"{trim_residual:.4f}",
+            "Residual norm < 0.05",
+            "Alpha, elevator and throttle solved simultaneously.",
+        )
+
+    min_cov_eig = float(
+        telemetry["ekf_min_cov_eig"].min()
+    )
+    add_test(
+        "EKF covariance PSD",
+        min_cov_eig >= -1e-8,
+        f"{min_cov_eig:.2e}",
+        "Minimum covariance eigenvalue >= -1e-8",
+    )
+
+    max_eta = float(
+        telemetry["propulsive_efficiency"].max()
+    )
+    add_test(
+        "Propulsion power consistency",
+        0.0 <= max_eta <= 1.0001,
+        f"max η={max_eta:.3f}",
+        "0 <= T·V/Pshaft <= 1",
+        "Fixed-wing thrust now derives from shaft power.",
+    )
+
+    rho_min = float(
+        telemetry["atmosphere_rho_kgm3"].min()
+    )
+    rho_max = float(
+        telemetry["atmosphere_rho_kgm3"].max()
+    )
+    add_test(
+        "Dynamic atmosphere",
+        rho_min > 0.0 and rho_max >= rho_min,
+        f"{rho_min:.4f}–{rho_max:.4f} kg/m³",
+        "Positive density recomputed from current altitude",
+    )
+
+    imu_finite = bool(
+        np.isfinite(
+            telemetry[
+                ["imu_ax_ms2", "imu_ay_ms2", "imu_az_ms2"]
+            ].to_numpy(dtype=float)
+        ).all()
+    )
+    add_test(
+        "Body-frame IMU specific force",
+        imu_finite,
+        "Finite body-axis f_b",
+        "Accelerometer reports non-gravity body force / mass",
+    )
+
+    estimated_control = bool(
+        "control_state_source" in telemetry.columns
+        and telemetry["control_state_source"].eq(
+            "EKF + IMU attitude estimate"
+        ).all()
+    )
+    add_test(
+        "Estimated-state flight control",
+        estimated_control,
+        "EKF + IMU" if estimated_control else "Truth navigation leak",
+        "Guidance/autopilot consume estimated navigation state",
+    )
+
+    if battery_twin is not None:
+        nominal_wh = max(
+            1.0,
+            float(battery_twin.nominal_capacity_wh),
+        )
+        throughput_wh = float(
+            telemetry[
+                "battery_twin_equivalent_full_cycles"
+            ].iloc[-1]
+        ) * nominal_wh
+        integrated_wh = float(
+            telemetry[
+                "battery_twin_delivered_power_w"
+            ].sum()
+            * float(dt)
+            / 3600.0
+        )
+        energy_error_pct = (
+            100.0
+            * abs(throughput_wh - integrated_wh)
+            / max(1.0, throughput_wh)
+        )
+        add_test(
+            "Battery energy accounting",
+            energy_error_pct < 1.0,
+            f"{energy_error_pct:.3f}%",
+            "< 1% throughput/integrated-power mismatch",
+        )
+
+    conv_pass = bool(
+        convergence_result.get("pass", False)
+    )
+    if "position_delta_m" in convergence_result:
+        conv_value = (
+            f"Δpos={convergence_result['position_delta_m']:.3f} m, "
+            f"ΔV={convergence_result['airspeed_delta_ms']:.4f} m/s"
+        )
+    else:
+        conv_value = convergence_result.get(
+            "reason",
+            "Unavailable",
+        )
+
+    add_test(
+        "RK4 timestep convergence",
+        conv_pass,
+        conv_value,
+        "0.02 vs 0.05 s: Δpos < 1 m and ΔV < 0.25 m/s",
+    )
+
+    return tests
+
+
+
 # ==============================================================================
 # STREAMLIT APPLICATION
 # ==============================================================================
@@ -5906,9 +7400,183 @@ st.caption(
     "digital twin simulation, sensor fusion, and mission planning"
 )
 st.caption(
-    "v0.7 Integrated Expansion: battery digital twin, swarm / mission ops, "
-    "stealth-signature tradeoffs, plus the quaternion 6-DOF flight simulator"
+    "v0.8 Physics + V&V Overhaul: RK4 6-DOF, nonlinear trim, dynamic "
+    "atmosphere, power-coupled propulsion, body-frame IMU, estimated-state "
+    "control, battery twin, swarm, and signature trade studies"
 )
+
+
+def render_mobile_timeseries(
+    data: pd.DataFrame,
+    x_col: str,
+    series_map: dict,
+    title: str,
+    unit_label: str = "",
+    max_points: int = 1200,
+):
+    """
+    Mobile-safe battery time-series renderer.
+
+    Uses Streamlit's native line chart rather than Plotly. It also coerces
+    telemetry to finite numeric values and downsamples very long runs to reduce
+    browser memory pressure on iPhone/iPad.
+    """
+    requested = [
+        column
+        for column in series_map
+        if column in data.columns
+    ]
+
+    if x_col not in data.columns or not requested:
+        st.warning(
+            f"{title}: telemetry columns are unavailable."
+        )
+        return
+
+    chart_df = data[
+        [x_col] + requested
+    ].copy()
+
+    chart_df[x_col] = pd.to_numeric(
+        chart_df[x_col],
+        errors="coerce",
+    )
+
+    for column in requested:
+        chart_df[column] = pd.to_numeric(
+            chart_df[column],
+            errors="coerce",
+        )
+
+    chart_df = chart_df.replace(
+        [np.inf, -np.inf],
+        np.nan,
+    ).dropna(
+        subset=[x_col],
+    )
+
+    if chart_df.empty:
+        st.warning(
+            f"{title}: no finite telemetry samples are available."
+        )
+        return
+
+    # Interpolate isolated missing values, then remove any still-invalid rows.
+    for column in requested:
+        chart_df[column] = (
+            chart_df[column]
+            .interpolate(
+                limit_direction="both"
+            )
+        )
+
+    chart_df = chart_df.dropna(
+        subset=requested,
+        how="all",
+    )
+
+    if chart_df.empty:
+        st.warning(
+            f"{title}: telemetry contains no plottable numeric values."
+        )
+        return
+
+    if len(chart_df) > max_points:
+        stride = max(
+            1,
+            int(
+                math.ceil(
+                    len(chart_df)
+                    / max_points
+                )
+            ),
+        )
+        chart_df = chart_df.iloc[
+            ::stride
+        ].copy()
+
+    plot_df = (
+        chart_df
+        .set_index(x_col)[
+            requested
+        ]
+        .rename(
+            columns={
+                key: value
+                for key, value in series_map.items()
+                if key in requested
+            }
+        )
+    )
+
+    st.markdown(
+        f"**{title}**"
+    )
+
+    st.line_chart(
+        plot_df,
+        height=280,
+    )
+
+    # Always provide a numerical fallback directly below the graph.
+    summary_rows = []
+    for column in requested:
+        series = chart_df[
+            column
+        ].dropna()
+
+        if series.empty:
+            continue
+
+        summary_rows.append(
+            {
+                "Metric": series_map[
+                    column
+                ],
+                "Minimum": float(
+                    series.min()
+                ),
+                "Average": float(
+                    series.mean()
+                ),
+                "Maximum": float(
+                    series.max()
+                ),
+                "Final": float(
+                    series.iloc[-1]
+                ),
+            }
+        )
+
+    if summary_rows:
+        summary_df = pd.DataFrame(
+            summary_rows
+        )
+
+        numeric_cols = [
+            "Minimum",
+            "Average",
+            "Maximum",
+            "Final",
+        ]
+        summary_df[
+            numeric_cols
+        ] = summary_df[
+            numeric_cols
+        ].round(
+            3
+        )
+
+        st.dataframe(
+            summary_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    if unit_label:
+        st.caption(
+            unit_label
+        )
 
 
 def parse_waypoints(text: str, default_altitude_m: float):
@@ -6149,8 +7817,13 @@ with st.sidebar:
 
     dt = st.select_slider(
         "Dynamics step Δt (s)",
-        options=[0.02, 0.05, 0.1, 0.2],
-        value=0.05,
+        options=[0.02, 0.05],
+        value=0.02,
+        help=(
+            "v0.8 restricts the rigid-body solver to the timestep range "
+            "that passes the convergence checks. 0.10 s and 0.20 s were "
+            "removed after numerical divergence was demonstrated."
+        ),
     )
 
     capture_radius_m = st.slider(
@@ -6431,7 +8104,7 @@ with st.sidebar:
     )
 
     run_simulation = st.button(
-        "Run v0.7 Integrated Simulation",
+        "Run v0.8 Physics + V&V Simulation",
         type="primary",
         use_container_width=True,
     )
@@ -6439,12 +8112,12 @@ with st.sidebar:
 
 if not run_simulation:
     st.info(
-        "Configure the scenario and select **Run v0.7 Integrated Simulation**."
+        "Configure the scenario and select **Run v0.8 Physics + V&V Simulation**."
     )
 
     st.markdown(
         '''
-### v0.7 integrated simulation chain
+### v0.8 physics and V&V simulation chain
 
 ```text
 Mission / Waypoints
@@ -6501,10 +8174,11 @@ total_mass_kg = (
     + float(payload_g) / 1000.0
 )
 
-rho, rho_ratio = density_ratio(
+rho, local_temperature_c, pressure_pa = isa_atmosphere(
     initial_altitude_m,
     temperature_c,
 )
+rho_ratio = rho / RHO0
 
 wind_ms = wind_speed_kmh / 3.6
 wind_to_deg = (wind_from_deg + 180.0) % 360.0
@@ -6512,14 +8186,30 @@ wind_to_rad = math.radians(wind_to_deg)
 
 base_environment = EnvironmentState(
     rho_kgm3=rho,
-    temperature_c=temperature_c,
+    temperature_c=local_temperature_c,
+    sea_level_temp_c=temperature_c,
     wind_north_ms=wind_ms * math.cos(wind_to_rad),
     wind_east_ms=wind_ms * math.sin(wind_to_rad),
+)
+
+# Trim is solved at commanded true airspeed in still air. Wind is then added
+# to the initial inertial/body velocity so the starting air-relative velocity
+# remains equal to the commanded airspeed.
+trim_environment = EnvironmentState(
+    rho_kgm3=rho,
+    temperature_c=local_temperature_c,
+    sea_level_temp_c=temperature_c,
+    wind_north_ms=0.0,
+    wind_east_ms=0.0,
+    wind_down_ms=0.0,
 )
 
 dyn_params = build_dynamics_params(
     profile,
     total_mass_kg,
+)
+dyn_params.drag_multiplier = float(
+    stealth_drag_factor
 )
 
 
@@ -6533,8 +8223,8 @@ def power_model(speed_ms: float):
         profile=profile,
         total_mass_kg=total_mass_kg,
         speed_ms=max(1.0, speed_ms),
-        rho=rho,
-        rho_ratio=rho_ratio,
+        rho=max(0.2, rho),
+        rho_ratio=max(0.1, rho_ratio),
         wind_kmh=wind_speed_kmh,
         gustiness=gustiness_index,
         terrain_factor=1.0,
@@ -6545,17 +8235,39 @@ def power_model(speed_ms: float):
 
 speed_cmd_ms = commanded_speed_kmh / 3.6
 
-trim_alpha = (
-    estimate_trim_alpha_deg(
+trim_solution = (
+    solve_fixedwing_trim(
         dyn_params,
-        rho,
+        environment_at_altitude(
+            trim_environment,
+            initial_altitude_m,
+        ),
         speed_cmd_ms,
     )
     if profile["type"] == "fixed"
-    else 0.0
+    else {
+        "converged": True,
+        "alpha_deg": 0.0,
+        "pitch_deg": 0.0,
+        "elevator": 0.0,
+        "throttle": 0.46,
+        "residual_norm": 0.0,
+        "iterations": 0,
+    }
 )
 
-trim_pitch = trim_alpha if profile["type"] == "fixed" else 0.0
+trim_alpha = float(
+    trim_solution["alpha_deg"]
+)
+trim_pitch = float(
+    trim_solution["pitch_deg"]
+)
+trim_elevator = float(
+    trim_solution["elevator"]
+)
+trim_throttle = float(
+    trim_solution["throttle"]
+)
 
 battery_capacity_factor = (
     battery_temp_capacity_factor(
@@ -6655,17 +8367,84 @@ engine = DigitalTwinEngine(
     initial_pitch_deg=trim_pitch,
     initial_alpha_deg=trim_alpha,
     battery_twin=battery_twin,
+    initial_fuel_l=profile.get(
+        "fuel_tank_l",
+        0.0,
+    ),
 )
+
+if profile["type"] == "fixed":
+    initial_r_bn = rotation_body_to_ned(
+        state_quaternion(
+            engine.state
+        )
+    )
+    initial_wind_ned = np.array(
+        [
+            base_environment.wind_north_ms,
+            base_environment.wind_east_ms,
+            base_environment.wind_down_ms,
+        ],
+        dtype=float,
+    )
+    initial_wind_body = (
+        initial_r_bn.T
+        @ initial_wind_ned
+    )
+
+    engine.state.u_ms += float(
+        initial_wind_body[0]
+    )
+    engine.state.v_ms += float(
+        initial_wind_body[1]
+    )
+    engine.state.w_ms += float(
+        initial_wind_body[2]
+    )
+
+    initial_ground_ned = (
+        initial_r_bn
+        @ np.array(
+            [
+                engine.state.u_ms,
+                engine.state.v_ms,
+                engine.state.w_ms,
+            ],
+            dtype=float,
+        )
+    )
+    engine.state.velocity_north_ms = float(
+        initial_ground_ned[0]
+    )
+    engine.state.velocity_east_ms = float(
+        initial_ground_ned[1]
+    )
+    engine.state.velocity_down_ms = float(
+        initial_ground_ned[2]
+    )
+    engine.state.ground_speed_ms = math.hypot(
+        engine.state.velocity_north_ms,
+        engine.state.velocity_east_ms,
+    )
+    engine.state.vertical_speed_ms = (
+        -engine.state.velocity_down_ms
+    )
+    engine.state.airspeed_ms = float(
+        speed_cmd_ms
+    )
 
 autopilot = Autopilot(
     dyn_params,
     trim_pitch_deg=trim_pitch,
+    trim_elevator=trim_elevator,
+    trim_throttle=trim_throttle,
 )
 
-# Initialize the physical elevator actuator at the calculated trim position
-# to avoid an artificial first-second pitch transient.
+# Initialize physical actuators at the nonlinear trim point to avoid an
+# artificial first-second transient.
 if profile["type"] == "fixed":
     engine.actuators.elevator.value = autopilot.trim_elevator
+    engine.actuators.throttle.value = autopilot.trim_throttle
 
 envelope = EnvelopeProtection(
     dyn_params,
@@ -6680,8 +8459,35 @@ turbulence = DrydenStyleTurbulence(
 
 sensors = SensorSuite(seed=int(sensor_seed))
 
+attitude_estimator = AttitudeEstimator(
+    initial_roll_deg=0.0,
+    initial_pitch_deg=trim_pitch,
+    initial_yaw_deg=0.0,
+)
+
 ekf = BiasAwareNavigationEKF(
     initial_altitude_m=initial_altitude_m,
+    initial_vn_ms=(
+        engine.state.velocity_north_ms
+        if profile["type"] == "fixed"
+        else 0.0
+    ),
+    initial_ve_ms=(
+        engine.state.velocity_east_ms
+        if profile["type"] == "fixed"
+        else 0.0
+    ),
+    initial_vh_ms=(
+        engine.state.vertical_speed_ms
+        if profile["type"] == "fixed"
+        else 0.0
+    ),
+)
+
+# Guidance/control starts from the best onboard estimate available, then is
+# updated from sensor/EKF outputs after each propagation step.
+control_state = copy.copy(
+    engine.state
 )
 
 max_steps = int(
@@ -6704,9 +8510,9 @@ for _ in range(max_steps):
         altitude_cmd,
         mission_complete,
     ) = waypoint_command(
-        s.north_m,
-        s.east_m,
-        s.altitude_m,
+        control_state.north_m,
+        control_state.east_m,
+        control_state.altitude_m,
         waypoints,
         s.active_waypoint,
         capture_radius_m,
@@ -6716,7 +8522,7 @@ for _ in range(max_steps):
     s.distance_to_waypoint_m = wp_distance
 
     raw_command = autopilot.command(
-        state=s,
+        state=control_state,
         heading_cmd_deg=heading_cmd,
         altitude_cmd_m=altitude_cmd,
         speed_cmd_ms=speed_cmd_ms,
@@ -6725,7 +8531,7 @@ for _ in range(max_steps):
 
     if envelope_enabled:
         protected_command, status = envelope.apply(
-            s,
+            control_state,
             raw_command,
         )
     else:
@@ -6769,12 +8575,31 @@ for _ in range(max_steps):
     truth.stall_warning = status.stall_warning
     truth.alpha_margin_deg = status.alpha_margin_deg
 
-    packet = sensors.measure(truth, faults)
+    packet = sensors.measure(
+        truth,
+        faults,
+        dyn_params,
+    )
+
+    attitude_estimator.update(
+        packet,
+        dt,
+    )
+
+    (
+        accel_n_est,
+        accel_e_est,
+        accel_up_est,
+    ) = nav_acceleration_from_specific_force(
+        packet,
+        attitude_estimator,
+    )
 
     ekf.predict(
         dt=dt,
-        accel_n_ms2=packet.imu_ax_ms2,
-        accel_e_ms2=packet.imu_ay_ms2,
+        accel_n_ms2=accel_n_est,
+        accel_e_ms2=accel_e_est,
+        accel_up_ms2=accel_up_est,
     )
 
     if packet.gps_valid:
@@ -6785,12 +8610,38 @@ for _ in range(max_steps):
             packet.gps_vn_ms,
             packet.gps_ve_ms,
         )
+    else:
+        _, _, estimated_yaw_deg = (
+            attitude_estimator.euler_deg()
+        )
+        ekf.update_airspeed_heading(
+            packet.airspeed_ms,
+            estimated_yaw_deg,
+            sigma_ms=max(
+                3.0,
+                wind_speed_kmh / 3.6 + 1.5,
+            ),
+        )
 
     ekf.update_baro(packet.baro_altitude_m)
+
+    control_state = build_estimated_control_state(
+        truth,
+        ekf,
+        attitude_estimator,
+        packet,
+    )
 
     row = truth.dictionary().copy()
     row.update(packet.dictionary())
     row.update(ekf.state_dict())
+    row.update(
+        attitude_estimator.state_dict()
+    )
+    row["imu_nav_accel_n_ms2"] = accel_n_est
+    row["imu_nav_accel_e_ms2"] = accel_e_est
+    row["imu_nav_accel_up_ms2"] = accel_up_est
+    row["control_state_source"] = "EKF + IMU attitude estimate"
 
     if battery_twin is not None:
         row.update(
@@ -6824,7 +8675,17 @@ for _ in range(max_steps):
 
     history.append(row)
 
-    if truth.battery_soc <= 0.001:
+    if (
+        profile.get("power_system") == "ICE"
+        and truth.fuel_l <= 1e-6
+    ):
+        energy_exhausted = True
+        break
+
+    if (
+        profile.get("power_system") == "Battery"
+        and truth.battery_soc <= 0.001
+    ):
         energy_exhausted = True
         break
 
@@ -6885,6 +8746,12 @@ protection_pct = (
 max_abs_alpha = float(
     telemetry["angle_of_attack_deg"].abs().max()
 )
+max_attitude_tilt_deg = float(
+    np.sqrt(
+        telemetry["roll_deg"]**2
+        + telemetry["pitch_deg"]**2
+    ).max()
+)
 
 gust_magnitude = np.sqrt(
     telemetry["gust_north_ms"]**2
@@ -6892,6 +8759,26 @@ gust_magnitude = np.sqrt(
     + telemetry["gust_down_ms"]**2
 )
 max_gust = float(gust_magnitude.max())
+
+convergence_result = quick_timestep_convergence_check(
+    dyn_params,
+    environment_at_altitude(
+        trim_environment,
+        initial_altitude_m,
+    ),
+    trim_solution,
+    speed_cmd_ms,
+)
+
+vv_report = build_vv_report(
+    telemetry=telemetry,
+    trim_solution=trim_solution,
+    dt=dt,
+    profile=profile,
+    params=dyn_params,
+    battery_twin=battery_twin,
+    convergence_result=convergence_result,
+)
 
 
 cols = st.columns(8)
@@ -6904,13 +8791,16 @@ cols[1].metric(
     (
         "Battery Remaining"
         if profile.get("power_system") == "Battery"
-        else "Energy Reserve"
+        else "Fuel Remaining"
     ),
     (
         f"{float(final['battery_wh']):.0f} Wh "
         f"({final['battery_soc']*100:.1f}%)"
         if profile.get("power_system") == "Battery"
-        else f"{final['battery_soc']*100:.1f}%"
+        else (
+            f"{float(final['fuel_l']):.1f} L "
+            f"({final['battery_soc']*100:.1f}%)"
+        )
     ),
 )
 cols[2].metric(
@@ -6926,8 +8816,16 @@ cols[4].metric(
     f"{rms_position_error:.2f} m",
 )
 cols[5].metric(
-    "Max |AoA|",
-    f"{max_abs_alpha:.1f}°",
+    (
+        "Max |AoA|"
+        if profile.get("type") == "fixed"
+        else "Max Attitude Tilt"
+    ),
+    (
+        f"{max_abs_alpha:.1f}°"
+        if profile.get("type") == "fixed"
+        else f"{max_attitude_tilt_deg:.1f}°"
+    ),
 )
 cols[6].metric(
     "Max Gust",
@@ -6944,7 +8842,7 @@ elif ground_contact:
     st.error("Simulation terminated at ground contact.")
 elif energy_exhausted:
     st.error(
-        "Simulation stopped because battery energy was exhausted."
+        "Simulation stopped because the propulsion energy reserve was exhausted."
     )
 else:
     st.warning(
@@ -6952,13 +8850,71 @@ else:
     )
 
 
+st.header("Physics Verification & Validation")
+
+vv_df = pd.DataFrame(vv_report)
+
+pass_count = int(
+    (vv_df["Status"] == "PASS").sum()
+)
+total_vv = len(vv_df)
+
+vv_cols = st.columns(4)
+vv_cols[0].metric(
+    "Checks Passed",
+    f"{pass_count}/{total_vv}",
+)
+vv_cols[1].metric(
+    "Trim Residual",
+    (
+        f"{float(trim_solution.get('residual_norm', 0.0)):.4f}"
+        if profile.get("type") == "fixed"
+        else "N/A"
+    ),
+)
+vv_cols[2].metric(
+    "RK4 Δt",
+    f"{dt:.3f} s",
+)
+vv_cols[3].metric(
+    "Aero Model",
+    "Generic / Unvalidated",
+)
+
+if pass_count == total_vv:
+    st.success(
+        "All automated internal physics/V&V checks passed for this run."
+    )
+else:
+    st.warning(
+        "One or more V&V checks require review. See the table below."
+    )
+
+st.dataframe(
+    vv_df,
+    use_container_width=True,
+    hide_index=True,
+)
+
+st.caption(
+    "These checks verify numerical behavior and internal consistency. "
+    "They do not validate a named UAV against manufacturer flight-test data."
+)
+
 # ------------------------------------------------------------------
 # Preserved baseline: AI / IR Detectability
 # ------------------------------------------------------------------
+final_ambient_temperature_c = float(
+    final.get(
+        "ambient_temperature_c",
+        temperature_c,
+    )
+)
+
 thermal_delta_t_c = max(
     0.0,
-    float(final["motor_temp_c"]) - float(temperature_c),
-    float(final["battery_temp_c"]) - float(temperature_c),
+    float(final["motor_temp_c"]) - final_ambient_temperature_c,
+    float(final["battery_temp_c"]) - final_ambient_temperature_c,
 )
 
 detectability = compute_detectability_scores_v3(
@@ -7229,22 +9185,30 @@ if profile.get("power_system") == "Battery":
         * 100.0
     )
 
-    capacity_fig = px.line(
-        battery_plot_df,
-        x="time_s",
-        y="battery_wh",
-        title="Battery Capacity Depletion (Wh)",
+    battery_capacity_chart = (
+        battery_plot_df[
+            [
+                "time_s",
+                "battery_wh",
+            ]
+        ].copy()
     )
 
-    capacity_fig.add_hline(
-        y=reserve_floor_wh,
-        line_dash="dash",
-        annotation_text="10% reserve",
-    )
+    battery_capacity_chart[
+        "reserve_floor_wh"
+    ] = reserve_floor_wh
 
-    st.plotly_chart(
-        capacity_fig,
-        use_container_width=True,
+    render_mobile_timeseries(
+        battery_capacity_chart,
+        x_col="time_s",
+        series_map={
+            "battery_wh": "Remaining energy (Wh)",
+            "reserve_floor_wh": (
+                f"{reserve_fraction * 100:.0f}% reserve floor (Wh)"
+            ),
+        },
+        title="Battery Capacity Depletion",
+        unit_label="Energy in watt-hours (Wh)",
     )
 
     if battery_twin is not None:
@@ -7346,101 +9310,133 @@ if profile.get("power_system") == "Battery":
             f"{float(final['battery_twin_equivalent_full_cycles']):.4f}",
         )
 
-        bt1, bt2 = st.columns(2)
+        st.subheader(
+            "Battery Digital Twin Trends"
+        )
 
-        with bt1:
-            voltage_fig = px.line(
-                telemetry,
-                x="time_s",
-                y=[
-                    "battery_twin_ocv_v",
-                    "battery_twin_terminal_voltage_v",
-                ],
-                title="Battery Voltage Sag",
-            )
-            st.plotly_chart(
-                voltage_fig,
-                use_container_width=True,
-            )
+        st.caption(
+            "These battery plots use Streamlit's native chart renderer for "
+            "reliable iPhone/iPad display. Each graph uses a single compatible "
+            "engineering unit."
+        )
 
-        with bt2:
-            current_fig = px.line(
-                telemetry,
-                x="time_s",
-                y=[
-                    "battery_twin_current_a",
-                    "battery_twin_c_rate",
-                ],
-                title="Battery Current / C-rate",
-            )
-            st.plotly_chart(
-                current_fig,
-                use_container_width=True,
-            )
+        render_mobile_timeseries(
+            telemetry,
+            x_col="time_s",
+            series_map={
+                "battery_twin_ocv_v": "Open-circuit voltage",
+                "battery_twin_terminal_voltage_v": "Terminal voltage",
+            },
+            title="Battery Voltage Sag",
+            unit_label="Voltage (V)",
+        )
 
-        bt3, bt4 = st.columns(2)
+        render_mobile_timeseries(
+            telemetry,
+            x_col="time_s",
+            series_map={
+                "battery_twin_current_a": "Pack current",
+            },
+            title="Battery Current",
+            unit_label="Current (A)",
+        )
 
-        with bt3:
-            battery_state_plot = telemetry.copy()
-            battery_state_plot[
-                "battery_twin_soc_pct"
-            ] = (
+        render_mobile_timeseries(
+            telemetry,
+            x_col="time_s",
+            series_map={
+                "battery_twin_c_rate": "C-rate",
+            },
+            title="Battery C-rate",
+            unit_label="Discharge rate (C)",
+        )
+
+        battery_state_plot = telemetry.copy()
+        battery_state_plot[
+            "battery_twin_soc_pct"
+        ] = (
+            pd.to_numeric(
                 battery_state_plot[
                     "battery_twin_soc"
-                ]
-                * 100.0
+                ],
+                errors="coerce",
             )
-            battery_state_plot[
-                "battery_twin_soh_pct"
-            ] = (
+            * 100.0
+        )
+        battery_state_plot[
+            "battery_twin_soh_pct"
+        ] = (
+            pd.to_numeric(
                 battery_state_plot[
                     "battery_twin_soh"
-                ]
-                * 100.0
-            )
-
-            state_fig = px.line(
-                battery_state_plot,
-                x="time_s",
-                y=[
-                    "battery_twin_soc_pct",
-                    "battery_twin_soh_pct",
                 ],
-                title="Battery SOC / SOH",
+                errors="coerce",
             )
-            st.plotly_chart(
-                state_fig,
-                use_container_width=True,
-            )
-
-        with bt4:
-            thermal_fig = px.line(
-                telemetry,
-                x="time_s",
-                y=[
-                    "battery_twin_temperature_c",
-                    "battery_twin_heat_generation_w",
-                ],
-                title="Battery Thermal State",
-            )
-            st.plotly_chart(
-                thermal_fig,
-                use_container_width=True,
-            )
-
-        power_fig = px.line(
-            telemetry,
-            x="time_s",
-            y=[
-                "battery_twin_demanded_power_w",
-                "battery_twin_delivered_power_w",
-                "battery_twin_power_limit_w",
-            ],
-            title="Battery Power Demand / Delivered / Limit",
+            * 100.0
         )
-        st.plotly_chart(
-            power_fig,
-            use_container_width=True,
+
+        render_mobile_timeseries(
+            battery_state_plot,
+            x_col="time_s",
+            series_map={
+                "battery_twin_soc_pct": "State of charge",
+                "battery_twin_soh_pct": "State of health",
+            },
+            title="Battery SOC / SOH",
+            unit_label="Percent (%)",
+        )
+
+        render_mobile_timeseries(
+            telemetry,
+            x_col="time_s",
+            series_map={
+                "battery_twin_temperature_c": "Battery temperature",
+            },
+            title="Battery Temperature",
+            unit_label="Temperature (°C)",
+        )
+
+        render_mobile_timeseries(
+            telemetry,
+            x_col="time_s",
+            series_map={
+                "battery_twin_heat_generation_w": "Battery heat generation",
+            },
+            title="Battery Heat Generation",
+            unit_label="Heat generation (W)",
+        )
+
+        render_mobile_timeseries(
+            telemetry,
+            x_col="time_s",
+            series_map={
+                "battery_twin_demanded_power_w": "Demanded power",
+                "battery_twin_delivered_power_w": "Delivered power",
+                "battery_twin_power_limit_w": "Available power limit",
+            },
+            title="Battery Power Availability",
+            unit_label="Electrical power (W)",
+        )
+
+        render_mobile_timeseries(
+            telemetry,
+            x_col="time_s",
+            series_map={
+                "battery_twin_min_cell_voltage_v": "Minimum cell voltage",
+                "battery_twin_max_cell_voltage_v": "Maximum cell voltage",
+            },
+            title="Cell Voltage Envelope",
+            unit_label="Cell voltage (V)",
+        )
+
+        render_mobile_timeseries(
+            telemetry,
+            x_col="time_s",
+            series_map={
+                "battery_twin_internal_resistance_ohm": "Internal resistance",
+            },
+            title="Battery Internal Resistance",
+            unit_label="Resistance (Ω)",
         )
 
 else:
@@ -7952,41 +9948,80 @@ else:
 
 st.header("Power / Thermal")
 
-p1, p2 = st.columns(2)
-
-with p1:
-    power_df = telemetry.copy()
-    power_df["battery_soc_pct"] = (
-        power_df["battery_soc"] * 100.0
-    )
-    fig_power = px.line(
-        power_df,
-        x="time_s",
-        y=[
-            "power_draw_w",
-            "battery_soc_pct",
-        ],
-        title="Power and Battery",
-    )
-    st.plotly_chart(
-        fig_power,
-        use_container_width=True,
-    )
-
-with p2:
-    fig_temp = px.line(
+if profile.get("power_system") == "Battery":
+    render_mobile_timeseries(
         telemetry,
-        x="time_s",
-        y=[
-            "motor_temp_c",
-            "battery_temp_c",
-        ],
-        title="Thermal State",
+        x_col="time_s",
+        series_map={
+            "power_draw_w": "Total electrical draw",
+        },
+        title="Aircraft Electrical Power",
+        unit_label="Power (W)",
     )
-    st.plotly_chart(
-        fig_temp,
-        use_container_width=True,
+
+    power_battery_df = telemetry.copy()
+    power_battery_df[
+        "battery_soc_pct"
+    ] = (
+        pd.to_numeric(
+            power_battery_df[
+                "battery_soc"
+            ],
+            errors="coerce",
+        )
+        * 100.0
     )
+
+    render_mobile_timeseries(
+        power_battery_df,
+        x_col="time_s",
+        series_map={
+            "battery_soc_pct": "Battery SOC",
+        },
+        title="Aircraft Battery SOC",
+        unit_label="State of charge (%)",
+    )
+
+    render_mobile_timeseries(
+        telemetry,
+        x_col="time_s",
+        series_map={
+            "motor_temp_c": "Motor temperature",
+            "battery_temp_c": "Battery temperature",
+        },
+        title="Propulsion / Battery Temperature",
+        unit_label="Temperature (°C)",
+    )
+else:
+    p1, p2 = st.columns(2)
+
+    with p1:
+        fig_power = px.line(
+            telemetry,
+            x="time_s",
+            y=[
+                "power_draw_w",
+            ],
+            title="Propulsion Power",
+        )
+        st.plotly_chart(
+            fig_power,
+            use_container_width=True,
+        )
+
+    with p2:
+        fig_temp = px.line(
+            telemetry,
+            x="time_s",
+            y=[
+                "motor_temp_c",
+            ],
+            title="Propulsion Thermal State",
+        )
+        st.plotly_chart(
+            fig_temp,
+            use_container_width=True,
+        )
 
 
 st.header("Current Replay State")
@@ -8031,14 +10066,14 @@ rc[7].metric(
 st.header("Exports")
 
 st.download_button(
-    "Download v0.7 Flight Telemetry CSV",
+    "Download v0.8 Flight Telemetry CSV",
     data=telemetry.to_csv(index=False).encode("utf-8"),
-    file_name="uav_battery_estimator_v0_7_telemetry.csv",
+    file_name="uav_battery_estimator_v0_8_telemetry.csv",
     mime="text/csv",
 )
 
 scenario = {
-    "version": "0.7",
+    "version": "0.8",
     "aircraft": aircraft_name,
     "profile": profile,
     "dynamics": dyn_params.__dict__,
@@ -8125,12 +10160,33 @@ scenario = {
         ),
     },
     "faults": faults.__dict__,
+    "physics_vv": {
+        "checks": vv_report,
+        "convergence": convergence_result,
+        "trim_solution": trim_solution,
+        "aero_model_quality": dyn_params.model_quality,
+    },
     "metrics": {
         "gps_availability_pct": gps_availability,
         "rms_position_error_m": rms_position_error,
         "max_position_error_m": max_position_error,
-        "max_abs_alpha_deg": max_abs_alpha,
+        "max_abs_alpha_deg": (
+            max_abs_alpha
+            if profile.get("type") == "fixed"
+            else None
+        ),
+        "max_attitude_tilt_deg": max_attitude_tilt_deg,
         "max_gust_ms": max_gust,
+        "final_fuel_l": (
+            float(final["fuel_l"])
+            if profile.get("power_system") == "ICE"
+            else None
+        ),
+        "final_fuel_burn_lph": (
+            float(final["fuel_burn_lph"])
+            if profile.get("power_system") == "ICE"
+            else None
+        ),
         "thermal_delta_t_c": thermal_delta_t_c,
         "visual_detectability_score_0_100": visual_score,
         "thermal_detectability_score_0_100": thermal_score,
@@ -8219,12 +10275,12 @@ if swarm_result is not None:
     }
 
 st.download_button(
-    "Download v0.7 Scenario JSON",
+    "Download v0.8 Scenario JSON",
     data=json.dumps(
         scenario,
         indent=2,
     ),
-    file_name="uav_battery_estimator_v0_7_scenario.json",
+    file_name="uav_battery_estimator_v0_8_scenario.json",
     mime="application/json",
 )
 
@@ -8240,24 +10296,33 @@ with st.expander(
 **Power system:** {profile.get("power_system", "—")}  
 **Mass:** {total_mass_kg:.3f} kg  
 **Dynamics step:** {dt:.3f} s  
-**Attitude propagation:** quaternion  
-**Battery model:** {'1-RC Thevenin digital twin' if battery_twin is not None else 'baseline energy reservoir / ICE energy model'}  
+**Rigid-body integration:** fourth-order Runge-Kutta (RK4)  
+**Attitude propagation:** normalized quaternion inside the RK4 state  
+**Guidance/control state:** EKF navigation + IMU attitude estimate  
+**Atmosphere:** altitude-updated ISA-style density/temperature  
+**Propulsion:** shaft-power-coupled fixed-wing thrust / rotor momentum approximation  
+**Battery model:** {'1-RC Thevenin digital twin' if battery_twin is not None else ('BSFC fuel propagation' if profile.get("power_system") == "ICE" else 'baseline battery reservoir')}  
 **Turbulence:** {turbulence_level}  
 **GPS availability:** {gps_availability:.1f}%  
 **RMS navigation error:** {rms_position_error:.2f} m  
-**Maximum |angle of attack|:** {max_abs_alpha:.1f}°  
+**Maximum fixed-wing |angle of attack|:** {f"{max_abs_alpha:.1f}°" if profile.get("type") == "fixed" else "N/A for rotorcraft"}  
+**Maximum attitude tilt:** {max_attitude_tilt_deg:.1f}°  
 **Envelope intervention:** {protection_pct:.1f}% of samples  
 **Telemetry samples:** {len(telemetry):,}
 
-v0.5 makes the quaternion the authoritative attitude state, inserts
-physical actuator dynamics between the autopilot and the aircraft,
-adds stochastic gusts, estimates selected sensor biases in the EKF,
-and introduces a supervisory flight-envelope layer.
+v0.8 closes several important physics loops: propulsion thrust is derived
+from available shaft power, the rigid-body state is propagated with RK4,
+fixed-wing initialization uses a nonlinear trim solution, atmospheric
+density is recomputed with altitude, accelerometers report body specific
+force, and waypoint guidance/autopilot logic uses estimated rather than
+truth navigation state.
 
-The aerodynamic coefficient tables are still generic. For higher
-fidelity, replace them with validated aircraft-specific coefficient
-surfaces across angle of attack, sideslip, control deflection,
-Reynolds number, and propulsion state.
+The aerodynamic coefficient tables, inertias, and stability/control
+derivatives remain generic and unvalidated. Named aircraft are therefore
+engineering configuration proxies rather than manufacturer-validated
+flight-dynamics models. Higher fidelity requires aircraft-specific
+coefficient surfaces, propulsion maps, inertial properties, control-system
+identification, and flight-test calibration.
 '''
     )
 
