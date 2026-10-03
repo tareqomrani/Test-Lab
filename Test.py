@@ -1,9 +1,9 @@
-# UAV Flight Lab v0.5 - Standalone Streamlit App
+# UAV Battery Efficiency Estimator - Standalone v0.5 Expansion
 # Single-file deployment build
 # Built by Tareq Omrani
 #
 # Paste directly into your GitHub repository as app.py.
-# No local project folders are required.
+# No local package folders are required.
 #
 # requirements.txt:
 # streamlit>=1.40,<2
@@ -23,89 +23,251 @@ from typing import Dict, Any
 UAV_PROFILES: Dict[str, Dict[str, Any]] = {
     "Generic Quad": {
         "type": "rotor",
+        "power_system": "Battery",
         "base_weight_kg": 1.2,
         "max_payload_g": 800,
-        "power_system": "Battery",
-        "draw_watt": 150.0,
         "battery_wh": 60.0,
+        "draw_watt": 150.0,
+        "hover_power_W_ref": 150.0,
         "rotor_WL_proxy": 45.0,
+        "parasitic_area_m2": 0.025,
+        "cd_body": 1.0,
+        "surface_area_m2": 0.20,
+        "ai_capabilities": "Basic flight stabilization, waypoint navigation",
     },
     "DJI Phantom": {
         "type": "rotor",
+        "power_system": "Battery",
         "base_weight_kg": 1.4,
         "max_payload_g": 500,
-        "power_system": "Battery",
-        "draw_watt": 120.0,
         "battery_wh": 68.0,
+        "draw_watt": 140.0,
+        "hover_power_W_ref": 140.0,
         "rotor_WL_proxy": 50.0,
+        "parasitic_area_m2": 0.024,
+        "cd_body": 1.0,
+        "surface_area_m2": 0.22,
+        "ai_capabilities": "Visual object tracking, return-to-home, autonomous mapping",
     },
     "Skydio 2+": {
         "type": "rotor",
+        "power_system": "Battery",
         "base_weight_kg": 0.8,
         "max_payload_g": 150,
-        "power_system": "Battery",
-        "draw_watt": 90.0,
         "battery_wh": 45.0,
+        "draw_watt": 95.0,
+        "hover_power_W_ref": 95.0,
         "rotor_WL_proxy": 40.0,
+        "parasitic_area_m2": 0.018,
+        "cd_body": 1.0,
+        "surface_area_m2": 0.15,
+        "ai_capabilities": "Full obstacle avoidance, visual SLAM, autonomous following",
     },
     "Freefly Alta 8": {
         "type": "rotor",
+        "power_system": "Battery",
         "base_weight_kg": 6.2,
         "max_payload_g": 9000,
-        "power_system": "Battery",
-        "draw_watt": 400.0,
         "battery_wh": 710.0,
+        "draw_watt": 900.0,
+        "hover_power_W_ref": 900.0,
         "rotor_WL_proxy": 60.0,
+        "parasitic_area_m2": 0.08,
+        "cd_body": 1.1,
+        "surface_area_m2": 0.60,
+        "ai_capabilities": "Autonomous camera coordination, precision loitering",
+    },
+    "Teal 2 / Golden Eagle": {
+        "type": "rotor",
+        "power_system": "Battery",
+        "base_weight_kg": 1.25,
+        "max_payload_g": 300,
+        "battery_wh": 110.0,
+        "draw_watt": 180.0,
+        "hover_power_W_ref": 180.0,
+        "rotor_WL_proxy": 46.0,
+        "parasitic_area_m2": 0.020,
+        "cd_body": 1.0,
+        "surface_area_m2": 0.18,
+        "crash_risk": True,
+        "ai_capabilities": "AI-driven ISR, edge-based visual classification, GPS-denied flight",
     },
     "RQ-11 Raven": {
         "type": "fixed",
-        "base_weight_kg": 1.9,
-        "max_payload_g": 0,
         "power_system": "Battery",
+        "base_weight_kg": 1.9,
+        "max_payload_g": 300,
+        "battery_wh": 120.0,
         "draw_watt": 90.0,
-        "battery_wh": 400.0,
         "wing_area_m2": 0.24,
         "wingspan_m": 1.4,
-        "cd0": 0.035,
-        "oswald_e": 0.75,
+        "cd0": 0.040,
+        "oswald_e": 0.78,
         "prop_eff": 0.72,
+        "hotel_W": 8.0,
+        "surface_area_m2": 0.22,
+        "cl_max": 1.3,
+        "ai_capabilities": "Auto-stabilized flight, limited route autonomy",
     },
     "RQ-20 Puma": {
         "type": "fixed",
+        "power_system": "Battery",
         "base_weight_kg": 6.3,
         "max_payload_g": 600,
-        "power_system": "Battery",
+        "battery_wh": 700.0,
         "draw_watt": 180.0,
-        "battery_wh": 600.0,
-        "wing_area_m2": 0.55,
-        "wingspan_m": 2.8,
-        "cd0": 0.040,
-        "oswald_e": 0.75,
-        "prop_eff": 0.72,
-    },
-    "Quantum Systems Vector": {
-        "type": "fixed",
-        "base_weight_kg": 2.3,
-        "max_payload_g": 1500,
-        "power_system": "Battery",
-        "draw_watt": 160.0,
-        "battery_wh": 150.0,
         "wing_area_m2": 0.55,
         "wingspan_m": 2.8,
         "cd0": 0.038,
         "oswald_e": 0.80,
+        "prop_eff": 0.75,
+        "hotel_W": 12.0,
+        "surface_area_m2": 0.45,
+        "cl_max": 1.4,
+        "ai_capabilities": "AI-enhanced ISR mission planning, autonomous loitering",
+    },
+    "Quantum Systems Vector": {
+        "type": "fixed",
+        "power_system": "Battery",
+        "base_weight_kg": 8.0,
+        "max_payload_g": 1500,
+        "battery_wh": 1200.0,
+        "draw_watt": 300.0,
+        "wing_area_m2": 0.90,
+        "wingspan_m": 2.8,
+        "cd0": 0.035,
+        "oswald_e": 0.82,
         "prop_eff": 0.78,
+        "hotel_W": 20.0,
+        "surface_area_m2": 0.55,
+        "cl_max": 1.5,
+        "ai_capabilities": "Modular AI sensor pods, onboard geospatial intelligence, autonomous route learning",
+    },
+    "Vector AI (Fixed-Wing)": {
+        "type": "fixed",
+        "power_system": "Battery",
+        "base_weight_kg": 8.0,
+        "max_payload_g": 1500,
+        "battery_wh": 1200.0,
+        "draw_watt": 300.0,
+        "wing_area_m2": 0.90,
+        "wingspan_m": 2.8,
+        "cd0": 0.035,
+        "oswald_e": 0.82,
+        "prop_eff": 0.78,
+        "hotel_W": 20.0,
+        "surface_area_m2": 0.55,
+        "cl_max": 1.5,
+        "ai_capabilities": "Modular AI sensor pods, onboard geospatial intelligence, autonomous route learning",
+    },
+    "Vector AI (Multicopter)": {
+        "type": "rotor",
+        "power_system": "Battery",
+        "base_weight_kg": 8.0,
+        "max_payload_g": 1500,
+        "battery_wh": 1200.0,
+        "draw_watt": 1200.0,
+        "hover_power_W_ref": 1200.0,
+        "rotor_WL_proxy": 65.0,
+        "parasitic_area_m2": 0.10,
+        "cd_body": 1.1,
+        "surface_area_m2": 0.60,
+        "ai_capabilities": "VTOL mode for launch/recovery and confined-area operations",
+    },
+    "MQ-1 Predator": {
+        "type": "fixed",
+        "power_system": "ICE",
+        "base_weight_kg": 512.0,
+        "max_payload_g": 204000,
+        "battery_wh": 150.0,
+        "draw_watt": 650.0,
+        "wing_area_m2": 11.5,
+        "wingspan_m": 14.8,
+        "cd0": 0.025,
+        "oswald_e": 0.80,
+        "prop_eff": 0.80,
+        "hotel_W": 400.0,
+        "surface_area_m2": 5.0,
+        "cl_max": 1.5,
+        "bsfc_gpkwh": 260.0,
+        "fuel_density_kgpl": 0.72,
+        "fuel_tank_l": 300.0,
+        "crash_risk": True,
+        "ai_capabilities": "Semi-autonomous surveillance, pattern-of-life analysis",
+    },
+    "MQ-9 Reaper": {
+        "type": "fixed",
+        "power_system": "ICE",
+        "base_weight_kg": 2223.0,
+        "max_payload_g": 1700000,
+        "battery_wh": 200.0,
+        "draw_watt": 800.0,
+        "wing_area_m2": 24.0,
+        "wingspan_m": 20.0,
+        "cd0": 0.030,
+        "oswald_e": 0.85,
+        "prop_eff": 0.82,
+        "hotel_W": 700.0,
+        "surface_area_m2": 8.0,
+        "cl_max": 1.6,
+        "bsfc_gpkwh": 330.0,
+        "fuel_density_kgpl": 0.80,
+        "fuel_tank_l": 900.0,
+        "crash_risk": True,
+        "ai_capabilities": "Real-time threat detection, sensor fusion, autonomous target tracking",
     },
     "Custom Build": {
         "type": "rotor",
+        "power_system": "Battery",
         "base_weight_kg": 2.0,
         "max_payload_g": 1500,
-        "power_system": "Battery",
-        "draw_watt": 180.0,
         "battery_wh": 150.0,
+        "draw_watt": 220.0,
+        "hover_power_W_ref": 220.0,
         "rotor_WL_proxy": 50.0,
+        "parasitic_area_m2": 0.03,
+        "cd_body": 1.0,
+        "surface_area_m2": 0.25,
+        "ai_capabilities": "User-defined platform with configurable components",
     },
 }
+
+MODEL_DEFAULT_SPEED_KMH = {
+    "Generic Quad": 25.0,
+    "DJI Phantom": 35.0,
+    "Skydio 2+": 30.0,
+    "Freefly Alta 8": 25.0,
+    "Teal 2 / Golden Eagle": 50.0,
+    "RQ-11 Raven": 45.0,
+    "RQ-20 Puma": 60.0,
+    "Quantum Systems Vector": 70.0,
+    "Vector AI (Fixed-Wing)": 70.0,
+    "Vector AI (Multicopter)": 30.0,
+    "MQ-1 Predator": 140.0,
+    "MQ-9 Reaper": 180.0,
+    "Custom Build": 30.0,
+}
+
+
+def effective_energy_capacity_wh(profile, user_battery_wh):
+    """
+    Battery aircraft use the selected pack capacity.
+
+    ICE aircraft use a fuel-equivalent shaft-energy reserve so the 6-DOF
+    simulator can propagate long-duration aircraft without treating a small
+    avionics battery as the propulsion source. This is a simulation bridge,
+    not a replacement for the original BSFC/fuel-burn endurance model.
+    """
+    if profile.get("power_system") == "Battery":
+        return max(1.0, float(user_battery_wh))
+
+    fuel_l = max(0.0, float(profile.get("fuel_tank_l", 0.0)))
+    density = max(0.1, float(profile.get("fuel_density_kgpl", 0.75)))
+    fuel_mass_kg = fuel_l * density
+
+    # Approximate chemical energy converted to useful shaft energy.
+    effective_wh = fuel_mass_kg * 12000.0 * 0.30
+    return max(100000.0, effective_wh)
 
 
 
@@ -2977,6 +3139,539 @@ def build_3d_figure(
 
 
 
+
+def _project_xyz(east, north, altitude, azimuth_deg=42.0, elevation_deg=24.0):
+    """
+    Orthographic pseudo-3D projection rendered with ordinary 2D Plotly traces.
+    This intentionally avoids WebGL so it works reliably in iOS embedded views.
+    """
+    az = np.radians(float(azimuth_deg))
+    el = np.radians(float(elevation_deg))
+
+    east = np.asarray(east, dtype=float)
+    north = np.asarray(north, dtype=float)
+    altitude = np.asarray(altitude, dtype=float)
+
+    horizontal_depth = (
+        np.sin(az) * east
+        + np.cos(az) * north
+    )
+
+    screen_x = (
+        np.cos(az) * east
+        - np.sin(az) * north
+    )
+
+    screen_y = (
+        np.cos(el) * altitude
+        + np.sin(el) * horizontal_depth
+    )
+
+    return screen_x, screen_y
+
+
+def build_mobile_safe_replay(
+    telemetry: pd.DataFrame,
+    waypoints,
+    frame_index: int,
+):
+    """
+    Mobile-safe projected flight replay.
+
+    Uses Plotly 2D SVG traces instead of Scatter3d/Surface WebGL traces.
+    """
+    frame_index = max(
+        0,
+        min(frame_index, len(telemetry) - 1),
+    )
+
+    hist = telemetry.iloc[: frame_index + 1]
+    current = telemetry.iloc[frame_index]
+
+    fig = go.Figure()
+
+    # Truth trajectory.
+    tx, ty = _project_xyz(
+        hist["east_m"].to_numpy(),
+        hist["north_m"].to_numpy(),
+        hist["altitude_m"].to_numpy(),
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=tx,
+            y=ty,
+            mode="lines",
+            name="Truth",
+            line=dict(
+                width=4,
+                color="#00ff66",
+            ),
+            customdata=np.column_stack([
+                hist["east_m"].to_numpy(),
+                hist["north_m"].to_numpy(),
+                hist["altitude_m"].to_numpy(),
+            ]),
+            hovertemplate=(
+                "Truth"
+                "<br>E %{customdata[0]:.1f} m"
+                "<br>N %{customdata[1]:.1f} m"
+                "<br>Alt %{customdata[2]:.1f} m"
+                "<extra></extra>"
+            ),
+        )
+    )
+
+    # EKF trajectory.
+    ex, ey = _project_xyz(
+        hist["est_east_m"].to_numpy(),
+        hist["est_north_m"].to_numpy(),
+        hist["est_altitude_m"].to_numpy(),
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=ex,
+            y=ey,
+            mode="lines",
+            name="EKF",
+            line=dict(
+                width=3,
+                dash="dash",
+                color="#4db8ff",
+            ),
+            customdata=np.column_stack([
+                hist["est_east_m"].to_numpy(),
+                hist["est_north_m"].to_numpy(),
+                hist["est_altitude_m"].to_numpy(),
+            ]),
+            hovertemplate=(
+                "EKF"
+                "<br>E %{customdata[0]:.1f} m"
+                "<br>N %{customdata[1]:.1f} m"
+                "<br>Alt %{customdata[2]:.1f} m"
+                "<extra></extra>"
+            ),
+        )
+    )
+
+    # Sparse GPS samples to avoid clutter on phones.
+    gps_hist = hist[hist["gps_valid"] == True]
+    if not gps_hist.empty:
+        stride = max(1, len(gps_hist) // 120)
+        gps_plot = gps_hist.iloc[::stride]
+
+        gx, gy = _project_xyz(
+            gps_plot["gps_east_m"].to_numpy(),
+            gps_plot["gps_north_m"].to_numpy(),
+            gps_plot["gps_altitude_m"].to_numpy(),
+        )
+
+        fig.add_trace(
+            go.Scatter(
+                x=gx,
+                y=gy,
+                mode="markers",
+                name="GPS",
+                marker=dict(
+                    size=4,
+                    color="#ffd34d",
+                    opacity=0.35,
+                ),
+                hoverinfo="skip",
+            )
+        )
+
+    # Waypoints.
+    if waypoints:
+        wp_n = np.array([w[0] for w in waypoints], dtype=float)
+        wp_e = np.array([w[1] for w in waypoints], dtype=float)
+        wp_a = np.array([w[2] for w in waypoints], dtype=float)
+
+        wx, wy = _project_xyz(
+            wp_e,
+            wp_n,
+            wp_a,
+        )
+
+        fig.add_trace(
+            go.Scatter(
+                x=wx,
+                y=wy,
+                mode="lines+markers+text",
+                name="Waypoints",
+                text=[
+                    f"WP-{i+1}"
+                    for i in range(len(waypoints))
+                ],
+                textposition="top center",
+                line=dict(
+                    width=2,
+                    dash="dot",
+                    color="#a0a0a0",
+                ),
+                marker=dict(
+                    size=7,
+                    color="#ffffff",
+                    symbol="circle-open",
+                ),
+                hovertemplate=(
+                    "%{text}"
+                    "<br>Projected mission point"
+                    "<extra></extra>"
+                ),
+            )
+        )
+
+    # Current aircraft.
+    ux, uy = _project_xyz(
+        [current["east_m"]],
+        [current["north_m"]],
+        [current["altitude_m"]],
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=ux,
+            y=uy,
+            mode="markers+text",
+            name="Aircraft",
+            text=["UAV"],
+            textposition="top center",
+            marker=dict(
+                size=14,
+                color="#ff5d5d",
+                symbol="diamond",
+                line=dict(
+                    width=1,
+                    color="#ffffff",
+                ),
+            ),
+            hovertemplate=(
+                f"UAV"
+                f"<br>t {float(current['time_s']):.1f} s"
+                f"<br>Alt {float(current['altitude_m']):.1f} m"
+                f"<br>Roll {float(current['roll_deg']):.1f}°"
+                f"<br>Pitch {float(current['pitch_deg']):.1f}°"
+                f"<br>Yaw {float(current['yaw_deg']):.1f}°"
+                "<extra></extra>"
+            ),
+        )
+    )
+
+    # Project current quaternion body axes.
+    axes = _attitude_axes(
+        current,
+        scale=max(
+            12.0,
+            min(
+                30.0,
+                0.06 * max(
+                    200.0,
+                    float(
+                        np.hypot(
+                            telemetry["east_m"],
+                            telemetry["north_m"],
+                        ).max()
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    axis_styles = [
+        ("Body X", "#ff6666"),
+        ("Body Y", "#66a3ff"),
+        ("Body Z", "#ffd966"),
+    ]
+
+    for vec, (label, color) in zip(
+        axes,
+        axis_styles,
+    ):
+        end_e = float(current["east_m"]) + float(vec[0])
+        end_n = float(current["north_m"]) + float(vec[1])
+        end_a = float(current["altitude_m"]) + float(vec[2])
+
+        ax, ay = _project_xyz(
+            [
+                float(current["east_m"]),
+                end_e,
+            ],
+            [
+                float(current["north_m"]),
+                end_n,
+            ],
+            [
+                float(current["altitude_m"]),
+                end_a,
+            ],
+        )
+
+        fig.add_trace(
+            go.Scatter(
+                x=ax,
+                y=ay,
+                mode="lines",
+                name=label,
+                line=dict(
+                    width=4,
+                    color=color,
+                ),
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        )
+
+    # Project a small ground-reference grid. 2D SVG, no WebGL.
+    east_extent = max(
+        150.0,
+        float(np.nanmax(np.abs(telemetry["east_m"]))) * 1.10,
+        max([abs(w[1]) for w in waypoints], default=0.0) * 1.10,
+    )
+    north_extent = max(
+        150.0,
+        float(np.nanmax(np.abs(telemetry["north_m"]))) * 1.10,
+        max([abs(w[0]) for w in waypoints], default=0.0) * 1.10,
+    )
+
+    for frac in np.linspace(-1.0, 1.0, 5):
+        # Constant east line.
+        e = np.array([frac * east_extent, frac * east_extent])
+        n = np.array([-north_extent, north_extent])
+        z = np.zeros(2)
+        px_, py_ = _project_xyz(e, n, z)
+
+        fig.add_trace(
+            go.Scatter(
+                x=px_,
+                y=py_,
+                mode="lines",
+                line=dict(
+                    width=1,
+                    color="rgba(140,160,150,0.20)",
+                ),
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        )
+
+        # Constant north line.
+        e = np.array([-east_extent, east_extent])
+        n = np.array([frac * north_extent, frac * north_extent])
+        px_, py_ = _project_xyz(e, n, z)
+
+        fig.add_trace(
+            go.Scatter(
+                x=px_,
+                y=py_,
+                mode="lines",
+                line=dict(
+                    width=1,
+                    color="rgba(140,160,150,0.20)",
+                ),
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        )
+
+    fig.update_layout(
+        height=560,
+        margin=dict(
+            l=8,
+            r=8,
+            t=15,
+            b=8,
+        ),
+        paper_bgcolor="#0e1117",
+        plot_bgcolor="#0e1117",
+        font=dict(
+            color="#f2f2f2",
+        ),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.01,
+            xanchor="left",
+            x=0.0,
+            font=dict(size=11),
+        ),
+        xaxis=dict(
+            title="Projected East / North",
+            showgrid=False,
+            zeroline=False,
+            scaleanchor="y",
+            scaleratio=1,
+        ),
+        yaxis=dict(
+            title="Projected altitude / depth",
+            showgrid=False,
+            zeroline=False,
+        ),
+        hovermode="closest",
+        uirevision="mobile-safe-flight-replay",
+    )
+
+    return fig
+
+
+def build_webgl_3d_figure_light(
+    telemetry: pd.DataFrame,
+    waypoints,
+    frame_index: int,
+):
+    """
+    Reduced-complexity desktop WebGL scene.
+
+    Deliberately omits the Surface ground plane and aggressively downsamples
+    GPS points because those are common WebGL stressors in mobile WebKit.
+    """
+    frame_index = max(
+        0,
+        min(frame_index, len(telemetry) - 1),
+    )
+
+    hist = telemetry.iloc[: frame_index + 1]
+    current = telemetry.iloc[frame_index]
+
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Scatter3d(
+            x=hist["east_m"],
+            y=hist["north_m"],
+            z=hist["altitude_m"],
+            mode="lines",
+            name="Truth",
+            line=dict(
+                width=6,
+                color="#00ff66",
+            ),
+        )
+    )
+
+    fig.add_trace(
+        go.Scatter3d(
+            x=hist["est_east_m"],
+            y=hist["est_north_m"],
+            z=hist["est_altitude_m"],
+            mode="lines",
+            name="EKF",
+            line=dict(
+                width=4,
+                dash="dash",
+                color="#4db8ff",
+            ),
+        )
+    )
+
+    gps_hist = hist[hist["gps_valid"] == True]
+    if not gps_hist.empty:
+        stride = max(1, len(gps_hist) // 150)
+        gps_plot = gps_hist.iloc[::stride]
+
+        fig.add_trace(
+            go.Scatter3d(
+                x=gps_plot["gps_east_m"],
+                y=gps_plot["gps_north_m"],
+                z=gps_plot["gps_altitude_m"],
+                mode="markers",
+                name="GPS",
+                marker=dict(
+                    size=2,
+                    color="#ffd34d",
+                    opacity=0.35,
+                ),
+            )
+        )
+
+    if waypoints:
+        fig.add_trace(
+            go.Scatter3d(
+                x=[w[1] for w in waypoints],
+                y=[w[0] for w in waypoints],
+                z=[w[2] for w in waypoints],
+                mode="lines+markers+text",
+                text=[
+                    f"WP-{i+1}"
+                    for i in range(len(waypoints))
+                ],
+                textposition="top center",
+                name="Waypoints",
+                marker=dict(
+                    size=4,
+                    color="#ffffff",
+                ),
+                line=dict(
+                    width=2,
+                    color="#b0b0b0",
+                ),
+            )
+        )
+
+    fig.add_trace(
+        go.Scatter3d(
+            x=[current["east_m"]],
+            y=[current["north_m"]],
+            z=[current["altitude_m"]],
+            mode="markers+text",
+            text=["UAV"],
+            textposition="top center",
+            name="Aircraft",
+            marker=dict(
+                size=7,
+                color="#ff5d5d",
+                symbol="diamond",
+            ),
+        )
+    )
+
+    fig.update_layout(
+        height=620,
+        margin=dict(
+            l=0,
+            r=0,
+            t=10,
+            b=0,
+        ),
+        paper_bgcolor="#0e1117",
+        font=dict(color="#f2f2f2"),
+        scene=dict(
+            bgcolor="#0e1117",
+            xaxis=dict(
+                title="East (m)",
+                backgroundcolor="#0e1117",
+                gridcolor="#303640",
+            ),
+            yaxis=dict(
+                title="North (m)",
+                backgroundcolor="#0e1117",
+                gridcolor="#303640",
+            ),
+            zaxis=dict(
+                title="Altitude (m)",
+                backgroundcolor="#0e1117",
+                gridcolor="#303640",
+            ),
+            aspectmode="data",
+            camera=dict(
+                eye=dict(
+                    x=1.45,
+                    y=1.45,
+                    z=0.95,
+                )
+            ),
+        ),
+        legend=dict(
+            orientation="h",
+            font=dict(size=11),
+        ),
+        uirevision="desktop-webgl-flight-replay",
+    )
+
+    return fig
+
+
 # ==============================================================================
 # STREAMLIT APPLICATION
 # ==============================================================================
@@ -2992,17 +3687,21 @@ import streamlit as st
 
 
 st.set_page_config(
-    page_title="UAV Flight Lab v0.5",
+    page_title="UAV Battery Efficiency Estimator",
     layout="wide",
 )
 
 st.markdown(
-    "<h1 style='color:#00FF00;'>UAV Flight Lab v0.5</h1>",
+    "<h1 style='color:#00FF00;'>UAV Battery Efficiency Estimator</h1>",
     unsafe_allow_html=True,
 )
 st.caption(
-    "Quaternion 6-DOF + Actuator Dynamics + Turbulence + "
-    "Envelope Protection + Bias-Aware EKF + HUD"
+    "Production build — first-order aerospace performance modeling, "
+    "digital twin simulation, sensor fusion, and mission planning"
+)
+st.caption(
+    "v0.5 Flight Simulator Expansion: quaternion 6-DOF, actuator dynamics, "
+    "turbulence, envelope protection, bias-aware EKF, HUD, and 3D replay"
 )
 
 
@@ -3055,18 +3754,33 @@ with st.sidebar:
         "Payload (g)",
         min_value=0,
         max_value=int(profile["max_payload_g"]),
-        value=min(
-            int(profile["max_payload_g"] * 0.20),
-            int(profile["max_payload_g"]),
-        ),
+        value=0,
         step=10,
+        key=f"payload_{aircraft_name}",
     )
 
-    battery_wh = st.number_input(
-        "Battery capacity (Wh)",
-        min_value=1.0,
-        value=float(profile.get("battery_wh", 100.0)),
-        step=5.0,
+    if profile.get("power_system") == "Battery":
+        battery_wh = st.number_input(
+            "Battery capacity (Wh)",
+            min_value=1.0,
+            value=max(1.0, float(profile.get("battery_wh", 100.0))),
+            step=5.0,
+            key=f"battery_{aircraft_name}",
+        )
+    else:
+        battery_wh = max(1.0, float(profile.get("battery_wh", 1.0)))
+        st.caption(
+            f"ICE propulsion | Fuel tank: {profile.get('fuel_tank_l', 0):,.0f} L | "
+            f"Auxiliary electrical reserve: {battery_wh:.0f} Wh"
+        )
+
+    st.caption(
+        f"Platform: {profile.get('power_system', '—')} {profile.get('type', '—')} | "
+        f"Base mass: {profile.get('base_weight_kg', 0):,.2f} kg | "
+        f"Max payload: {profile.get('max_payload_g', 0):,} g"
+    )
+    st.caption(
+        f"AI / autonomy: {profile.get('ai_capabilities', 'User-defined')}"
     )
 
     st.header("Flight Command")
@@ -3074,8 +3788,14 @@ with st.sidebar:
     commanded_speed_kmh = st.number_input(
         "Commanded airspeed (km/h)",
         min_value=7.2,
-        value=60.0 if profile["type"] == "fixed" else 25.0,
+        value=float(
+            MODEL_DEFAULT_SPEED_KMH.get(
+                aircraft_name,
+                60.0 if profile["type"] == "fixed" else 25.0,
+            )
+        ),
         step=1.0,
+        key=f"speed_{aircraft_name}",
     )
 
     initial_altitude_m = st.number_input(
@@ -3352,9 +4072,14 @@ trim_alpha = (
 
 trim_pitch = trim_alpha if profile["type"] == "fixed" else 0.0
 
+simulation_energy_wh = effective_energy_capacity_wh(
+    profile,
+    battery_wh,
+)
+
 engine = DigitalTwinEngine(
     params=dyn_params,
-    battery_capacity_wh=battery_wh,
+    battery_capacity_wh=simulation_energy_wh,
     power_model=power_model,
     initial_altitude_m=initial_altitude_m,
     initial_heading_deg=0.0,
@@ -3602,7 +4327,7 @@ cols[0].metric(
     f"{final['time_s']/60.0:.2f} min",
 )
 cols[1].metric(
-    "Battery",
+    "Energy Reserve",
     f"{final['battery_soc']*100:.1f}%",
 )
 cols[2].metric(
@@ -3684,13 +4409,51 @@ st.plotly_chart(
 
 st.header("3D Quaternion Flight Replay")
 
-st.plotly_chart(
-    build_3d_figure(
+current_3d = telemetry.iloc[frame_index]
+
+st.caption(
+    f"t={current_3d['time_s']:.1f} s  |  "
+    f"Roll {current_3d['roll_deg']:.1f}°  |  "
+    f"Pitch {current_3d['pitch_deg']:.1f}°  |  "
+    f"Heading {current_3d['yaw_deg']:.1f}°"
+)
+
+renderer_mode = st.radio(
+    "Replay renderer",
+    [
+        "Mobile-safe projected 3D",
+        "Full WebGL 3D",
+    ],
+    index=0,
+    horizontal=True,
+    help=(
+        "Mobile-safe mode uses ordinary 2D SVG rendering and works reliably "
+        "on iPhone/iPad embedded browsers. Full 3D uses WebGL and is better "
+        "suited to desktop browsers."
+    ),
+)
+
+if renderer_mode == "Mobile-safe projected 3D":
+    replay_figure = build_mobile_safe_replay(
         telemetry,
         waypoints,
         frame_index,
-    ),
+    )
+else:
+    replay_figure = build_webgl_3d_figure_light(
+        telemetry,
+        waypoints,
+        frame_index,
+    )
+
+st.plotly_chart(
+    replay_figure,
     use_container_width=True,
+    config={
+        "displaylogo": False,
+        "responsive": True,
+        "scrollZoom": False,
+    },
 )
 
 
@@ -4007,6 +4770,8 @@ scenario = {
     "dynamics": dyn_params.__dict__,
     "payload_g": payload_g,
     "battery_capacity_wh": battery_wh,
+    "simulation_energy_capacity_wh": simulation_energy_wh,
+    "power_system": profile.get("power_system"),
     "environment": {
         "temperature_c": temperature_c,
         "steady_wind_kmh": wind_speed_kmh,
@@ -4063,6 +4828,7 @@ with st.expander(
         f'''
 **Aircraft:** {aircraft_name}  
 **Vehicle type:** {dyn_params.vehicle_type}  
+**Power system:** {profile.get("power_system", "—")}  
 **Mass:** {total_mass_kg:.3f} kg  
 **Dynamics step:** {dt:.3f} s  
 **Attitude propagation:** quaternion  
@@ -4085,7 +4851,4 @@ Reynolds number, and propulsion state.
 '''
     )
 
-st.caption(
-    "UAV Flight Lab v0.5 | Flight Simulator Systems Build | "
-    "Built by Tareq Omrani"
-)
+st.caption("GPT-UAV Planner | Built by Tareq Omrani | 2025")
