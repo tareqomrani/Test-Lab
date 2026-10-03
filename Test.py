@@ -2230,6 +2230,947 @@ def derivatives(
 
 
 
+
+# ==============================================================================
+# battery/digital_twin.py
+# ==============================================================================
+@dataclass
+class BatteryTwinSnapshot:
+    soc: float
+    soh: float
+    nominal_capacity_wh: float
+    usable_capacity_wh: float
+    remaining_wh: float
+    nominal_voltage_v: float
+    open_circuit_voltage_v: float
+    terminal_voltage_v: float
+    current_a: float
+    c_rate: float
+    internal_resistance_ohm: float
+    polarization_voltage_v: float
+    demanded_power_w: float
+    delivered_power_w: float
+    power_limit_w: float
+    power_limited: bool
+    temperature_c: float
+    heat_generation_w: float
+    thermal_margin_c: float
+    voltage_margin_v: float
+    min_cell_voltage_v: float
+    max_cell_voltage_v: float
+    equivalent_full_cycles: float
+    reserve_soc: float
+    status: str
+
+
+class BatteryDigitalTwin:
+    """
+    First-order Thevenin battery digital twin.
+
+    State:
+        SOC, SOH, pack temperature, RC polarization voltage,
+        charge throughput, terminal voltage, current, and power margin.
+
+    The model is intentionally low-order and engineering-oriented. It is
+    designed for UAV mission simulation, not electrochemical certification.
+    """
+
+    def __init__(
+        self,
+        nominal_capacity_wh: float,
+        nominal_voltage_v: float,
+        initial_soc: float = 1.0,
+        initial_soh: float = 1.0,
+        initial_temperature_c: float = 25.0,
+        max_c_rate: float = 8.0,
+        internal_resistance_scale: float = 1.0,
+        cell_imbalance_mv: float = 0.0,
+        degraded_cell: bool = False,
+        reserve_soc: float = 0.10,
+        thermal_limit_c: float = 60.0,
+    ):
+        self.nominal_capacity_wh = max(
+            1.0,
+            float(nominal_capacity_wh),
+        )
+        self.nominal_voltage_v = max(
+            3.7,
+            float(nominal_voltage_v),
+        )
+        self.series_cells = max(
+            1,
+            int(round(
+                self.nominal_voltage_v / 3.7
+            )),
+        )
+
+        self.nominal_capacity_ah = max(
+            0.1,
+            self.nominal_capacity_wh
+            / self.nominal_voltage_v,
+        )
+
+        self.soc = max(
+            0.0,
+            min(1.0, float(initial_soc)),
+        )
+        self.initial_soh = max(
+            0.50,
+            min(1.0, float(initial_soh)),
+        )
+        self.soh = self.initial_soh
+
+        self.temperature_c = float(
+            initial_temperature_c
+        )
+        self.max_c_rate = max(
+            0.5,
+            float(max_c_rate),
+        )
+        self.internal_resistance_scale = max(
+            0.25,
+            float(internal_resistance_scale),
+        )
+        self.cell_imbalance_mv = max(
+            0.0,
+            float(cell_imbalance_mv),
+        )
+        self.degraded_cell = bool(
+            degraded_cell
+        )
+        self.reserve_soc = max(
+            0.0,
+            min(0.50, float(reserve_soc)),
+        )
+        self.thermal_limit_c = max(
+            40.0,
+            float(thermal_limit_c),
+        )
+
+        # Generic Li-ion/LiPo operating envelope.
+        self.min_cell_voltage_v = 3.20
+        self.max_cell_voltage_v = 4.20
+
+        # Reference series resistance scales mildly with pack voltage and Ah.
+        self.base_r0_ohm = max(
+            0.004,
+            min(
+                0.18,
+                0.018
+                * (
+                    self.nominal_voltage_v
+                    / 22.2
+                )
+                / max(
+                    0.45,
+                    math.sqrt(
+                        self.nominal_capacity_ah
+                        / 5.0
+                    ),
+                ),
+            ),
+        )
+
+        # First RC polarization branch.
+        self.polarization_voltage_v = 0.0
+        self.r1_ratio = 0.60
+        self.rc_time_constant_s = 18.0
+
+        # Lumped thermal network.
+        self.thermal_capacitance_j_per_k = max(
+            500.0,
+            10.0 * self.nominal_capacity_wh,
+        )
+        self.thermal_resistance_k_per_w = max(
+            0.08,
+            min(
+                1.20,
+                0.80
+                * (
+                    100.0
+                    / self.nominal_capacity_wh
+                ) ** 0.30,
+            ),
+        )
+
+        self.throughput_wh = 0.0
+        self.current_a = 0.0
+        self.c_rate = 0.0
+        self.demanded_power_w = 0.0
+        self.delivered_power_w = 0.0
+        self.power_limit_w = 0.0
+        self.power_limited = False
+        self.heat_generation_w = 0.0
+
+        self.open_circuit_voltage_v = (
+            self._open_circuit_voltage()
+        )
+        self.terminal_voltage_v = (
+            self.open_circuit_voltage_v
+        )
+
+        self.usable_capacity_wh = (
+            self._usable_capacity_wh()
+        )
+        self.initial_usable_capacity_wh = (
+            self.usable_capacity_wh
+        )
+        self.initial_energy_wh = (
+            self.usable_capacity_wh
+            * self.soc
+        )
+        self.remaining_wh = (
+            self.initial_energy_wh
+        )
+
+        self.min_cell_terminal_voltage_v = (
+            self.terminal_voltage_v
+            / self.series_cells
+        )
+        self.max_cell_terminal_voltage_v = (
+            self.min_cell_terminal_voltage_v
+        )
+        self.status = "NORMAL"
+
+    @staticmethod
+    def _temperature_capacity_factor(
+        temp_c: float,
+    ) -> float:
+        if temp_c <= -10:
+            return 0.65
+        if temp_c <= 0:
+            return 0.78
+        if temp_c <= 10:
+            return 0.88
+        if temp_c <= 30:
+            return 1.00
+        if temp_c <= 40:
+            return 0.96
+        return 0.92
+
+    def _usable_capacity_wh(self) -> float:
+        cell_factor = (
+            0.88
+            if self.degraded_cell
+            else 1.0
+        )
+        return max(
+            1.0,
+            self.nominal_capacity_wh
+            * self._temperature_capacity_factor(
+                self.temperature_c
+            )
+            * self.soh
+            * cell_factor,
+        )
+
+    def _open_circuit_voltage(self) -> float:
+        # Generic Li-ion/LiPo OCV-SOC curve.
+        soc_grid = np.array(
+            [
+                0.00,
+                0.03,
+                0.08,
+                0.15,
+                0.30,
+                0.50,
+                0.70,
+                0.85,
+                0.95,
+                1.00,
+            ],
+            dtype=float,
+        )
+        cell_v_grid = np.array(
+            [
+                3.00,
+                3.20,
+                3.40,
+                3.52,
+                3.66,
+                3.76,
+                3.86,
+                3.98,
+                4.12,
+                4.20,
+            ],
+            dtype=float,
+        )
+
+        cell_v = float(
+            np.interp(
+                self.soc,
+                soc_grid,
+                cell_v_grid,
+            )
+        )
+
+        return (
+            cell_v
+            * self.series_cells
+        )
+
+    def _effective_r0_ohm(self) -> float:
+        temp_delta = max(
+            0.0,
+            25.0 - self.temperature_c,
+        )
+        cold_multiplier = min(
+            2.8,
+            1.0 + 0.035 * temp_delta,
+        )
+
+        hot_multiplier = (
+            1.0
+            + 0.006
+            * max(
+                0.0,
+                self.temperature_c - 35.0,
+            )
+        )
+
+        soh_multiplier = (
+            1.0
+            + 1.8
+            * max(
+                0.0,
+                1.0 - self.soh,
+            )
+        )
+
+        low_soc_multiplier = (
+            1.0
+            + 0.8
+            * max(
+                0.0,
+                0.15 - self.soc,
+            )
+            / 0.15
+        )
+
+        degraded_cell_multiplier = (
+            1.65
+            if self.degraded_cell
+            else 1.0
+        )
+
+        return max(
+            1e-4,
+            self.base_r0_ohm
+            * self.internal_resistance_scale
+            * cold_multiplier
+            * hot_multiplier
+            * soh_multiplier
+            * low_soc_multiplier
+            * degraded_cell_multiplier,
+        )
+
+    def _current_limit_a(self) -> float:
+        temp_factor = 1.0
+
+        if self.temperature_c < 0.0:
+            temp_factor = 0.55
+        elif self.temperature_c < 10.0:
+            temp_factor = 0.75
+        elif self.temperature_c > 55.0:
+            temp_factor = 0.65
+
+        cell_factor = (
+            0.65
+            if self.degraded_cell
+            else 1.0
+        )
+
+        return max(
+            0.1,
+            self.max_c_rate
+            * self.nominal_capacity_ah
+            * self.soh
+            * temp_factor
+            * cell_factor,
+        )
+
+    def _power_limit(self) -> float:
+        self.open_circuit_voltage_v = (
+            self._open_circuit_voltage()
+        )
+        r0 = self._effective_r0_ohm()
+
+        effective_voltage = max(
+            0.0,
+            self.open_circuit_voltage_v
+            - self.polarization_voltage_v,
+        )
+
+        minimum_pack_voltage = (
+            self.min_cell_voltage_v
+            * self.series_cells
+        )
+
+        if effective_voltage <= minimum_pack_voltage:
+            return 0.0
+
+        voltage_limited_current = (
+            effective_voltage
+            - minimum_pack_voltage
+        ) / max(
+            1e-6,
+            r0,
+        )
+
+        current_limit = min(
+            self._current_limit_a(),
+            max(
+                0.0,
+                voltage_limited_current,
+            ),
+        )
+
+        terminal_at_limit = max(
+            minimum_pack_voltage,
+            effective_voltage
+            - current_limit * r0,
+        )
+
+        return max(
+            0.0,
+            current_limit
+            * terminal_at_limit,
+        )
+
+    def power_availability_factor(
+        self,
+        demanded_power_w: float,
+    ) -> float:
+        demand = max(
+            0.0,
+            float(demanded_power_w),
+        )
+        if demand <= 1e-9:
+            return 1.0
+
+        limit = self._power_limit()
+
+        return max(
+            0.0,
+            min(
+                1.0,
+                limit / demand,
+            ),
+        )
+
+    def step(
+        self,
+        demanded_power_w: float,
+        ambient_temperature_c: float,
+        dt: float,
+    ) -> BatteryTwinSnapshot:
+        dt = max(
+            1e-4,
+            float(dt),
+        )
+
+        self.demanded_power_w = max(
+            0.0,
+            float(demanded_power_w),
+        )
+
+        self.usable_capacity_wh = (
+            self._usable_capacity_wh()
+        )
+
+        r0 = self._effective_r0_ohm()
+        self.power_limit_w = (
+            self._power_limit()
+        )
+
+        self.delivered_power_w = min(
+            self.demanded_power_w,
+            self.power_limit_w,
+        )
+
+        self.power_limited = (
+            self.delivered_power_w
+            + 1e-6
+            < self.demanded_power_w
+        )
+
+        effective_voltage = max(
+            1e-3,
+            self.open_circuit_voltage_v
+            - self.polarization_voltage_v,
+        )
+
+        # Solve P = I * (V_eff - I*R0) using the physically lower-current root.
+        if self.delivered_power_w <= 0.0:
+            current = 0.0
+        elif r0 <= 1e-8:
+            current = (
+                self.delivered_power_w
+                / effective_voltage
+            )
+        else:
+            discriminant = max(
+                0.0,
+                effective_voltage**2
+                - 4.0
+                * r0
+                * self.delivered_power_w,
+            )
+            current = (
+                effective_voltage
+                - math.sqrt(discriminant)
+            ) / (
+                2.0 * r0
+            )
+
+        current = min(
+            current,
+            self._current_limit_a(),
+        )
+
+        self.current_a = max(
+            0.0,
+            current,
+        )
+
+        self.terminal_voltage_v = max(
+            0.0,
+            effective_voltage
+            - self.current_a * r0,
+        )
+
+        # RC polarization branch.
+        r1 = max(
+            1e-5,
+            self.r1_ratio * r0,
+        )
+        c1 = max(
+            1.0,
+            self.rc_time_constant_s
+            / r1,
+        )
+
+        dv_rc_dt = (
+            -self.polarization_voltage_v
+            / (
+                r1 * c1
+            )
+            + self.current_a
+            / c1
+        )
+
+        self.polarization_voltage_v = max(
+            0.0,
+            min(
+                0.25
+                * self.open_circuit_voltage_v,
+                self.polarization_voltage_v
+                + dv_rc_dt * dt,
+            ),
+        )
+
+        effective_capacity_ah = max(
+            0.05,
+            self.usable_capacity_wh
+            / self.nominal_voltage_v,
+        )
+
+        discharged_ah = (
+            self.current_a
+            * dt
+            / 3600.0
+        )
+
+        self.soc = max(
+            0.0,
+            self.soc
+            - discharged_ah
+            / effective_capacity_ah,
+        )
+
+        delivered_energy_wh = (
+            self.delivered_power_w
+            * dt
+            / 3600.0
+        )
+
+        self.throughput_wh += (
+            delivered_energy_wh
+        )
+
+        self.c_rate = (
+            self.current_a
+            / max(
+                0.05,
+                self.nominal_capacity_ah,
+            )
+        )
+
+        # Joule + polarization heating.
+        self.heat_generation_w = max(
+            0.0,
+            self.current_a**2
+            * r0
+            + self.current_a
+            * self.polarization_voltage_v,
+        )
+
+        cooling_w = (
+            self.temperature_c
+            - float(
+                ambient_temperature_c
+            )
+        ) / max(
+            0.02,
+            self.thermal_resistance_k_per_w,
+        )
+
+        dtemp_dt = (
+            self.heat_generation_w
+            - cooling_w
+        ) / max(
+            100.0,
+            self.thermal_capacitance_j_per_k,
+        )
+
+        self.temperature_c += (
+            dtemp_dt * dt
+        )
+
+        # Slow mission-scale degradation tied to throughput and stress.
+        efc_increment = (
+            delivered_energy_wh
+            / max(
+                1.0,
+                self.nominal_capacity_wh,
+            )
+        )
+
+        stress = 1.0
+        stress += 0.18 * max(
+            0.0,
+            self.c_rate - 1.0,
+        )
+        stress += 0.035 * max(
+            0.0,
+            self.temperature_c - 35.0,
+        )
+
+        if self.degraded_cell:
+            stress *= 1.35
+
+        self.soh = max(
+            0.50,
+            self.soh
+            - 0.00035
+            * efc_increment
+            * stress,
+        )
+
+        self.usable_capacity_wh = (
+            self._usable_capacity_wh()
+        )
+
+        self.remaining_wh = max(
+            0.0,
+            self.usable_capacity_wh
+            * self.soc,
+        )
+
+        self.open_circuit_voltage_v = (
+            self._open_circuit_voltage()
+        )
+
+        imbalance_v = (
+            self.cell_imbalance_mv
+            / 1000.0
+        )
+
+        mean_cell_v = (
+            self.terminal_voltage_v
+            / self.series_cells
+        )
+
+        self.min_cell_terminal_voltage_v = max(
+            0.0,
+            mean_cell_v
+            - 0.5 * imbalance_v,
+        )
+        self.max_cell_terminal_voltage_v = max(
+            self.min_cell_terminal_voltage_v,
+            mean_cell_v
+            + 0.5 * imbalance_v,
+        )
+
+        voltage_margin_v = (
+            self.min_cell_terminal_voltage_v
+            - self.min_cell_voltage_v
+        )
+        thermal_margin_c = (
+            self.thermal_limit_c
+            - self.temperature_c
+        )
+
+        status_flags = []
+
+        if self.power_limited:
+            status_flags.append(
+                "POWER_LIMITED"
+            )
+
+        if (
+            self.min_cell_terminal_voltage_v
+            <= self.min_cell_voltage_v
+            + 0.05
+        ):
+            status_flags.append(
+                "LOW_VOLTAGE"
+            )
+
+        if self.temperature_c >= (
+            self.thermal_limit_c
+            - 3.0
+        ):
+            status_flags.append(
+                "THERMAL_LIMIT"
+            )
+
+        if self.c_rate >= (
+            0.90
+            * self.max_c_rate
+        ):
+            status_flags.append(
+                "HIGH_C_RATE"
+            )
+
+        if self.soc <= self.reserve_soc:
+            status_flags.append(
+                "RESERVE"
+            )
+
+        if self.degraded_cell:
+            status_flags.append(
+                "DEGRADED_CELL"
+            )
+
+        self.status = (
+            "+".join(status_flags)
+            if status_flags
+            else "NORMAL"
+        )
+
+        return BatteryTwinSnapshot(
+            soc=float(self.soc),
+            soh=float(self.soh),
+            nominal_capacity_wh=float(
+                self.nominal_capacity_wh
+            ),
+            usable_capacity_wh=float(
+                self.usable_capacity_wh
+            ),
+            remaining_wh=float(
+                self.remaining_wh
+            ),
+            nominal_voltage_v=float(
+                self.nominal_voltage_v
+            ),
+            open_circuit_voltage_v=float(
+                self.open_circuit_voltage_v
+            ),
+            terminal_voltage_v=float(
+                self.terminal_voltage_v
+            ),
+            current_a=float(
+                self.current_a
+            ),
+            c_rate=float(
+                self.c_rate
+            ),
+            internal_resistance_ohm=float(
+                r0
+            ),
+            polarization_voltage_v=float(
+                self.polarization_voltage_v
+            ),
+            demanded_power_w=float(
+                self.demanded_power_w
+            ),
+            delivered_power_w=float(
+                self.delivered_power_w
+            ),
+            power_limit_w=float(
+                self.power_limit_w
+            ),
+            power_limited=bool(
+                self.power_limited
+            ),
+            temperature_c=float(
+                self.temperature_c
+            ),
+            heat_generation_w=float(
+                self.heat_generation_w
+            ),
+            thermal_margin_c=float(
+                thermal_margin_c
+            ),
+            voltage_margin_v=float(
+                voltage_margin_v
+            ),
+            min_cell_voltage_v=float(
+                self.min_cell_terminal_voltage_v
+            ),
+            max_cell_voltage_v=float(
+                self.max_cell_terminal_voltage_v
+            ),
+            equivalent_full_cycles=float(
+                self.throughput_wh
+                / max(
+                    1.0,
+                    self.nominal_capacity_wh,
+                )
+            ),
+            reserve_soc=float(
+                self.reserve_soc
+            ),
+            status=str(
+                self.status
+            ),
+        )
+
+    def state_dict(self) -> dict:
+        snap = self.step_snapshot()
+        return {
+            "battery_twin_soc": snap.soc,
+            "battery_twin_soh": snap.soh,
+            "battery_twin_nominal_capacity_wh": snap.nominal_capacity_wh,
+            "battery_twin_usable_capacity_wh": snap.usable_capacity_wh,
+            "battery_twin_remaining_wh": snap.remaining_wh,
+            "battery_twin_nominal_voltage_v": snap.nominal_voltage_v,
+            "battery_twin_ocv_v": snap.open_circuit_voltage_v,
+            "battery_twin_terminal_voltage_v": snap.terminal_voltage_v,
+            "battery_twin_current_a": snap.current_a,
+            "battery_twin_c_rate": snap.c_rate,
+            "battery_twin_internal_resistance_ohm": snap.internal_resistance_ohm,
+            "battery_twin_polarization_voltage_v": snap.polarization_voltage_v,
+            "battery_twin_demanded_power_w": snap.demanded_power_w,
+            "battery_twin_delivered_power_w": snap.delivered_power_w,
+            "battery_twin_power_limit_w": snap.power_limit_w,
+            "battery_twin_power_limited": snap.power_limited,
+            "battery_twin_temperature_c": snap.temperature_c,
+            "battery_twin_heat_generation_w": snap.heat_generation_w,
+            "battery_twin_thermal_margin_c": snap.thermal_margin_c,
+            "battery_twin_voltage_margin_v": snap.voltage_margin_v,
+            "battery_twin_min_cell_voltage_v": snap.min_cell_voltage_v,
+            "battery_twin_max_cell_voltage_v": snap.max_cell_voltage_v,
+            "battery_twin_equivalent_full_cycles": snap.equivalent_full_cycles,
+            "battery_twin_reserve_soc": snap.reserve_soc,
+            "battery_twin_status": snap.status,
+        }
+
+    def step_snapshot(self) -> BatteryTwinSnapshot:
+        r0 = self._effective_r0_ohm()
+
+        return BatteryTwinSnapshot(
+            soc=float(self.soc),
+            soh=float(self.soh),
+            nominal_capacity_wh=float(
+                self.nominal_capacity_wh
+            ),
+            usable_capacity_wh=float(
+                self.usable_capacity_wh
+            ),
+            remaining_wh=float(
+                self.remaining_wh
+            ),
+            nominal_voltage_v=float(
+                self.nominal_voltage_v
+            ),
+            open_circuit_voltage_v=float(
+                self.open_circuit_voltage_v
+            ),
+            terminal_voltage_v=float(
+                self.terminal_voltage_v
+            ),
+            current_a=float(
+                self.current_a
+            ),
+            c_rate=float(
+                self.c_rate
+            ),
+            internal_resistance_ohm=float(
+                r0
+            ),
+            polarization_voltage_v=float(
+                self.polarization_voltage_v
+            ),
+            demanded_power_w=float(
+                self.demanded_power_w
+            ),
+            delivered_power_w=float(
+                self.delivered_power_w
+            ),
+            power_limit_w=float(
+                self.power_limit_w
+            ),
+            power_limited=bool(
+                self.power_limited
+            ),
+            temperature_c=float(
+                self.temperature_c
+            ),
+            heat_generation_w=float(
+                self.heat_generation_w
+            ),
+            thermal_margin_c=float(
+                self.thermal_limit_c
+                - self.temperature_c
+            ),
+            voltage_margin_v=float(
+                self.min_cell_terminal_voltage_v
+                - self.min_cell_voltage_v
+            ),
+            min_cell_voltage_v=float(
+                self.min_cell_terminal_voltage_v
+            ),
+            max_cell_voltage_v=float(
+                self.max_cell_terminal_voltage_v
+            ),
+            equivalent_full_cycles=float(
+                self.throughput_wh
+                / max(
+                    1.0,
+                    self.nominal_capacity_wh,
+                )
+            ),
+            reserve_soc=float(
+                self.reserve_soc
+            ),
+            status=str(
+                self.status
+            ),
+        )
+
+
+def infer_battery_pack_voltage(
+    capacity_wh: float,
+) -> float:
+    """
+    Generic pack-voltage inference for the built-in profiles.
+    These are simulator defaults, not manufacturer-certified specifications.
+    """
+    wh = float(capacity_wh)
+
+    if wh <= 80.0:
+        return 14.8
+    if wh <= 180.0:
+        return 22.2
+    if wh <= 800.0:
+        return 44.4
+    return 50.4
+
+
+
 # ==============================================================================
 # twin/engine.py
 # ==============================================================================
@@ -2253,6 +3194,7 @@ class DigitalTwinEngine:
         initial_speed_ms: float = 0.0,
         initial_pitch_deg: float = 0.0,
         initial_alpha_deg: float = 0.0,
+        battery_twin=None,
     ):
         self.params = params
         self.capacity_wh = max(
@@ -2260,6 +3202,7 @@ class DigitalTwinEngine:
             float(battery_capacity_wh),
         )
         self.power_model = power_model
+        self.battery_twin = battery_twin
         self.actuators = ActuatorModel(
             params.vehicle_type
         )
@@ -2314,8 +3257,21 @@ class DigitalTwinEngine:
             angle_of_attack_deg=float(
                 initial_alpha_deg
             ),
-            battery_wh=self.capacity_wh,
-            battery_soc=1.0,
+            battery_wh=(
+                float(self.battery_twin.remaining_wh)
+                if self.battery_twin is not None
+                else self.capacity_wh
+            ),
+            battery_soc=(
+                float(self.battery_twin.soc)
+                if self.battery_twin is not None
+                else 1.0
+            ),
+            battery_temp_c=(
+                float(self.battery_twin.temperature_c)
+                if self.battery_twin is not None
+                else 25.0
+            ),
         )
 
     def _integrate_rigid_body(
@@ -2516,6 +3472,74 @@ class DigitalTwinEngine:
             dt,
         )
 
+        # Battery-powered aircraft can become propulsion-power limited.
+        if self.battery_twin is not None:
+            preview_modeled_power = float(
+                self.power_model(
+                    max(
+                        1.0,
+                        s.airspeed_ms,
+                    )
+                )
+            )
+
+            preview_actuator_factor = (
+                1.0
+                + 0.06
+                * (
+                    abs(actual.aileron)
+                    + abs(actual.elevator)
+                    + abs(actual.rudder)
+                )
+            )
+
+            preview_throttle_factor = (
+                0.45
+                + 0.80
+                * actual.throttle
+            )
+
+            preview_demand_w = (
+                preview_modeled_power
+                * preview_actuator_factor
+                * preview_throttle_factor
+                / max(
+                    0.40,
+                    s.motor_health,
+                )
+            )
+
+            battery_power_factor = (
+                self.battery_twin
+                .power_availability_factor(
+                    preview_demand_w
+                )
+            )
+
+            if battery_power_factor < 0.999:
+                actual = ControlInput(
+                    throttle=max(
+                        0.0,
+                        min(
+                            1.0,
+                            actual.throttle
+                            * battery_power_factor,
+                        ),
+                    ),
+                    aileron=actual.aileron,
+                    elevator=actual.elevator,
+                    rudder=actual.rudder,
+                    commanded_heading_deg=(
+                        actual.commanded_heading_deg
+                    ),
+                    commanded_altitude_m=(
+                        actual.commanded_altitude_m
+                    ),
+                    commanded_speed_ms=(
+                        actual.commanded_speed_ms
+                    ),
+                )
+
         d = derivatives(
             s,
             environment,
@@ -2626,20 +3650,58 @@ class DigitalTwinEngine:
             )
         )
 
-        s.power_draw_w = max(
-            0.0,
-            power_w,
-        )
+        if self.battery_twin is not None:
+            battery_snapshot = (
+                self.battery_twin.step(
+                    demanded_power_w=max(
+                        0.0,
+                        power_w,
+                    ),
+                    ambient_temperature_c=(
+                        environment.temperature_c
+                    ),
+                    dt=dt,
+                )
+            )
 
-        self.update_energy(
-            s.power_draw_w,
-            dt,
-        )
-        self.update_thermal(
-            s.power_draw_w,
-            environment.temperature_c,
-            dt,
-        )
+            s.power_draw_w = float(
+                battery_snapshot.delivered_power_w
+            )
+            s.battery_wh = float(
+                battery_snapshot.remaining_wh
+            )
+            s.battery_soc = float(
+                battery_snapshot.soc
+            )
+            s.battery_health = float(
+                battery_snapshot.soh
+            )
+
+            # Preserve motor thermal dynamics while battery temperature is
+            # authoritative from the battery digital twin.
+            self.update_thermal(
+                s.power_draw_w,
+                environment.temperature_c,
+                dt,
+            )
+            s.battery_temp_c = float(
+                battery_snapshot.temperature_c
+            )
+        else:
+            s.power_draw_w = max(
+                0.0,
+                power_w,
+            )
+
+            self.update_energy(
+                s.power_draw_w,
+                dt,
+            )
+            self.update_thermal(
+                s.power_draw_w,
+                environment.temperature_c,
+                dt,
+            )
 
         s.time_s += dt
         return s
@@ -3672,6 +4734,1150 @@ def build_webgl_3d_figure_light(
     return fig
 
 
+
+# ==============================================================================
+# PRESERVED BASELINE: BATTERY CAPACITY + AI/IR DETECTABILITY
+# ==============================================================================
+
+DEFAULT_SIZE_M = {
+    "Generic Quad": 0.45,
+    "DJI Phantom": 0.35,
+    "Skydio 2+": 0.30,
+    "Freefly Alta 8": 1.30,
+    "Teal 2 / Golden Eagle": 0.50,
+    "RQ-11 Raven": 1.40,
+    "RQ-20 Puma": 2.80,
+    "Quantum Systems Vector": 2.80,
+    "Vector AI (Fixed-Wing)": 2.80,
+    "Vector AI (Multicopter)": 2.20,
+    "MQ-1 Predator": 14.80,
+    "MQ-9 Reaper": 20.00,
+    "Custom Build": 1.00,
+}
+
+
+def clamp01(x: float) -> float:
+    return max(0.0, min(1.0, float(x)))
+
+
+def battery_temp_capacity_factor(temp_c: float) -> float:
+    """
+    Preserved baseline temperature derating used for displayed/usable
+    battery capacity. This is a low-order engineering approximation.
+    """
+    if temp_c <= -10:
+        return 0.65
+    if temp_c <= 0:
+        return 0.78
+    if temp_c <= 10:
+        return 0.88
+    if temp_c <= 30:
+        return 1.00
+    if temp_c <= 40:
+        return 0.96
+    return 0.92
+
+
+def compute_detectability_scores_v3(
+    delta_T: float,
+    altitude_m: float,
+    speed_kmh: float,
+    cloud_cover: int,
+    gustiness: int,
+    stealth_factor: float,
+    drone_type: str,
+    power_system: str,
+    effective_size_m: float,
+    background_complexity: float,
+    humidity_factor: float = 0.5,
+) -> dict:
+    """
+    Preserved heuristic mission-awareness model.
+
+    These are not validated EO/IR sensor-detection probabilities.
+    They are comparative 0-100 mission-awareness scores.
+    """
+    size_term = clamp01(effective_size_m / 3.0)
+    altitude_term = 1.0 - min(0.80, altitude_m / 1200.0)
+    speed_term = clamp01(speed_kmh / 90.0)
+    motion_bonus = 0.18 if drone_type == "rotor" else 0.08
+
+    clutter_reduction = 1.0 - 0.35 * clamp01(background_complexity)
+    cloud_reduction = 1.0 - 0.18 * (cloud_cover / 100.0)
+    humidity_reduction = 1.0 - 0.10 * clamp01(humidity_factor)
+    stealth_reduction = 1.0 - max(
+        0.0,
+        (stealth_factor - 1.0) * 0.18,
+    )
+
+    visual_raw = (
+        0.36 * size_term
+        + 0.30 * altitude_term
+        + 0.16 * speed_term
+        + 0.10 * motion_bonus
+    )
+
+    visual_score = 100.0 * clamp01(
+        visual_raw
+        * clutter_reduction
+        * cloud_reduction
+        * humidity_reduction
+        * stealth_reduction
+    )
+
+    thermal_contrast = clamp01(delta_T / 25.0)
+    exposed_size = clamp01(effective_size_m / 2.5)
+
+    altitude_reduction = 1.0 - min(0.50, altitude_m / 2000.0)
+    cloud_ir_reduction = 1.0 - 0.22 * (cloud_cover / 100.0)
+    humidity_ir_reduction = 1.0 - 0.18 * clamp01(humidity_factor)
+    atmosphere_factor = max(
+        0.45,
+        cloud_ir_reduction * humidity_ir_reduction,
+    )
+
+    propulsion_bias = 0.12 if power_system == "ICE" else 0.03
+    thermal_speed_term = 0.06 * clamp01(speed_kmh / 120.0)
+    gust_uncertainty = 1.0 - 0.04 * (gustiness / 10.0)
+
+    thermal_raw = (
+        0.56 * thermal_contrast
+        + 0.18 * exposed_size
+        + propulsion_bias
+        + thermal_speed_term
+    )
+
+    thermal_score = 100.0 * clamp01(
+        thermal_raw
+        * altitude_reduction
+        * atmosphere_factor
+        * gust_uncertainty
+        * stealth_reduction
+    )
+
+    confidence = 1.0 - (
+        0.20 * (cloud_cover / 100.0)
+        + 0.18 * clamp01(background_complexity)
+        + 0.10 * (gustiness / 10.0)
+    )
+    confidence = max(
+        0.45,
+        min(0.95, confidence),
+    )
+
+    if power_system == "ICE":
+        overall = (
+            0.40 * visual_score
+            + 0.60 * thermal_score
+        )
+    elif drone_type == "rotor":
+        overall = (
+            0.55 * visual_score
+            + 0.45 * thermal_score
+        )
+    else:
+        overall = (
+            0.50 * visual_score
+            + 0.50 * thermal_score
+        )
+
+    return {
+        "visual_score": round(visual_score, 1),
+        "thermal_score": round(thermal_score, 1),
+        "overall_score": round(overall, 1),
+        "confidence": round(confidence * 100.0, 1),
+    }
+
+
+def detectability_risk_label(score: float) -> str:
+    if score < 33.0:
+        return "Low"
+    if score < 67.0:
+        return "Moderate"
+    return "High"
+
+
+def thermal_signature_risk(delta_t_c: float) -> str:
+    if delta_t_c < 10.0:
+        return "Low"
+    if delta_t_c < 20.0:
+        return "Moderate"
+    return "High"
+
+
+def turbulence_to_gust_index(level: str) -> int:
+    return {
+        "None": 0,
+        "Light": 2,
+        "Moderate": 5,
+        "Severe": 8,
+    }.get(str(level), 2)
+
+
+
+# ==============================================================================
+# PRESERVED / EXPANDED BASELINE: SWARM + STEALTH MISSION LAYER
+# ==============================================================================
+
+SWARM_ALLOWED_ACTIONS = [
+    "RTB",
+    "LOITER",
+    "HANDOFF_TRACK",
+    "RELOCATE",
+    "ALTITUDE_CHANGE",
+    "SPEED_CHANGE",
+    "RELAY_COMMS",
+    "STANDBY",
+]
+
+
+@dataclass
+class SwarmVehicle:
+    vehicle_id: str
+    role: str
+    north_m: float
+    east_m: float
+    altitude_m: float
+    speed_kmh: float
+    energy_pct: float
+    health_pct: float
+    detectability_score: float
+    current_waypoint: int
+    action: str = "STANDBY"
+    status_note: str = "Nominal"
+
+
+def _swarm_role(index: int) -> str:
+    roles = [
+        "LEAD",
+        "SCOUT",
+        "RELAY",
+        "OBSERVER",
+        "TRACKER",
+    ]
+    return roles[index % len(roles)]
+
+
+def _swarm_action_logic(
+    vehicle: SwarmVehicle,
+    threat_distance_m: float,
+    threat_radius_m: float,
+    reserve_pct: float,
+    coordination_enabled: bool,
+) -> tuple:
+    if vehicle.energy_pct <= reserve_pct:
+        return (
+            "RTB",
+            "Energy reserve threshold reached",
+        )
+
+    inside_threat = (
+        threat_radius_m > 0.0
+        and threat_distance_m <= threat_radius_m
+    )
+
+    if inside_threat:
+        if vehicle.role == "RELAY":
+            return (
+                "RELAY_COMMS",
+                "Maintain relay geometry outside peak exposure",
+            )
+        if vehicle.role in ("SCOUT", "TRACKER"):
+            return (
+                "RELOCATE",
+                "Reduce threat-zone dwell time",
+            )
+        return (
+            "ALTITUDE_CHANGE",
+            "Adjust geometry to reduce exposure",
+        )
+
+    if coordination_enabled:
+        if vehicle.role == "RELAY":
+            return (
+                "RELAY_COMMS",
+                "Maintain communications support",
+            )
+        if vehicle.role == "TRACKER":
+            return (
+                "HANDOFF_TRACK",
+                "Coordinate sensor-track continuity",
+            )
+        if vehicle.role == "SCOUT":
+            return (
+                "RELOCATE",
+                "Advance to next survey position",
+            )
+        if vehicle.role == "OBSERVER":
+            return (
+                "LOITER",
+                "Hold observation geometry",
+            )
+        return (
+            "SPEED_CHANGE",
+            "Synchronize formation timing",
+        )
+
+    return (
+        "LOITER",
+        "Independent mission hold",
+    )
+
+
+def simulate_swarm_mission(
+    swarm_size: int,
+    rounds: int,
+    waypoints,
+    lead_north_m: float,
+    lead_east_m: float,
+    lead_altitude_m: float,
+    lead_speed_kmh: float,
+    lead_energy_pct: float,
+    lead_detectability_score: float,
+    stealth_drag_factor: float,
+    threat_center_north_m: float,
+    threat_center_east_m: float,
+    threat_radius_km: float,
+    formation_spacing_m: float,
+    reserve_pct: float,
+    coordination_enabled: bool,
+    seed: int,
+):
+    """
+    Deterministic, role-aware swarm mission simulator.
+
+    This is a mission-logic layer, not a multi-vehicle 6-DOF integrator.
+    The primary aircraft retains the high-fidelity flight/battery twin;
+    swarm vehicles use low-order energy, motion, and signature propagation.
+    """
+    swarm_size = max(
+        1,
+        min(20, int(swarm_size)),
+    )
+    rounds = max(
+        1,
+        min(20, int(rounds)),
+    )
+    rng = np.random.default_rng(
+        int(seed)
+    )
+
+    if waypoints:
+        mission_wps = [
+            (
+                float(w[0]),
+                float(w[1]),
+                float(w[2]),
+            )
+            for w in waypoints
+        ]
+    else:
+        mission_wps = [
+            (
+                float(lead_north_m),
+                float(lead_east_m),
+                float(lead_altitude_m),
+            )
+        ]
+
+    vehicles = []
+    for i in range(swarm_size):
+        angle = (
+            2.0
+            * math.pi
+            * i
+            / max(1, swarm_size)
+        )
+        radius = (
+            0.0
+            if i == 0
+            else formation_spacing_m
+            * (
+                0.80
+                + 0.35
+                * rng.random()
+            )
+        )
+
+        energy_offset = (
+            -2.0
+            * i
+            / max(1, swarm_size - 1)
+            if swarm_size > 1
+            else 0.0
+        )
+
+        detect_offset = (
+            rng.normal(
+                0.0,
+                2.0,
+            )
+        )
+
+        vehicles.append(
+            SwarmVehicle(
+                vehicle_id=f"UAV-{i+1:02d}",
+                role=_swarm_role(i),
+                north_m=(
+                    lead_north_m
+                    + radius
+                    * math.cos(angle)
+                ),
+                east_m=(
+                    lead_east_m
+                    + radius
+                    * math.sin(angle)
+                ),
+                altitude_m=max(
+                    5.0,
+                    lead_altitude_m
+                    + rng.normal(
+                        0.0,
+                        5.0,
+                    ),
+                ),
+                speed_kmh=max(
+                    5.0,
+                    lead_speed_kmh
+                    * (
+                        0.92
+                        + 0.16
+                        * rng.random()
+                    ),
+                ),
+                energy_pct=max(
+                    0.0,
+                    min(
+                        100.0,
+                        lead_energy_pct
+                        + energy_offset,
+                    ),
+                ),
+                health_pct=max(
+                    75.0,
+                    100.0
+                    - abs(
+                        rng.normal(
+                            0.0,
+                            1.5,
+                        )
+                    ),
+                ),
+                detectability_score=max(
+                    0.0,
+                    min(
+                        100.0,
+                        lead_detectability_score
+                        + detect_offset,
+                    ),
+                ),
+                current_waypoint=(
+                    i
+                    % len(
+                        mission_wps
+                    )
+                ),
+            )
+        )
+
+    threat_radius_m = max(
+        0.0,
+        float(threat_radius_km)
+        * 1000.0,
+    )
+
+    history = []
+    coordination_log = []
+
+    for round_index in range(rounds):
+        for vehicle in vehicles:
+            target = mission_wps[
+                vehicle.current_waypoint
+            ]
+            target_n = target[0]
+            target_e = target[1]
+            target_alt = target[2]
+
+            dn = (
+                target_n
+                - vehicle.north_m
+            )
+            de = (
+                target_e
+                - vehicle.east_m
+            )
+            distance = math.hypot(
+                dn,
+                de,
+            )
+
+            threat_distance = math.hypot(
+                vehicle.north_m
+                - threat_center_north_m,
+                vehicle.east_m
+                - threat_center_east_m,
+            )
+
+            action, reason = (
+                _swarm_action_logic(
+                    vehicle=vehicle,
+                    threat_distance_m=(
+                        threat_distance
+                    ),
+                    threat_radius_m=(
+                        threat_radius_m
+                    ),
+                    reserve_pct=float(
+                        reserve_pct
+                    ),
+                    coordination_enabled=bool(
+                        coordination_enabled
+                    ),
+                )
+            )
+
+            # Apply high-level action.
+            speed_scale = 1.0
+            exposure_scale = 1.0
+
+            if action == "RTB":
+                target_n = 0.0
+                target_e = 0.0
+                speed_scale = 0.90
+            elif action == "LOITER":
+                speed_scale = 0.55
+            elif action == "RELOCATE":
+                speed_scale = 1.05
+                exposure_scale = 0.88
+            elif action == "ALTITUDE_CHANGE":
+                target_alt = max(
+                    20.0,
+                    target_alt + 40.0,
+                )
+                exposure_scale = 0.90
+            elif action == "SPEED_CHANGE":
+                speed_scale = 0.88
+            elif action == "RELAY_COMMS":
+                speed_scale = 0.60
+                target_alt = max(
+                    target_alt,
+                    lead_altitude_m
+                    + 40.0,
+                )
+            elif action == "HANDOFF_TRACK":
+                speed_scale = 0.82
+                exposure_scale = 0.94
+
+            vehicle.action = action
+            vehicle.status_note = reason
+
+            effective_speed_ms = (
+                vehicle.speed_kmh
+                * speed_scale
+                / 3.6
+            )
+
+            # Each round is a short planning epoch rather than one physics step.
+            epoch_s = 45.0
+
+            if action == "LOITER":
+                travel_m = (
+                    0.20
+                    * effective_speed_ms
+                    * epoch_s
+                )
+            else:
+                travel_m = min(
+                    distance,
+                    effective_speed_ms
+                    * epoch_s,
+                )
+
+            if distance > 1e-6:
+                vehicle.north_m += (
+                    travel_m
+                    * dn
+                    / distance
+                )
+                vehicle.east_m += (
+                    travel_m
+                    * de
+                    / distance
+                )
+
+            vehicle.altitude_m += max(
+                -20.0,
+                min(
+                    20.0,
+                    target_alt
+                    - vehicle.altitude_m,
+                ),
+            )
+
+            if (
+                distance <= max(
+                    25.0,
+                    travel_m + 10.0,
+                )
+                and action != "RTB"
+            ):
+                vehicle.current_waypoint = (
+                    vehicle.current_waypoint
+                    + 1
+                ) % len(
+                    mission_wps
+                )
+
+            # Stealth drag raises energy consumption.
+            stealth_energy_multiplier = (
+                1.0
+                + 0.70
+                * max(
+                    0.0,
+                    stealth_drag_factor
+                    - 1.0,
+                )
+            )
+
+            role_multiplier = {
+                "LEAD": 1.00,
+                "SCOUT": 1.08,
+                "RELAY": 0.90,
+                "OBSERVER": 0.82,
+                "TRACKER": 0.96,
+            }.get(
+                vehicle.role,
+                1.0,
+            )
+
+            energy_burn_pct = (
+                0.45
+                * (
+                    0.55
+                    + vehicle.speed_kmh
+                    / max(
+                        25.0,
+                        lead_speed_kmh,
+                    )
+                )
+                * stealth_energy_multiplier
+                * role_multiplier
+            )
+
+            if action == "RTB":
+                energy_burn_pct *= 0.88
+            elif action == "LOITER":
+                energy_burn_pct *= 0.72
+
+            vehicle.energy_pct = max(
+                0.0,
+                vehicle.energy_pct
+                - energy_burn_pct,
+            )
+
+            # Signature score evolves with geometry and stealth setting.
+            altitude_reduction = min(
+                12.0,
+                vehicle.altitude_m
+                / 150.0,
+            )
+            stealth_reduction = (
+                22.0
+                * max(
+                    0.0,
+                    stealth_drag_factor
+                    - 1.0,
+                )
+                / 0.50
+            )
+
+            inside_threat = (
+                threat_radius_m > 0.0
+                and threat_distance
+                <= threat_radius_m
+            )
+            exposure_penalty = (
+                8.0
+                if inside_threat
+                else 0.0
+            )
+
+            vehicle.detectability_score = max(
+                0.0,
+                min(
+                    100.0,
+                    (
+                        lead_detectability_score
+                        - altitude_reduction
+                        - stealth_reduction
+                        + exposure_penalty
+                    )
+                    * exposure_scale
+                    + rng.normal(
+                        0.0,
+                        1.0,
+                    ),
+                ),
+            )
+
+            history.append(
+                {
+                    "round": (
+                        round_index + 1
+                    ),
+                    "vehicle_id": (
+                        vehicle.vehicle_id
+                    ),
+                    "role": vehicle.role,
+                    "north_m": (
+                        vehicle.north_m
+                    ),
+                    "east_m": (
+                        vehicle.east_m
+                    ),
+                    "altitude_m": (
+                        vehicle.altitude_m
+                    ),
+                    "speed_kmh": (
+                        vehicle.speed_kmh
+                        * speed_scale
+                    ),
+                    "energy_pct": (
+                        vehicle.energy_pct
+                    ),
+                    "health_pct": (
+                        vehicle.health_pct
+                    ),
+                    "detectability_score": (
+                        vehicle.detectability_score
+                    ),
+                    "action": action,
+                    "status_note": reason,
+                    "current_waypoint": (
+                        vehicle.current_waypoint
+                    ),
+                    "inside_threat_zone": (
+                        inside_threat
+                    ),
+                }
+            )
+
+            coordination_log.append(
+                {
+                    "round": (
+                        round_index + 1
+                    ),
+                    "vehicle_id": (
+                        vehicle.vehicle_id
+                    ),
+                    "role": (
+                        vehicle.role
+                    ),
+                    "action": action,
+                    "reason": reason,
+                }
+            )
+
+    history_df = pd.DataFrame(
+        history
+    )
+    final_df = pd.DataFrame(
+        [
+            {
+                "vehicle_id": v.vehicle_id,
+                "role": v.role,
+                "north_m": v.north_m,
+                "east_m": v.east_m,
+                "altitude_m": v.altitude_m,
+                "speed_kmh": v.speed_kmh,
+                "energy_pct": v.energy_pct,
+                "health_pct": v.health_pct,
+                "detectability_score": (
+                    v.detectability_score
+                ),
+                "action": v.action,
+                "status_note": (
+                    v.status_note
+                ),
+                "current_waypoint": (
+                    v.current_waypoint
+                ),
+            }
+            for v in vehicles
+        ]
+    )
+
+    mean_energy = float(
+        final_df[
+            "energy_pct"
+        ].mean()
+    )
+    mean_health = float(
+        final_df[
+            "health_pct"
+        ].mean()
+    )
+    mean_detectability = float(
+        final_df[
+            "detectability_score"
+        ].mean()
+    )
+
+    roles_present = len(
+        set(
+            final_df[
+                "role"
+            ].tolist()
+        )
+    )
+
+    reserve_margin = max(
+        0.0,
+        min(
+            1.0,
+            (
+                mean_energy
+                - reserve_pct
+            )
+            / max(
+                1.0,
+                100.0 - reserve_pct,
+            ),
+        ),
+    )
+
+    resilience_score = max(
+        0.0,
+        min(
+            100.0,
+            0.40 * mean_health
+            + 35.0 * reserve_margin
+            + 5.0 * min(
+                5,
+                roles_present,
+            ),
+        ),
+    )
+
+    swarm_score = max(
+        0.0,
+        min(
+            100.0,
+            0.38 * mean_energy
+            + 0.32 * resilience_score
+            + 0.30
+            * (
+                100.0
+                - mean_detectability
+            ),
+        ),
+    )
+
+    summary = {
+        "swarm_size": int(
+            swarm_size
+        ),
+        "rounds": int(
+            rounds
+        ),
+        "mean_energy_pct": (
+            mean_energy
+        ),
+        "mean_health_pct": (
+            mean_health
+        ),
+        "mean_detectability_score": (
+            mean_detectability
+        ),
+        "resilience_score": (
+            resilience_score
+        ),
+        "swarm_score": (
+            swarm_score
+        ),
+        "rtb_count": int(
+            (
+                final_df["action"]
+                == "RTB"
+            ).sum()
+        ),
+        "roles_present": int(
+            roles_present
+        ),
+    }
+
+    return {
+        "history": history_df,
+        "final": final_df,
+        "coordination_log": (
+            coordination_log
+        ),
+        "summary": summary,
+    }
+
+
+def build_swarm_map(
+    swarm_final_df: pd.DataFrame,
+    waypoints,
+    threat_center_north_m: float,
+    threat_center_east_m: float,
+    threat_radius_km: float,
+):
+    fig = go.Figure()
+
+    if waypoints:
+        fig.add_trace(
+            go.Scatter(
+                x=[
+                    float(w[1])
+                    for w in waypoints
+                ],
+                y=[
+                    float(w[0])
+                    for w in waypoints
+                ],
+                mode="lines+markers+text",
+                text=[
+                    f"WP-{i+1}"
+                    for i in range(
+                        len(waypoints)
+                    )
+                ],
+                textposition="top center",
+                name="Mission waypoints",
+                line=dict(
+                    width=2,
+                    dash="dot",
+                ),
+                marker=dict(
+                    size=7,
+                ),
+            )
+        )
+
+    fig.add_trace(
+        go.Scatter(
+            x=swarm_final_df[
+                "east_m"
+            ],
+            y=swarm_final_df[
+                "north_m"
+            ],
+            mode="markers+text",
+            text=[
+                (
+                    f"{vid}<br>{role}"
+                )
+                for vid, role in zip(
+                    swarm_final_df[
+                        "vehicle_id"
+                    ],
+                    swarm_final_df[
+                        "role"
+                    ],
+                )
+            ],
+            textposition="top center",
+            marker=dict(
+                size=13,
+                color=swarm_final_df[
+                    "detectability_score"
+                ],
+                colorscale="Viridis",
+                cmin=0,
+                cmax=100,
+                colorbar=dict(
+                    title="Detectability"
+                ),
+            ),
+            name="Swarm",
+            customdata=np.column_stack(
+                [
+                    swarm_final_df[
+                        "energy_pct"
+                    ],
+                    swarm_final_df[
+                        "altitude_m"
+                    ],
+                    swarm_final_df[
+                        "action"
+                    ],
+                ]
+            ),
+            hovertemplate=(
+                "%{text}"
+                "<br>Energy %{customdata[0]:.1f}%"
+                "<br>Alt %{customdata[1]:.0f} m"
+                "<br>Action %{customdata[2]}"
+                "<extra></extra>"
+            ),
+        )
+    )
+
+    threat_radius_m = max(
+        0.0,
+        float(
+            threat_radius_km
+        )
+        * 1000.0,
+    )
+
+    if threat_radius_m > 0.0:
+        theta = np.linspace(
+            0.0,
+            2.0 * math.pi,
+            100,
+        )
+
+        fig.add_trace(
+            go.Scatter(
+                x=(
+                    threat_center_east_m
+                    + threat_radius_m
+                    * np.cos(theta)
+                ),
+                y=(
+                    threat_center_north_m
+                    + threat_radius_m
+                    * np.sin(theta)
+                ),
+                mode="lines",
+                name="Threat zone",
+                line=dict(
+                    width=2,
+                    dash="dash",
+                ),
+                fill="toself",
+                fillcolor=(
+                    "rgba(255,80,80,0.08)"
+                ),
+            )
+        )
+
+    fig.update_layout(
+        height=560,
+        title=(
+            "Swarm Mission Map"
+        ),
+        xaxis_title="East (m)",
+        yaxis_title="North (m)",
+        yaxis=dict(
+            scaleanchor="x",
+            scaleratio=1.0,
+        ),
+        legend=dict(
+            orientation="h"
+        ),
+        margin=dict(
+            l=20,
+            r=20,
+            t=50,
+            b=20,
+        ),
+    )
+
+    return fig
+
+
+def compute_stealth_tradeoff(
+    current_detectability: dict,
+    baseline_detectability: dict,
+    stealth_drag_factor: float,
+    current_power_w: float,
+):
+    visual_reduction = max(
+        0.0,
+        float(
+            baseline_detectability[
+                "visual_score"
+            ]
+        )
+        - float(
+            current_detectability[
+                "visual_score"
+            ]
+        ),
+    )
+    thermal_reduction = max(
+        0.0,
+        float(
+            baseline_detectability[
+                "thermal_score"
+            ]
+        )
+        - float(
+            current_detectability[
+                "thermal_score"
+            ]
+        ),
+    )
+    overall_reduction = max(
+        0.0,
+        float(
+            baseline_detectability[
+                "overall_score"
+            ]
+        )
+        - float(
+            current_detectability[
+                "overall_score"
+            ]
+        ),
+    )
+
+    drag_penalty_pct = max(
+        0.0,
+        (
+            float(
+                stealth_drag_factor
+            )
+            - 1.0
+        )
+        * 100.0,
+    )
+
+    estimated_power_penalty_w = (
+        max(
+            0.0,
+            float(
+                current_power_w
+            )
+        )
+        * max(
+            0.0,
+            float(
+                stealth_drag_factor
+            )
+            - 1.0,
+        )
+        / max(
+            1.0,
+            float(
+                stealth_drag_factor
+            ),
+        )
+    )
+
+    return {
+        "visual_reduction": (
+            visual_reduction
+        ),
+        "thermal_reduction": (
+            thermal_reduction
+        ),
+        "overall_reduction": (
+            overall_reduction
+        ),
+        "drag_penalty_pct": (
+            drag_penalty_pct
+        ),
+        "estimated_power_penalty_w": (
+            estimated_power_penalty_w
+        ),
+    }
+
+
+
 # ==============================================================================
 # STREAMLIT APPLICATION
 # ==============================================================================
@@ -3700,8 +5906,8 @@ st.caption(
     "digital twin simulation, sensor fusion, and mission planning"
 )
 st.caption(
-    "v0.5 Flight Simulator Expansion: quaternion 6-DOF, actuator dynamics, "
-    "turbulence, envelope protection, bias-aware EKF, HUD, and 3D replay"
+    "v0.7 Integrated Expansion: battery digital twin, swarm / mission ops, "
+    "stealth-signature tradeoffs, plus the quaternion 6-DOF flight simulator"
 )
 
 
@@ -3759,19 +5965,148 @@ with st.sidebar:
         key=f"payload_{aircraft_name}",
     )
 
+    battery_twin_enabled = False
+    battery_nominal_voltage_v = 0.0
+    battery_initial_soc_pct = 100.0
+    battery_initial_soh_pct = 100.0
+    battery_initial_temp_c = 25.0
+    battery_max_c_rate = 8.0
+    battery_resistance_scale = 1.0
+    battery_cell_imbalance_mv = 0.0
+    battery_degraded_cell = False
+    battery_reserve_soc_pct = 10.0
+
     if profile.get("power_system") == "Battery":
         battery_wh = st.number_input(
             "Battery capacity (Wh)",
             min_value=1.0,
-            value=max(1.0, float(profile.get("battery_wh", 100.0))),
+            value=max(
+                1.0,
+                float(
+                    profile.get(
+                        "battery_wh",
+                        100.0,
+                    )
+                ),
+            ),
             step=5.0,
             key=f"battery_{aircraft_name}",
         )
+
+        with st.expander(
+            "Battery Digital Twin",
+            expanded=True,
+        ):
+            battery_twin_enabled = st.checkbox(
+                "Enable battery digital twin",
+                value=True,
+                key=f"battery_twin_{aircraft_name}",
+            )
+
+            battery_nominal_voltage_v = st.number_input(
+                "Nominal pack voltage (V)",
+                min_value=7.4,
+                max_value=100.0,
+                value=float(
+                    infer_battery_pack_voltage(
+                        battery_wh
+                    )
+                ),
+                step=0.1,
+                key=f"battery_voltage_{aircraft_name}",
+                help=(
+                    "Generic simulator default. Override with the actual "
+                    "pack nominal voltage when known."
+                ),
+            )
+
+            battery_initial_soc_pct = st.slider(
+                "Initial SOC (%)",
+                20.0,
+                100.0,
+                100.0,
+                1.0,
+                key=f"battery_soc_{aircraft_name}",
+            )
+
+            battery_initial_soh_pct = st.slider(
+                "Initial SOH (%)",
+                50.0,
+                100.0,
+                100.0,
+                1.0,
+                key=f"battery_soh_{aircraft_name}",
+            )
+
+            battery_initial_temp_c = st.slider(
+                "Initial pack temperature (°C)",
+                -20.0,
+                60.0,
+                25.0,
+                1.0,
+                key=f"battery_temp_{aircraft_name}",
+            )
+
+            battery_max_c_rate = st.slider(
+                "Max continuous C-rate",
+                1.0,
+                20.0,
+                (
+                    8.0
+                    if profile["type"] == "rotor"
+                    else 6.0
+                ),
+                0.5,
+                key=f"battery_c_rate_{aircraft_name}",
+            )
+
+            battery_resistance_scale = st.slider(
+                "Internal resistance multiplier",
+                0.5,
+                3.0,
+                1.0,
+                0.1,
+                key=f"battery_rscale_{aircraft_name}",
+            )
+
+            battery_cell_imbalance_mv = st.slider(
+                "Cell imbalance (mV)",
+                0.0,
+                250.0,
+                0.0,
+                5.0,
+                key=f"battery_imbalance_{aircraft_name}",
+            )
+
+            battery_degraded_cell = st.checkbox(
+                "Inject degraded-cell fault",
+                value=False,
+                key=f"battery_degraded_cell_{aircraft_name}",
+            )
+
+            battery_reserve_soc_pct = st.slider(
+                "Reserve SOC (%)",
+                5.0,
+                30.0,
+                10.0,
+                1.0,
+                key=f"battery_reserve_{aircraft_name}",
+            )
     else:
-        battery_wh = max(1.0, float(profile.get("battery_wh", 1.0)))
+        battery_wh = max(
+            1.0,
+            float(
+                profile.get(
+                    "battery_wh",
+                    1.0,
+                )
+            ),
+        )
         st.caption(
-            f"ICE propulsion | Fuel tank: {profile.get('fuel_tank_l', 0):,.0f} L | "
-            f"Auxiliary electrical reserve: {battery_wh:.0f} Wh"
+            f"ICE propulsion | Fuel tank: "
+            f"{profile.get('fuel_tank_l', 0):,.0f} L | "
+            f"Auxiliary electrical reserve: "
+            f"{battery_wh:.0f} Wh"
         )
 
     st.caption(
@@ -3870,6 +6205,68 @@ with st.sidebar:
         step=1,
     )
 
+    st.subheader("Thermal / Detectability")
+
+    cloud_cover = st.slider(
+        "Cloud cover (%)",
+        0,
+        100,
+        50,
+    )
+
+    humidity_factor = st.slider(
+        "Humidity / haze factor",
+        0.0,
+        1.0,
+        0.5,
+        0.05,
+    )
+
+    background_complexity = st.slider(
+        "Background complexity",
+        0.0,
+        1.0,
+        0.5,
+        0.05,
+    )
+
+    st.subheader(
+        "Stealth / Signature Management"
+    )
+
+    stealth_enabled = st.checkbox(
+        "Enable stealth / low-observable tradeoff",
+        value=True,
+    )
+
+    stealth_drag_factor = st.slider(
+        "Stealth drag factor",
+        1.0,
+        1.5,
+        1.10,
+        0.05,
+        disabled=not stealth_enabled,
+        help=(
+            "Heuristic signature-management proxy. Higher values reduce "
+            "visual/IR detectability while increasing aerodynamic and "
+            "battery/fuel demand."
+        ),
+    )
+
+    if not stealth_enabled:
+        stealth_drag_factor = 1.0
+
+    effective_size_m = st.slider(
+        "Effective visual / IR size (m)",
+        0.2,
+        20.0,
+        min(
+            20.0,
+            float(DEFAULT_SIZE_M.get(aircraft_name, 1.0)),
+        ),
+        0.1,
+    )
+
     st.header("Envelope Protection")
 
     envelope_enabled = st.checkbox(
@@ -3952,8 +6349,89 @@ with st.sidebar:
         0.05,
     )
 
+    st.header(
+        "Swarm / Mission Ops"
+    )
+
+    swarm_enabled = st.checkbox(
+        "Enable swarm simulation",
+        value=True,
+    )
+
+    swarm_size = st.slider(
+        "Swarm size",
+        1,
+        12,
+        4,
+        disabled=not swarm_enabled,
+    )
+
+    swarm_rounds = st.slider(
+        "Coordination rounds",
+        1,
+        8,
+        4,
+        disabled=not swarm_enabled,
+    )
+
+    swarm_coordination_enabled = st.checkbox(
+        "Role-aware coordination",
+        value=True,
+        disabled=not swarm_enabled,
+    )
+
+    swarm_spacing_m = st.slider(
+        "Formation spacing (m)",
+        25.0,
+        500.0,
+        120.0,
+        25.0,
+        disabled=not swarm_enabled,
+    )
+
+    threat_zone_km = st.slider(
+        "Threat-zone radius (km)",
+        0.0,
+        5.0,
+        0.75,
+        0.05,
+        disabled=not swarm_enabled,
+    )
+
+    threat_center_north_m = st.number_input(
+        "Threat center North (m)",
+        value=400.0,
+        step=50.0,
+        disabled=not swarm_enabled,
+    )
+
+    threat_center_east_m = st.number_input(
+        "Threat center East (m)",
+        value=300.0,
+        step=50.0,
+        disabled=not swarm_enabled,
+    )
+
+    swarm_reserve_pct = st.slider(
+        "Swarm RTB reserve (%)",
+        5.0,
+        40.0,
+        15.0,
+        1.0,
+        disabled=not swarm_enabled,
+    )
+
+    swarm_seed = st.number_input(
+        "Swarm random seed",
+        min_value=0,
+        max_value=100000,
+        value=2026,
+        step=1,
+        disabled=not swarm_enabled,
+    )
+
     run_simulation = st.button(
-        "Run v0.5 Flight Simulator",
+        "Run v0.7 Integrated Simulation",
         type="primary",
         use_container_width=True,
     )
@@ -3961,30 +6439,32 @@ with st.sidebar:
 
 if not run_simulation:
     st.info(
-        "Configure the scenario and select **Run v0.5 Flight Simulator**."
+        "Configure the scenario and select **Run v0.7 Integrated Simulation**."
     )
 
     st.markdown(
         '''
-### v0.5 simulation chain
+### v0.7 integrated simulation chain
 
 ```text
-Waypoints
-   ↓
-Autopilot
-   ↓
-Flight-Envelope Protection
-   ↓
-Actuator Lag / Rate Limits
-   ↓
-Aero Tables + Propulsion
-   ↓
-Quaternion 6-DOF Dynamics
-   ↓
-Truth Aircraft
-   ├── 3D Replay
-   ├── HUD
-   └── Sensors → Bias-Aware EKF
+Mission / Waypoints
+   ├── Swarm Coordinator
+   └── Stealth / Signature Management
+                ↓
+           Autopilot
+                ↓
+       Envelope Protection
+                ↓
+      Actuator Dynamics
+                ↓
+ Battery Twin ↔ Propulsion
+                ↓
+     Quaternion 6-DOF
+                ↓
+          Truth Aircraft
+       ├── HUD / 3D Replay
+       ├── Sensors → EKF
+       └── Swarm Mission Ops
 ```
 '''
     )
@@ -4043,6 +6523,11 @@ dyn_params = build_dynamics_params(
 )
 
 
+gustiness_index = turbulence_to_gust_index(
+    turbulence_level
+)
+
+
 def power_model(speed_ms: float):
     power, _ = estimate_power_w(
         profile=profile,
@@ -4051,9 +6536,9 @@ def power_model(speed_ms: float):
         rho=rho,
         rho_ratio=rho_ratio,
         wind_kmh=wind_speed_kmh,
-        gustiness=2,
+        gustiness=gustiness_index,
         terrain_factor=1.0,
-        drag_factor=1.0,
+        drag_factor=stealth_drag_factor,
     )
     return power
 
@@ -4072,9 +6557,92 @@ trim_alpha = (
 
 trim_pitch = trim_alpha if profile["type"] == "fixed" else 0.0
 
-simulation_energy_wh = effective_energy_capacity_wh(
-    profile,
-    battery_wh,
+battery_capacity_factor = (
+    battery_temp_capacity_factor(
+        battery_initial_temp_c
+        if (
+            profile.get("power_system") == "Battery"
+            and battery_twin_enabled
+        )
+        else temperature_c
+    )
+    if profile.get("power_system") == "Battery"
+    else 1.0
+)
+
+battery_twin = None
+
+if (
+    profile.get("power_system") == "Battery"
+    and battery_twin_enabled
+):
+    battery_twin = BatteryDigitalTwin(
+        nominal_capacity_wh=float(
+            battery_wh
+        ),
+        nominal_voltage_v=float(
+            battery_nominal_voltage_v
+        ),
+        initial_soc=(
+            float(
+                battery_initial_soc_pct
+            )
+            / 100.0
+        ),
+        initial_soh=(
+            float(
+                battery_initial_soh_pct
+            )
+            / 100.0
+        ),
+        initial_temperature_c=float(
+            battery_initial_temp_c
+        ),
+        max_c_rate=float(
+            battery_max_c_rate
+        ),
+        internal_resistance_scale=float(
+            battery_resistance_scale
+        ),
+        cell_imbalance_mv=float(
+            battery_cell_imbalance_mv
+        ),
+        degraded_cell=bool(
+            battery_degraded_cell
+        ),
+        reserve_soc=(
+            float(
+                battery_reserve_soc_pct
+            )
+            / 100.0
+        ),
+    )
+
+    battery_derated_wh = float(
+        battery_twin.initial_usable_capacity_wh
+    )
+    battery_initial_energy_wh = float(
+        battery_twin.initial_energy_wh
+    )
+else:
+    battery_derated_wh = (
+        float(battery_wh)
+        * battery_capacity_factor
+        if profile.get("power_system") == "Battery"
+        else float(battery_wh)
+    )
+
+    battery_initial_energy_wh = float(
+        battery_derated_wh
+    )
+
+simulation_energy_wh = (
+    battery_initial_energy_wh
+    if profile.get("power_system") == "Battery"
+    else effective_energy_capacity_wh(
+        profile,
+        battery_wh,
+    )
 )
 
 engine = DigitalTwinEngine(
@@ -4086,6 +6654,7 @@ engine = DigitalTwinEngine(
     initial_speed_ms=speed_cmd_ms if profile["type"] == "fixed" else 0.0,
     initial_pitch_deg=trim_pitch,
     initial_alpha_deg=trim_alpha,
+    battery_twin=battery_twin,
 )
 
 autopilot = Autopilot(
@@ -4223,6 +6792,11 @@ for _ in range(max_steps):
     row.update(packet.dictionary())
     row.update(ekf.state_dict())
 
+    if battery_twin is not None:
+        row.update(
+            battery_twin.state_dict()
+        )
+
     row["heading_command_deg"] = heading_cmd
     row["altitude_command_m"] = altitude_cmd
     row["speed_command_ms"] = speed_cmd_ms
@@ -4327,8 +6901,17 @@ cols[0].metric(
     f"{final['time_s']/60.0:.2f} min",
 )
 cols[1].metric(
-    "Energy Reserve",
-    f"{final['battery_soc']*100:.1f}%",
+    (
+        "Battery Remaining"
+        if profile.get("power_system") == "Battery"
+        else "Energy Reserve"
+    ),
+    (
+        f"{float(final['battery_wh']):.0f} Wh "
+        f"({final['battery_soc']*100:.1f}%)"
+        if profile.get("power_system") == "Battery"
+        else f"{final['battery_soc']*100:.1f}%"
+    ),
 )
 cols[2].metric(
     "Airspeed",
@@ -4368,6 +6951,697 @@ else:
         "Simulation reached the configured duration."
     )
 
+
+# ------------------------------------------------------------------
+# Preserved baseline: AI / IR Detectability
+# ------------------------------------------------------------------
+thermal_delta_t_c = max(
+    0.0,
+    float(final["motor_temp_c"]) - float(temperature_c),
+    float(final["battery_temp_c"]) - float(temperature_c),
+)
+
+detectability = compute_detectability_scores_v3(
+    delta_T=thermal_delta_t_c,
+    altitude_m=float(final["altitude_m"]),
+    speed_kmh=float(final["airspeed_ms"]) * 3.6,
+    cloud_cover=int(cloud_cover),
+    gustiness=int(gustiness_index),
+    stealth_factor=float(stealth_drag_factor),
+    drone_type=profile["type"],
+    power_system=profile["power_system"],
+    effective_size_m=float(effective_size_m),
+    background_complexity=float(background_complexity),
+    humidity_factor=float(humidity_factor),
+)
+
+visual_score = float(
+    detectability["visual_score"]
+)
+thermal_score = float(
+    detectability["thermal_score"]
+)
+overall_detectability_score = float(
+    detectability["overall_score"]
+)
+detectability_confidence = float(
+    detectability["confidence"]
+)
+
+baseline_detectability_no_stealth = compute_detectability_scores_v3(
+    delta_T=thermal_delta_t_c,
+    altitude_m=float(final["altitude_m"]),
+    speed_kmh=float(final["airspeed_ms"]) * 3.6,
+    cloud_cover=int(cloud_cover),
+    gustiness=int(gustiness_index),
+    stealth_factor=1.0,
+    drone_type=profile["type"],
+    power_system=profile["power_system"],
+    effective_size_m=float(effective_size_m),
+    background_complexity=float(background_complexity),
+    humidity_factor=float(humidity_factor),
+)
+
+stealth_tradeoff = compute_stealth_tradeoff(
+    current_detectability=detectability,
+    baseline_detectability=(
+        baseline_detectability_no_stealth
+    ),
+    stealth_drag_factor=float(
+        stealth_drag_factor
+    ),
+    current_power_w=float(
+        final["power_draw_w"]
+    ),
+)
+
+st.header("AI / IR Detectability")
+
+st.caption(
+    "Visual and IR thermal detectability are preserved heuristic "
+    "mission-awareness scores, not validated sensor detection probabilities."
+)
+
+overall_risk = detectability_risk_label(
+    overall_detectability_score
+)
+
+if overall_risk == "Low":
+    st.success(
+        f"Overall detectability: LOW ({overall_detectability_score:.0f}/100)"
+    )
+elif overall_risk == "Moderate":
+    st.warning(
+        f"Overall detectability: MODERATE ({overall_detectability_score:.0f}/100)"
+    )
+else:
+    st.error(
+        f"Overall detectability: HIGH ({overall_detectability_score:.0f}/100)"
+    )
+
+det_cols = st.columns(5)
+
+det_cols[0].metric(
+    "Visual Detectability",
+    f"{visual_score:.0f}/100",
+)
+det_cols[1].metric(
+    "IR Thermal Detectability",
+    f"{thermal_score:.0f}/100",
+)
+det_cols[2].metric(
+    "Blended Detectability",
+    f"{overall_detectability_score:.0f}/100",
+)
+det_cols[3].metric(
+    "Heuristic Confidence",
+    f"{detectability_confidence:.0f}/100",
+)
+det_cols[4].metric(
+    "Thermal Signature Risk",
+    (
+        f"{thermal_signature_risk(thermal_delta_t_c)} "
+        f"(ΔT {thermal_delta_t_c:.1f}°C)"
+    ),
+)
+
+st.subheader(
+    "Stealth / Signature Tradeoff"
+)
+
+st.caption(
+    "The stealth model is a comparative engineering proxy. It trades "
+    "lower heuristic visual/IR detectability against added drag and "
+    "energy demand."
+)
+
+stealth_cols = st.columns(5)
+
+stealth_cols[0].metric(
+    "Stealth Factor",
+    f"{stealth_drag_factor:.2f}×",
+)
+stealth_cols[1].metric(
+    "Overall Score Reduction",
+    f"{stealth_tradeoff['overall_reduction']:.1f} pts",
+)
+stealth_cols[2].metric(
+    "Visual Reduction",
+    f"{stealth_tradeoff['visual_reduction']:.1f} pts",
+)
+stealth_cols[3].metric(
+    "IR Reduction",
+    f"{stealth_tradeoff['thermal_reduction']:.1f} pts",
+)
+stealth_cols[4].metric(
+    "Drag Penalty",
+    f"{stealth_tradeoff['drag_penalty_pct']:.0f}%",
+)
+
+st.caption(
+    f"Estimated instantaneous power attributable to the stealth-drag "
+    f"tradeoff: {stealth_tradeoff['estimated_power_penalty_w']:.0f} W. "
+    "That penalty is already propagated through the aircraft energy model "
+    "and battery digital twin."
+)
+
+# ------------------------------------------------------------------
+# Preserved baseline: battery capacity measurements
+# ------------------------------------------------------------------
+if profile.get("power_system") == "Battery":
+    st.header("Thermal Signature Risk & Battery")
+
+    st.caption(
+        "Electrical capacity and thermal burden for the current digital-twin run."
+    )
+
+    nominal_capacity_wh = float(
+        battery_wh
+    )
+    derated_capacity_wh = float(
+        battery_derated_wh
+    )
+    remaining_energy_wh = max(
+        0.0,
+        float(final["battery_wh"]),
+    )
+
+    if battery_twin is not None:
+        used_energy_wh = max(
+            0.0,
+            float(
+                battery_initial_energy_wh
+            )
+            - remaining_energy_wh,
+        )
+        reserve_fraction = float(
+            battery_twin.reserve_soc
+        )
+        remaining_soc_pct = (
+            100.0
+            * float(
+                final[
+                    "battery_twin_soc"
+                ]
+            )
+        )
+    else:
+        used_energy_wh = max(
+            0.0,
+            derated_capacity_wh
+            - remaining_energy_wh,
+        )
+        reserve_fraction = 0.10
+        remaining_soc_pct = (
+            100.0
+            * remaining_energy_wh
+            / max(
+                1e-9,
+                derated_capacity_wh,
+            )
+        )
+
+    reserve_floor_wh = (
+        reserve_fraction
+        * derated_capacity_wh
+    )
+
+    available_above_reserve_wh = max(
+        0.0,
+        remaining_energy_wh
+        - reserve_floor_wh,
+    )
+
+    batt_cols_1 = st.columns(4)
+
+    batt_cols_1[0].metric(
+        "Nominal Battery Capacity",
+        f"{nominal_capacity_wh:.1f} Wh",
+    )
+    batt_cols_1[1].metric(
+        "Temperature-Derated Capacity",
+        f"{derated_capacity_wh:.1f} Wh",
+        delta=(
+            f"{(battery_capacity_factor - 1.0) * 100:+.0f}%"
+        ),
+    )
+    batt_cols_1[2].metric(
+        "Remaining Energy",
+        f"{remaining_energy_wh:.1f} Wh",
+    )
+    batt_cols_1[3].metric(
+        "State of Charge",
+        f"{remaining_soc_pct:.1f}%",
+    )
+
+    batt_cols_2 = st.columns(4)
+
+    batt_cols_2[0].metric(
+        "Energy Used",
+        f"{used_energy_wh:.1f} Wh",
+    )
+    batt_cols_2[1].metric(
+        f"{reserve_fraction * 100:.0f}% Reserve Floor",
+        f"{reserve_floor_wh:.1f} Wh",
+    )
+    batt_cols_2[2].metric(
+        "Available Above Reserve",
+        f"{available_above_reserve_wh:.1f} Wh",
+    )
+    batt_cols_2[3].metric(
+        "Current Total Draw",
+        f"{float(final['power_draw_w']):.0f} W",
+    )
+
+    battery_plot_df = telemetry[
+        [
+            "time_s",
+            "battery_wh",
+            "battery_soc",
+            "power_draw_w",
+        ]
+    ].copy()
+
+    battery_plot_df[
+        "battery_soc_pct"
+    ] = (
+        battery_plot_df["battery_soc"]
+        * 100.0
+    )
+
+    capacity_fig = px.line(
+        battery_plot_df,
+        x="time_s",
+        y="battery_wh",
+        title="Battery Capacity Depletion (Wh)",
+    )
+
+    capacity_fig.add_hline(
+        y=reserve_floor_wh,
+        line_dash="dash",
+        annotation_text="10% reserve",
+    )
+
+    st.plotly_chart(
+        capacity_fig,
+        use_container_width=True,
+    )
+
+    if battery_twin is not None:
+        st.subheader("Battery Digital Twin")
+
+        st.caption(
+            "1-RC Thevenin equivalent-circuit model coupled to propulsion. "
+            "Voltage sag and battery power limits can reduce available thrust."
+        )
+
+        twin_status = str(
+            final[
+                "battery_twin_status"
+            ]
+        )
+
+        if twin_status == "NORMAL":
+            st.success(
+                "Battery twin status: NORMAL"
+            )
+        elif "THERMAL_LIMIT" in twin_status or "LOW_VOLTAGE" in twin_status:
+            st.error(
+                f"Battery twin status: {twin_status}"
+            )
+        else:
+            st.warning(
+                f"Battery twin status: {twin_status}"
+            )
+
+        twin_cols_1 = st.columns(5)
+
+        twin_cols_1[0].metric(
+            "Terminal Voltage",
+            f"{float(final['battery_twin_terminal_voltage_v']):.2f} V",
+        )
+        twin_cols_1[1].metric(
+            "Open-Circuit Voltage",
+            f"{float(final['battery_twin_ocv_v']):.2f} V",
+        )
+        twin_cols_1[2].metric(
+            "Current",
+            f"{float(final['battery_twin_current_a']):.1f} A",
+        )
+        twin_cols_1[3].metric(
+            "C-rate",
+            f"{float(final['battery_twin_c_rate']):.2f} C",
+        )
+        twin_cols_1[4].metric(
+            "SOH",
+            f"{float(final['battery_twin_soh']) * 100:.2f}%",
+        )
+
+        twin_cols_2 = st.columns(5)
+
+        twin_cols_2[0].metric(
+            "Internal Resistance",
+            (
+                f"{float(final['battery_twin_internal_resistance_ohm']) * 1000:.1f} "
+                "mΩ"
+            ),
+        )
+        twin_cols_2[1].metric(
+            "Battery Temperature",
+            f"{float(final['battery_twin_temperature_c']):.1f} °C",
+        )
+        twin_cols_2[2].metric(
+            "Heat Generation",
+            f"{float(final['battery_twin_heat_generation_w']):.1f} W",
+        )
+        twin_cols_2[3].metric(
+            "Voltage Margin",
+            f"{float(final['battery_twin_voltage_margin_v']):.2f} V/cell",
+        )
+        twin_cols_2[4].metric(
+            "Thermal Margin",
+            f"{float(final['battery_twin_thermal_margin_c']):.1f} °C",
+        )
+
+        twin_cols_3 = st.columns(5)
+
+        twin_cols_3[0].metric(
+            "Power Demand",
+            f"{float(final['battery_twin_demanded_power_w']):.0f} W",
+        )
+        twin_cols_3[1].metric(
+            "Power Delivered",
+            f"{float(final['battery_twin_delivered_power_w']):.0f} W",
+        )
+        twin_cols_3[2].metric(
+            "Available Power Limit",
+            f"{float(final['battery_twin_power_limit_w']):.0f} W",
+        )
+        twin_cols_3[3].metric(
+            "Minimum Cell Voltage",
+            f"{float(final['battery_twin_min_cell_voltage_v']):.3f} V",
+        )
+        twin_cols_3[4].metric(
+            "Equivalent Full Cycles",
+            f"{float(final['battery_twin_equivalent_full_cycles']):.4f}",
+        )
+
+        bt1, bt2 = st.columns(2)
+
+        with bt1:
+            voltage_fig = px.line(
+                telemetry,
+                x="time_s",
+                y=[
+                    "battery_twin_ocv_v",
+                    "battery_twin_terminal_voltage_v",
+                ],
+                title="Battery Voltage Sag",
+            )
+            st.plotly_chart(
+                voltage_fig,
+                use_container_width=True,
+            )
+
+        with bt2:
+            current_fig = px.line(
+                telemetry,
+                x="time_s",
+                y=[
+                    "battery_twin_current_a",
+                    "battery_twin_c_rate",
+                ],
+                title="Battery Current / C-rate",
+            )
+            st.plotly_chart(
+                current_fig,
+                use_container_width=True,
+            )
+
+        bt3, bt4 = st.columns(2)
+
+        with bt3:
+            battery_state_plot = telemetry.copy()
+            battery_state_plot[
+                "battery_twin_soc_pct"
+            ] = (
+                battery_state_plot[
+                    "battery_twin_soc"
+                ]
+                * 100.0
+            )
+            battery_state_plot[
+                "battery_twin_soh_pct"
+            ] = (
+                battery_state_plot[
+                    "battery_twin_soh"
+                ]
+                * 100.0
+            )
+
+            state_fig = px.line(
+                battery_state_plot,
+                x="time_s",
+                y=[
+                    "battery_twin_soc_pct",
+                    "battery_twin_soh_pct",
+                ],
+                title="Battery SOC / SOH",
+            )
+            st.plotly_chart(
+                state_fig,
+                use_container_width=True,
+            )
+
+        with bt4:
+            thermal_fig = px.line(
+                telemetry,
+                x="time_s",
+                y=[
+                    "battery_twin_temperature_c",
+                    "battery_twin_heat_generation_w",
+                ],
+                title="Battery Thermal State",
+            )
+            st.plotly_chart(
+                thermal_fig,
+                use_container_width=True,
+            )
+
+        power_fig = px.line(
+            telemetry,
+            x="time_s",
+            y=[
+                "battery_twin_demanded_power_w",
+                "battery_twin_delivered_power_w",
+                "battery_twin_power_limit_w",
+            ],
+            title="Battery Power Demand / Delivered / Limit",
+        )
+        st.plotly_chart(
+            power_fig,
+            use_container_width=True,
+        )
+
+else:
+    st.header("Fuel / Thermal Signature")
+
+    fuel_cols = st.columns(4)
+
+    fuel_cols[0].metric(
+        "Fuel Tank",
+        f"{float(profile.get('fuel_tank_l', 0.0)):,.0f} L",
+    )
+    fuel_cols[1].metric(
+        "Thermal ΔT",
+        f"{thermal_delta_t_c:.1f} °C",
+    )
+    fuel_cols[2].metric(
+        "IR Thermal Detectability",
+        f"{thermal_score:.0f}/100",
+    )
+    fuel_cols[3].metric(
+        "Current Propulsion Power",
+        f"{float(final['power_draw_w']) / 1000.0:.1f} kW",
+    )
+
+
+swarm_result = None
+
+if swarm_enabled:
+    swarm_result = simulate_swarm_mission(
+        swarm_size=int(
+            swarm_size
+        ),
+        rounds=int(
+            swarm_rounds
+        ),
+        waypoints=waypoints,
+        lead_north_m=float(
+            final["north_m"]
+        ),
+        lead_east_m=float(
+            final["east_m"]
+        ),
+        lead_altitude_m=float(
+            final["altitude_m"]
+        ),
+        lead_speed_kmh=float(
+            final["airspeed_ms"]
+        ) * 3.6,
+        lead_energy_pct=float(
+            final["battery_soc"]
+        ) * 100.0,
+        lead_detectability_score=float(
+            overall_detectability_score
+        ),
+        stealth_drag_factor=float(
+            stealth_drag_factor
+        ),
+        threat_center_north_m=float(
+            threat_center_north_m
+        ),
+        threat_center_east_m=float(
+            threat_center_east_m
+        ),
+        threat_radius_km=float(
+            threat_zone_km
+        ),
+        formation_spacing_m=float(
+            swarm_spacing_m
+        ),
+        reserve_pct=float(
+            swarm_reserve_pct
+        ),
+        coordination_enabled=bool(
+            swarm_coordination_enabled
+        ),
+        seed=int(
+            swarm_seed
+        ),
+    )
+
+    st.header(
+        "Swarm / Mission Ops"
+    )
+
+    st.caption(
+        "Role-aware deterministic swarm coordination. The lead aircraft "
+        "uses the full 6-DOF/battery twin; wing vehicles use a lower-order "
+        "mission model for formation, energy, signature, and coordination."
+    )
+
+    swarm_summary = swarm_result[
+        "summary"
+    ]
+
+    swarm_cols = st.columns(6)
+
+    swarm_cols[0].metric(
+        "Vehicles",
+        int(
+            swarm_summary[
+                "swarm_size"
+            ]
+        ),
+    )
+    swarm_cols[1].metric(
+        "Coordination Rounds",
+        int(
+            swarm_summary[
+                "rounds"
+            ]
+        ),
+    )
+    swarm_cols[2].metric(
+        "Swarm Score",
+        f"{swarm_summary['swarm_score']:.1f}/100",
+    )
+    swarm_cols[3].metric(
+        "Resilience",
+        f"{swarm_summary['resilience_score']:.1f}/100",
+    )
+    swarm_cols[4].metric(
+        "Mean Energy",
+        f"{swarm_summary['mean_energy_pct']:.1f}%",
+    )
+    swarm_cols[5].metric(
+        "RTB Ordered",
+        int(
+            swarm_summary[
+                "rtb_count"
+            ]
+        ),
+    )
+
+    st.plotly_chart(
+        build_swarm_map(
+            swarm_result["final"],
+            waypoints,
+            float(
+                threat_center_north_m
+            ),
+            float(
+                threat_center_east_m
+            ),
+            float(
+                threat_zone_km
+            ),
+        ),
+        use_container_width=True,
+    )
+
+    st.subheader(
+        "Swarm Vehicle State"
+    )
+
+    swarm_display = swarm_result[
+        "final"
+    ].copy()
+
+    numeric_columns = [
+        "north_m",
+        "east_m",
+        "altitude_m",
+        "speed_kmh",
+        "energy_pct",
+        "health_pct",
+        "detectability_score",
+    ]
+
+    for column in numeric_columns:
+        swarm_display[
+            column
+        ] = (
+            swarm_display[
+                column
+            ].astype(
+                float
+            ).round(
+                1
+            )
+        )
+
+    st.dataframe(
+        swarm_display,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    with st.expander(
+        "Coordination Log",
+        expanded=False,
+    ):
+        coordination_df = pd.DataFrame(
+            swarm_result[
+                "coordination_log"
+            ]
+        )
+        st.dataframe(
+            coordination_df,
+            use_container_width=True,
+            hide_index=True,
+        )
 
 with st.expander(
     "Model Architecture / Parameters",
@@ -4757,14 +8031,14 @@ rc[7].metric(
 st.header("Exports")
 
 st.download_button(
-    "Download v0.5 Flight Telemetry CSV",
+    "Download v0.7 Flight Telemetry CSV",
     data=telemetry.to_csv(index=False).encode("utf-8"),
-    file_name="uav_flight_lab_v0_5_telemetry.csv",
+    file_name="uav_battery_estimator_v0_7_telemetry.csv",
     mime="text/csv",
 )
 
 scenario = {
-    "version": "0.5",
+    "version": "0.7",
     "aircraft": aircraft_name,
     "profile": profile,
     "dynamics": dyn_params.__dict__,
@@ -4790,6 +8064,66 @@ scenario = {
         "overspeed_ms": overspeed_ms,
         "intervention_pct": protection_pct,
     },
+    "stealth_signature_management": {
+        "enabled": bool(
+            stealth_enabled
+        ),
+        "stealth_drag_factor": float(
+            stealth_drag_factor
+        ),
+        "visual_detectability_reduction_points": float(
+            stealth_tradeoff[
+                "visual_reduction"
+            ]
+        ),
+        "thermal_detectability_reduction_points": float(
+            stealth_tradeoff[
+                "thermal_reduction"
+            ]
+        ),
+        "overall_detectability_reduction_points": float(
+            stealth_tradeoff[
+                "overall_reduction"
+            ]
+        ),
+        "estimated_power_penalty_w": float(
+            stealth_tradeoff[
+                "estimated_power_penalty_w"
+            ]
+        ),
+    },
+    "swarm_configuration": {
+        "enabled": bool(
+            swarm_enabled
+        ),
+        "size": int(
+            swarm_size
+        ),
+        "coordination_rounds": int(
+            swarm_rounds
+        ),
+        "role_aware_coordination": bool(
+            swarm_coordination_enabled
+        ),
+        "formation_spacing_m": float(
+            swarm_spacing_m
+        ),
+        "threat_zone_radius_km": float(
+            threat_zone_km
+        ),
+        "threat_center_north_m": float(
+            threat_center_north_m
+        ),
+        "threat_center_east_m": float(
+            threat_center_east_m
+        ),
+        "reserve_pct": float(
+            swarm_reserve_pct
+        ),
+        "seed": int(
+            swarm_seed
+        ),
+    },
     "faults": faults.__dict__,
     "metrics": {
         "gps_availability_pct": gps_availability,
@@ -4797,6 +8131,11 @@ scenario = {
         "max_position_error_m": max_position_error,
         "max_abs_alpha_deg": max_abs_alpha,
         "max_gust_ms": max_gust,
+        "thermal_delta_t_c": thermal_delta_t_c,
+        "visual_detectability_score_0_100": visual_score,
+        "thermal_detectability_score_0_100": thermal_score,
+        "blended_detectability_score_0_100": overall_detectability_score,
+        "detectability_confidence_0_100": detectability_confidence,
         "estimated_final_accel_bias_n_ms2": float(
             final["est_accel_bias_n_ms2"]
         ),
@@ -4809,13 +8148,83 @@ scenario = {
     },
 }
 
+if profile.get("power_system") == "Battery":
+    scenario["battery_measurements"] = {
+        "nominal_capacity_wh": float(battery_wh),
+        "temperature_capacity_factor": float(battery_capacity_factor),
+        "temperature_derated_capacity_wh": float(battery_derated_wh),
+        "remaining_energy_wh": float(final["battery_wh"]),
+        "remaining_soc_pct": float(final["battery_soc"]) * 100.0,
+        "energy_used_wh": max(
+            0.0,
+            float(battery_derated_wh) - float(final["battery_wh"]),
+        ),
+        "reserve_floor_wh_10pct": 0.10 * float(battery_derated_wh),
+        "current_draw_w": float(final["power_draw_w"]),
+    }
+
+    if battery_twin is not None:
+        scenario["battery_digital_twin"] = {
+            "model": "1-RC Thevenin equivalent circuit",
+            "enabled": True,
+            "configuration": {
+                "nominal_voltage_v": float(
+                    battery_nominal_voltage_v
+                ),
+                "initial_soc_pct": float(
+                    battery_initial_soc_pct
+                ),
+                "initial_soh_pct": float(
+                    battery_initial_soh_pct
+                ),
+                "initial_temperature_c": float(
+                    battery_initial_temp_c
+                ),
+                "max_c_rate": float(
+                    battery_max_c_rate
+                ),
+                "internal_resistance_scale": float(
+                    battery_resistance_scale
+                ),
+                "cell_imbalance_mv": float(
+                    battery_cell_imbalance_mv
+                ),
+                "degraded_cell_fault": bool(
+                    battery_degraded_cell
+                ),
+                "reserve_soc_pct": float(
+                    battery_reserve_soc_pct
+                ),
+            },
+            "final_state": battery_twin.state_dict(),
+        }
+    else:
+        scenario["battery_digital_twin"] = {
+            "enabled": False
+        }
+
+if swarm_result is not None:
+    scenario["swarm_results"] = {
+        "summary": swarm_result[
+            "summary"
+        ],
+        "vehicles": swarm_result[
+            "final"
+        ].to_dict(
+            orient="records"
+        ),
+        "coordination_log": swarm_result[
+            "coordination_log"
+        ],
+    }
+
 st.download_button(
-    "Download v0.5 Scenario JSON",
+    "Download v0.7 Scenario JSON",
     data=json.dumps(
         scenario,
         indent=2,
     ),
-    file_name="uav_flight_lab_v0_5_scenario.json",
+    file_name="uav_battery_estimator_v0_7_scenario.json",
     mime="application/json",
 )
 
@@ -4832,6 +8241,7 @@ with st.expander(
 **Mass:** {total_mass_kg:.3f} kg  
 **Dynamics step:** {dt:.3f} s  
 **Attitude propagation:** quaternion  
+**Battery model:** {'1-RC Thevenin digital twin' if battery_twin is not None else 'baseline energy reservoir / ICE energy model'}  
 **Turbulence:** {turbulence_level}  
 **GPS availability:** {gps_availability:.1f}%  
 **RMS navigation error:** {rms_position_error:.2f} m  
