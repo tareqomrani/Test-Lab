@@ -1,4 +1,4 @@
-# UAV Battery Efficiency Estimator | v0.8.1 architecture-aligned refactor
+# UAV Battery Efficiency Estimator | v0.8.3 aircraft + battery Plotly twins
 # Standalone Streamlit application | Built by Tareq Omrani
 # requirements.txt: streamlit>=1.40,<2; numpy>=1.26,<3; pandas>=2,<4;
 # plotly>=5.20,<8; pyarrow<25
@@ -21,7 +21,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-VERSION = "0.8.1"
+VERSION = "0.8.3"
 G = 9.80665
 R_AIR = 287.05
 P_SL = 101325.0
@@ -1337,6 +1337,623 @@ def run_physics(config):
         waypoints=waypoints,swarm=swarm,scenario=scenario)
 
 # ============================================================================
+# INTERACTIVE 3D BATTERY PACK REPLAY
+# ============================================================================
+# This is a visualization of the existing pack-level battery digital twin.
+# Series-group voltages interpolate between the model's pack-level min/max
+# estimates while preserving the model's terminal pack voltage. Parallel
+# cells share series-group voltage. Temperature gradients are illustrative,
+# not independently solved cell thermal states. The geometry/topology is not
+# an assertion about the manufacturer's actual battery-pack construction.
+
+BATTERY_3D_SCALES = {
+    'Cell voltage (V)': (3.0, 4.2, [
+        [0, '#ad233c'], [.16, '#fb8549'], [.33, '#ffe07a'],
+        [.58, '#3bc6d2'], [1, '#20f59e']]),
+    'Temperature proxy (°C)': (-20., 70., [
+        [0, '#2855cf'], [.29, '#49bfff'], [.52, '#27d6ad'],
+        [.70, '#ffd76a'], [1, '#ef4a5e']]),
+    'Pack SOC (%)': (0., 100., [
+        [0, '#a62648'], [.30, '#f3ae4c'], [.65, '#47bbae'], [1, '#21f59c']]),
+    'Cell voltage margin (V)': (-.2, 1., [
+        [0, '#a62648'], [.17, '#f16852'], [.4, '#e9cd5d'],
+        [.7, '#27c9b8'], [1, '#19f196']]),
+}
+
+
+def inferred_parallel_count(wh, series_cells, assumed_cell_ah=5.):
+    """Display-only topology estimate based on an explicitly assumed cell Ah."""
+    denom=max(1.,int(series_cells))*3.7*max(.1,float(assumed_cell_ah))
+    return int(clamp(round(float(wh)/denom),1,6))
+
+
+def representative_battery_cells(frame, series_cells, parallel_cells,
+                                 thermal_spread_c=0., nominal_wh=None):
+    """Derive a pack-voltage-consistent *visual* cell array from telemetry.
+
+    This is not a multi-cell electrochemical solver or a thermal FEM model.
+    It yields one terminal voltage per series-connected parallel group.
+    """
+    series=int(clamp(series_cells,1,48))
+    parallel=int(clamp(parallel_cells,1,8))
+    vpack=float(frame['battery_terminal_v'])
+    vmean=vpack/series
+    vlo=float(frame['battery_min_cell_v'])
+    vhi=float(frame['battery_max_cell_v'])
+    # The pack model provides symmetric end points around the mean except
+    # for floating-point differences. Rescale to enforce pack-voltage closure.
+    spread=max(0.,(vhi-vlo)*.5)
+    voltage_levels=vmean+np.linspace(-spread,spread,series)
+    # Constrain any endpoint roundoff while keeping the string sum exact.
+    voltage_levels+= (vpack-float(voltage_levels.sum()))/series
+    assert abs(float(voltage_levels.sum())-vpack)<1e-7
+    group_columns=int(math.ceil(math.sqrt(series)))
+    pp_cols=int(math.ceil(math.sqrt(parallel)))
+    pp_rows=int(math.ceil(parallel/pp_cols))
+    group_rows=int(math.ceil(series/group_columns))
+    cell_soc=float(frame['battery_soc'])*100.
+    pack_temp=float(frame['battery_temperature_c'])
+    wh=float(nominal_wh if nominal_wh is not None else frame['battery_nominal_wh'])
+    implied_cell_ah=wh/max(1e-6,3.7*series*parallel)
+    rows=[]
+    for group in range(series):
+        gx,gy=group%group_columns,group//group_columns
+        # Zero-mean, user-controlled visual offset; not derived from the
+        # pack's thermal ODE or from measured individual cell temperatures.
+        thermal_offset=(group-(series-1)/2.)/max(1.,series-1)*float(thermal_spread_c)
+        for index in range(parallel):
+            px,py=index%pp_cols,index//pp_cols
+            x=gx*(pp_cols*1.43+1.3)+px*1.43
+            y=gy*(pp_rows*1.43+1.3)+py*1.43
+            rows.append(dict(
+                cell_id=f'S{group+1:02d}-P{index+1:02d}',
+                series_group=group+1,parallel_cell=index+1,
+                x=float(x),y=float(y),z=0.72,
+                voltage_v=float(voltage_levels[group]),
+                voltage_margin_v=float(voltage_levels[group]-3.2),
+                temperature_proxy_c=float(pack_temp+thermal_offset),
+                soc_pct=cell_soc,
+                soh_pct=float(frame['battery_soh'])*100.,
+                implied_cell_capacity_ah=implied_cell_ah,
+                pack_time_s=float(frame['time_s']),
+            ))
+    return pd.DataFrame(rows)
+
+
+def battery_cylinder_mesh(cx,cy,r=.53,height=1.44,segments=12):
+    theta=np.linspace(0.,2.*math.pi,int(segments),endpoint=False)
+    ring_x=cx+r*np.cos(theta);ring_y=cy+r*np.sin(theta)
+    x=np.concatenate([ring_x,ring_x,[cx,cx]])
+    y=np.concatenate([ring_y,ring_y,[cy,cy]])
+    z=np.concatenate([np.zeros(segments),np.full(segments,height),[0.,height]])
+    faces_i=[];faces_j=[];faces_k=[]
+    for k in range(segments):
+        nxt=(k+1)%segments
+        # 2 triangles per lateral face and one triangle on each end cap.
+        faces_i.extend([k,nxt,2*segments,2*segments+1])
+        faces_j.extend([nxt,segments+nxt,k,segments+k])
+        faces_k.extend([segments+k,segments+k,nxt,segments+nxt])
+    return x,y,z,faces_i,faces_j,faces_k
+
+
+def build_battery_pack_3d(cells,metric='Cell voltage (V)',selected_cell=None):
+    """Plotly WebGL model with orbit/zoom/hover and a highlighted cell."""
+    if cells.empty:raise ValueError('Cannot render a battery pack without cells.')
+    if metric not in BATTERY_3D_SCALES:raise ValueError('Unknown 3D battery metric.')
+    lo,hi,colorscale=BATTERY_3D_SCALES[metric]
+    field={
+        'Cell voltage (V)':'voltage_v',
+        'Temperature proxy (°C)':'temperature_proxy_c',
+        'Pack SOC (%)':'soc_pct',
+        'Cell voltage margin (V)':'voltage_margin_v',
+    }[metric]
+    fig=go.Figure()
+    for j,r in enumerate(cells.itertuples(index=False)):
+        val=float(getattr(r,field))
+        x,y,z,ii,jj,kk=battery_cylinder_mesh(r.x,r.y)
+        tooltip=(
+            f'<b>{r.cell_id}</b><br>'
+            f'Series group {r.series_group} | Parallel {r.parallel_cell}<br>'
+            f'Group voltage estimate: {r.voltage_v:.3f} V<br>'
+            f'Pack SOC: {r.soc_pct:.1f}%<br>'
+            f'Illustrative cell temperature: {r.temperature_proxy_c:.1f} °C<br>'
+            f'Voltage margin to 3.20 V: {r.voltage_margin_v:+.3f} V<br>'
+            f't = {r.pack_time_s:.1f} s'
+        )
+        fig.add_trace(go.Mesh3d(
+            x=x,y=y,z=z,i=ii,j=jj,k=kk,
+            intensity=[val]*len(x),intensitymode='vertex',
+            colorscale=colorscale,cmin=lo,cmax=hi,
+            flatshading=False,opacity=.96,
+            showscale=(j==0),
+            colorbar=dict(title=dict(text=metric),len=.70,thickness=13,
+                          x=1.01,tickfont=dict(size=10,color='#d8ffe9')) if j==0 else None,
+            lighting=dict(ambient=.68,diffuse=.75,specular=.35,roughness=.45,fresnel=.06),
+            lightposition=dict(x=75,y=30,z=120),
+            name=r.cell_id,hovertemplate=tooltip+'<extra></extra>',showlegend=False,
+        ))
+    # Selected cell has a prominent top-ring and pointer; the selection is
+    # controlled by the UI, since Mesh3d point-selection is not reliable in
+    # Streamlit/Plotly across desktop and mobile versions.
+    selected=cells[cells.cell_id==selected_cell]
+    if not selected.empty:
+        chosen=selected.iloc[0]
+        theta=np.linspace(0,2*math.pi,49)
+        fig.add_trace(go.Scatter3d(
+            x=chosen.x+.62*np.cos(theta),y=chosen.y+.62*np.sin(theta),
+            z=np.full(theta.shape,1.48),mode='lines',
+            line=dict(color='#ffffff',width=8),showlegend=False,
+            name='Selected cell',hoverinfo='skip'))
+        fig.add_trace(go.Scatter3d(
+            x=[chosen.x],y=[chosen.y],z=[1.75],mode='markers+text',
+            marker=dict(size=6,color='#e6faff',symbol='diamond'),
+            text=[chosen.cell_id],textposition='top center',
+            textfont=dict(color='#ffffff',size=12),hoverinfo='skip',showlegend=False))
+    # A simple mounting-tray wireframe gives 3D depth cues. It does not
+    # claim to be a battery casing designed to any aircraft dimensions.
+    xmin,xmax=float(cells.x.min())-.8,float(cells.x.max())+.8
+    ymin,ymax=float(cells.y.min())-.8,float(cells.y.max())+.8
+    bx=[xmin,xmax,xmax,xmin,xmin,None,xmin,xmax,xmax,xmin,xmin]
+    by=[ymin,ymin,ymax,ymax,ymin,None,ymin,ymin,ymax,ymax,ymin]
+    bz=[-.13]*5+[None]+[1.62]*5
+    fig.add_trace(go.Scatter3d(x=bx,y=by,z=bz,mode='lines',
+        line=dict(color='#5c9f8e',width=3),name='Illustrative enclosure',
+        hoverinfo='skip',showlegend=False))
+    for xx,yy in [(xmin,ymin),(xmin,ymax),(xmax,ymin),(xmax,ymax)]:
+        fig.add_trace(go.Scatter3d(x=[xx,xx],y=[yy,yy],z=[-.13,1.62],
+            mode='lines',line=dict(color='#5c9f8e',width=3),
+            showlegend=False,hoverinfo='skip'))
+    fig.update_layout(
+        height=590,margin=dict(l=0,r=15,t=35,b=5),
+        title=dict(text='INTERACTIVE BATTERY PACK | REPLAY-DRIVEN',
+                   font=dict(color='#caffdf',size=15)),
+        paper_bgcolor='#06140f',font=dict(color='#d8ffe9'),
+        showlegend=False,uirevision='battery_pack_camera',
+        scene=dict(
+            bgcolor='#06140f',dragmode='orbit',aspectmode='data',
+            xaxis=dict(visible=False,showbackground=False),
+            yaxis=dict(visible=False,showbackground=False),
+            zaxis=dict(visible=False,showbackground=False),
+            camera=dict(eye=dict(x=1.45,y=1.55,z=1.18)),
+        ),
+    )
+    return fig
+
+
+def render_battery_pack_view(df,config):
+    """Streamlit controls are kept independent of the physics time stepping."""
+    st.markdown('#### Interactive 3D Battery Pack')
+    st.caption('Rotate, zoom and hover to inspect a cell. Choose a cell below to highlight it. '
+        'Changing the replay time uses stored battery telemetry, without rerunning the physics simulation.')
+    index=st.slider('Flight and battery replay frame',0,len(df)-1,len(df)-1,
+                    key='replay_frame')
+    frame=df.iloc[index]
+    left,right=st.columns(2)
+    with left:
+        metric=st.selectbox('Color battery geometry by',list(BATTERY_3D_SCALES),
+                            key='battery_3d_metric')
+    with right:
+        p=inferred_parallel_count(config['battery_wh'],config['series_cells'])
+        parallel=st.slider('Illustrative cells in parallel (P)',1,6,p,
+                           key='battery_3d_parallel')
+    gradient=st.slider('Illustrative pack temperature spread (°C)',0.,8.,0.,.5,
+                       key='battery_3d_temp_spread')
+    cells=representative_battery_cells(frame,config['series_cells'],parallel,
+        thermal_spread_c=gradient,nominal_wh=config['battery_wh'])
+    chosen=st.selectbox('Highlight / inspect cell',cells.cell_id.tolist(),
+                        key='battery_3d_selected')
+    fig=build_battery_pack_3d(cells,metric,chosen)
+    st.plotly_chart(fig,use_container_width=True,
+        config={'displaylogo':False,'responsive':True,'scrollZoom':True})
+    c=cells.loc[cells.cell_id==chosen].iloc[0]
+    st.caption(f'Replay t = {frame.time_s:.2f} s | {config["series_cells"]}S{parallel}P illustrative geometry | '
+        f'{len(cells)} visual cells | implied cell capacity {c.implied_cell_capacity_ah:.2f} Ah '
+        'at nominal 3.7 V/cell.')
+    metrics_grid([
+        ('Pack SOC',f'{frame.battery_soc*100:.1f}%'),
+        ('Pack current',f'{frame.battery_current_a:.2f} A'),
+        ('Pack voltage',f'{frame.battery_terminal_v:.2f} V'),
+        ('Pack thermal state',f'{frame.battery_temperature_c:.1f} °C'),
+    ])
+    st.markdown(f'**Selected {chosen}** | Series group {int(c.series_group)} | '
+        f'Voltage {c.voltage_v:.3f} V | Margin {c.voltage_margin_v:+.3f} V | '
+        f'Illustrative cell temperature {c.temperature_proxy_c:.1f} °C')
+    if bool(frame.battery_limited) or c.voltage_margin_v<=.05:
+        st.warning('Power limiting or low-voltage margin is present in this battery-pack frame.')
+    if 'DEGRADED_CELL' in str(frame.battery_status):
+        st.warning('Degraded-cell fault enabled. The existing pack model does not identify '
+                   'a specific failed cell or simulate independent cell aging.')
+    st.info('Model fidelity: pack-level 1-RC Thevenin or ideal-energy simulation. '
+        'Displayed series-group voltages are constrained interpolations between the '
+        'pack-level estimated minimum and maximum cell voltages. Parallel cells '
+        'share group voltage. All cells show pack SOC and SOH. Any nonzero temperature '
+        'spread is display-only, not computed heat transfer. Cell geometry and '
+        'series/parallel topology are illustrative, not manufacturer-verified.')
+    st.download_button('Download representative 3D cell-state table (CSV)',
+        cells.drop(columns=['x','y','z']).to_csv(index=False).encode('utf-8'),
+        f'battery_pack_replay_{frame.time_s:.1f}s.csv','text/csv')
+    return index
+
+
+# ============================================================================
+# QUATERNION-DRIVEN AIRCRAFT GEOMETRY / PLOTLY WEBGL REPLAY
+# ============================================================================
+# Procedural illustration, not manufacturer CAD. Body axes: +x forward,
+# +y right, +z DOWN. q rotates body -> NED; Plotly scene is East/North/UP.
+# Control surface and propeller motion are visualization proxies, not
+# independently simulated hinge dynamics or blade RPM measurements.
+
+AIRCRAFT_PALETTE = {
+    'fuselage': '#d1e4e6', 'canopy': '#3caeec', 'wing': '#8eb1c0',
+    'aileron': '#17e3ad', 'tail': '#79a6b7', 'elevator': '#eea955',
+    'fin': '#829aa7', 'rudder': '#f18db4', 'motor': '#c8d8dc',
+}
+
+
+def aircraft_body_to_scene(quaternion):
+    """Rotation for column vectors in (east, north, up) coordinates."""
+    ned_to_enu = np.array([[0., 1., 0.], [1., 0., 0.], [0., 0., -1.]])
+    return ned_to_enu @ body_to_ned(qnormalize(quaternion))
+
+
+def transform_aircraft_points(body_xyz, row, scale=1.):
+    points = np.asarray(body_xyz, dtype=float).reshape(-1, 3)
+    q = [float(row.qw), float(row.qx), float(row.qy), float(row.qz)]
+    center = np.array([float(row.east_m), float(row.north_m), float(row.altitude_m)])
+    return center + (float(scale) * points) @ aircraft_body_to_scene(q).T
+
+
+def make_aircraft_part(name, vertices, faces, color, **extras):
+    return dict(name=name, v=np.asarray(vertices, float),
+                f=np.asarray(faces, int), color=color, **extras)
+
+
+def wing_slab(name, root_front, root_rear, tip_front, tip_rear,
+              y_root, y_tip, z_root, z_tip, thickness, color,
+              hinge=None, hinge_deflection_rad=0.):
+    """Tapered low-order slab. Optional hinge rotation about local span axis."""
+    points=np.array([
+        [root_front,y_root,z_root-thickness/2],
+        [root_rear,y_root,z_root-thickness/2],
+        [tip_rear,y_tip,z_tip-thickness/2],
+        [tip_front,y_tip,z_tip-thickness/2],
+        [root_front,y_root,z_root+thickness/2],
+        [root_rear,y_root,z_root+thickness/2],
+        [tip_rear,y_tip,z_tip+thickness/2],
+        [tip_front,y_tip,z_tip+thickness/2],
+    ],dtype=float)
+    if hinge is not None and abs(hinge_deflection_rad)>1e-12:
+        # Hinge x varies linearly over the tapered panel's span.
+        h_root,h_tip=hinge
+        t=np.clip((points[:,1]-y_root)/(y_tip-y_root),0.,1.)
+        hx=h_root+(h_tip-h_root)*t
+        dz=points[:,2]-(z_root+(z_tip-z_root)*t)
+        dx=points[:,0]-hx
+        c,s=math.cos(hinge_deflection_rad),math.sin(hinge_deflection_rad)
+        points[:,0]=hx+c*dx+s*dz
+        points[:,2]=(z_root+(z_tip-z_root)*t)-s*dx+c*dz
+    faces=np.array([
+        [0,1,2],[0,2,3],[4,6,5],[4,7,6],
+        [0,4,5],[0,5,1],[1,5,6],[1,6,2],
+        [2,6,7],[2,7,3],[3,7,4],[3,4,0]
+    ],dtype=int)
+    return make_aircraft_part(name,points,faces,color)
+
+
+def lofted_hull(name, x_rings, ry_rings, rz_rings, color, sides=10, z_offset=0.):
+    rings=[]
+    for x,ry,rz in zip(x_rings,ry_rings,rz_rings):
+        for a in np.linspace(0,2*math.pi,sides,endpoint=False):
+            rings.append((x,ry*math.cos(a),z_offset+rz*math.sin(a)))
+    faces=[]
+    for k in range(len(x_rings)-1):
+        for j in range(sides):
+            a=k*sides+j;b=k*sides+(j+1)%sides
+            c=(k+1)*sides+j;d=(k+1)*sides+(j+1)%sides
+            faces.extend([(a,b,c),(b,d,c)])
+    return make_aircraft_part(name,rings,faces,color)
+
+
+def cylinder_z(name,cx,cy,z0,z1,r,color,sides=9):
+    vertices=[]
+    for z in (z0,z1):
+        for a in np.linspace(0,2*math.pi,sides,endpoint=False):
+            vertices.append((cx+r*math.cos(a),cy+r*math.sin(a),z))
+    faces=[]
+    for j in range(sides):
+        nj=(j+1)%sides
+        faces += [(j,nj,sides+j),(nj,sides+nj,sides+j)]
+    return make_aircraft_part(name,vertices,faces,color)
+
+
+def vertical_fin(name, x_front, x_rear, x_front_tip, x_rear_tip,
+                 z_root, z_tip, thickness, color,
+                 hinge=None, rudder_rad=0.):
+    vertices=np.array([
+        [x_front,-thickness/2,z_root],[x_rear,-thickness/2,z_root],
+        [x_rear_tip,-thickness/2,z_tip],[x_front_tip,-thickness/2,z_tip],
+        [x_front,thickness/2,z_root],[x_rear,thickness/2,z_root],
+        [x_rear_tip,thickness/2,z_tip],[x_front_tip,thickness/2,z_tip]],float)
+    if hinge is not None and abs(rudder_rad)>1e-12:
+        h0,h1=hinge
+        t=np.clip((vertices[:,2]-z_root)/(z_tip-z_root),0.,1.)
+        hx=h0+(h1-h0)*t
+        dx=vertices[:,0]-hx;dy=vertices[:,1]
+        c,s=math.cos(rudder_rad),math.sin(rudder_rad)
+        vertices[:,0]=hx+c*dx-s*dy
+        vertices[:,1]=s*dx+c*dy
+    faces=[(0,1,2),(0,2,3),(4,6,5),(4,7,6),
+           (0,4,5),(0,5,1),(1,5,6),(1,6,2),
+           (2,6,7),(2,7,3),(3,7,4),(3,4,0)]
+    return make_aircraft_part(name,vertices,faces,color)
+
+
+def aircraft_3d_parts(profile, row, aircraft_name=''):
+    """Procedural mesh set plus line segments, all in aircraft body frame."""
+    span=float(profile.get('wingspan_m',DEFAULT_SIZE_M.get(aircraft_name,1.)))
+    if profile['type']=='rotor':
+        span=max(.30, float(DEFAULT_SIZE_M.get(aircraft_name,.8)))
+    length=max(.20,span*(.70 if profile['type']=='fixed' else .40))
+    parts=[]; extra=[]
+    aileron=clamp(float(row.aileron_actual),-.65,.65)
+    elevator=clamp(float(row.elevator_actual),-.65,.65)
+    rudder=clamp(float(row.rudder_actual),-.65,.65)
+    phase=float(row.time_s)*3.17  # apparent rotation, not actual rotor RPM
+    if profile['type']=='fixed':
+        parts.append(lofted_hull('Fuselage',
+            [-.55*length,-.38*length,-.06*length,.25*length,.53*length],
+            [.018,.095,.125,.092,.005],
+            [.018,.093,.108,.082,.005],AIRCRAFT_PALETTE['fuselage']))
+        parts.append(lofted_hull('Cockpit fairing',
+            [.07*length,.19*length,.36*length,.42*length],
+            [.040,.072,.047,.002],[.03,.055,.033,.002],
+            AIRCRAFT_PALETTE['canopy'],z_offset=-.078*length))
+        half=.5*span
+        for side in (-1,1):
+            yr=side*.09*span;ym=side*.34*span;yt=side*.49*span
+            z0=-.018*span;zm=-.045*span;zt=-.056*span
+            # Main wing has a separate outer trailing-edge aileron.
+            parts.append(wing_slab('Main wing',.15*length,-.15*length,
+                .015*length,-.095*length,yr,ym,z0,zm,.018*span,
+                AIRCRAFT_PALETTE['wing']))
+            parts.append(wing_slab('Outer wing',.015*length,-.056*length,
+                -.075*length,-.116*length,ym,yt,zm,zt,.014*span,
+                AIRCRAFT_PALETTE['wing']))
+            # Hinged at the rear of the fixed outer-wing section.
+            parts.append(wing_slab('Aileron',-.056*length,-.095*length,
+                -.116*length,-.144*length,ym,yt,zm,zt,.010*span,
+                AIRCRAFT_PALETTE['aileron'],hinge=(-.056*length,-.116*length),
+                hinge_deflection_rad=.48*aileron*(1 if side>0 else -1)))
+            yr=side*.038*span;yt=side*.205*span
+            parts.append(wing_slab('Horizontal stabilizer',-.33*length,-.45*length,
+                -.41*length,-.485*length,yr,yt,0.,-.006*span,
+                .012*span,AIRCRAFT_PALETTE['tail']))
+            parts.append(wing_slab('Elevator',-.45*length,-.50*length,
+                -.485*length,-.52*length,yr,yt,0.,-.006*span,
+                .008*span,AIRCRAFT_PALETTE['elevator'],
+                hinge=(-.45*length,-.485*length),
+                hinge_deflection_rad=.40*elevator))
+        parts.append(vertical_fin('Vertical stabilizer',
+            -.32*length,-.47*length,-.43*length,-.48*length,
+            -.01*span,-.17*span,.016*span,AIRCRAFT_PALETTE['fin']))
+        parts.append(vertical_fin('Rudder',-.47*length,-.53*length,
+            -.48*length,-.515*length,-.01*span,-.17*span,
+            .010*span,AIRCRAFT_PALETTE['rudder'],
+            hinge=(-.47*length,-.48*length),rudder_rad=.4*rudder))
+        prop_x=(-.56 if 'MQ-' in aircraft_name else .55)*length
+        blade_r=.13*span
+        for k in range(2):
+            a=phase+k*math.pi
+            extra.append([(prop_x,0.,0.),(prop_x,blade_r*math.cos(a),blade_r*math.sin(a))])
+        extra.append([(prop_x-.025*length,0.,0.),(prop_x+.025*length,0.,0.)])
+    else:
+        parts.append(lofted_hull('Central avionics body',
+            [-.50*length,-.32*length,.15*length,.49*length],
+            [.01,.18*span,.16*span,.01],
+            [.01,.11*span,.13*span,.01],AIRCRAFT_PALETTE['fuselage']))
+        count=8 if 'Alta 8' in aircraft_name else 4
+        radius=.41*span
+        zhub=-.10*span
+        for k in range(count):
+            a=2*math.pi*(k+.5)/count
+            cx=radius*math.cos(a);cy=radius*math.sin(a)
+            extra.append([(0.,0.,-.025*span),(cx,cy,zhub)])
+            parts.append(cylinder_z('Rotor motor',cx,cy,zhub-.035*span,
+                                    zhub+.02*span,.038*span,
+                                    AIRCRAFT_PALETTE['motor']))
+            blade_radius=(.23 if count==4 else .14)*span
+            for blade in range(2):
+                theta=phase*(1 if k%2 else -1)+blade*math.pi
+                extra.append([(cx,cy,zhub-.045*span),
+                    (cx+blade_radius*math.cos(theta),
+                     cy+blade_radius*math.sin(theta),zhub-.045*span)])
+        # Landing skids are fixed visualization geometry.
+        for sgn in (-1,1):
+            y=sgn*.17*span
+            extra.extend([[( -.22*span,y,.11*span),(.22*span,y,.11*span)],
+                          [(-.14*span,y,.00*span),(-.14*span,y,.11*span)],
+                          [(.14*span,y,.00*span),(.14*span,y,.11*span)]])
+    return parts,extra,span
+
+
+def aircraft_dynamic_traces(profile, row, aircraft_name, visual_scale=1.,
+                            show_axes=True,show_thrust=True):
+    parts,segments,span=aircraft_3d_parts(profile,row,aircraft_name)
+    traces=[]
+    for part in parts:
+        verts=transform_aircraft_points(part['v'],row,visual_scale)
+        tri=part['f']
+        traces.append(go.Mesh3d(x=verts[:,0],y=verts[:,1],z=verts[:,2],
+            i=tri[:,0],j=tri[:,1],k=tri[:,2],name=part['name'],
+            color=part['color'],flatshading=True,opacity=.97,
+            lighting=dict(ambient=.66,diffuse=.7,roughness=.65,specular=.18),
+            showlegend=False,hovertemplate=part['name']+'<extra></extra>'))
+    def scene_lines(body_segments,name,color,width=6):
+        flat=[]
+        for segment in body_segments:
+            flat.extend([*segment,[np.nan,np.nan,np.nan]])
+        coords=transform_aircraft_points(flat,row,visual_scale)
+        return go.Scatter3d(x=coords[:,0],y=coords[:,1],z=coords[:,2],
+            mode='lines',line=dict(width=width,color=color),name=name,
+            showlegend=False,hoverinfo='skip')
+    traces.append(scene_lines(segments,'Propellers / rotor arms (illustrative)','#d5fafa',6))
+    if show_axes:
+        for name,axis,color in [('+X forward',[1,0,0],'#2de5be'),
+                                ('+Y right',[0,1,0],'#ffb65c'),
+                                ('+Z down',[0,0,1],'#f185ac')]:
+            end=np.asarray(axis,float)*span*.65
+            traces.append(scene_lines([[[0.,0.,0.],end]],name,color,4))
+    if show_thrust:
+        direction=np.array([1,0,0] if profile['type']=='fixed' else [0,0,-1],float)
+        thrust_ratio=clamp(float(row.thrust_n)/max(1.,float(row.mass_kg)*G),0.,2.5)
+        endpoint=direction*span*(.25+.40*thrust_ratio)
+        traces.append(scene_lines([[[0,0,0],endpoint]],'Thrust vector (magnitude scaled)','#f5d06b',9))
+    # Fixed trace count for any given aircraft and visualization toggles.
+    return traces,span
+
+
+def aircraft_scene_axes(df, row, waypoints, span, scale, camera_mode):
+    center=np.array([float(row.east_m),float(row.north_m),float(row.altitude_m)])
+    if camera_mode=='Aircraft focus':
+        width=max(8.,span*scale*3.6)
+        xlo,xhi=center[0]-width,center[0]+width
+        ylo,yhi=center[1]-width,center[1]+width
+        zlo,zhi=max(-10.,center[2]-width),center[2]+width
+    else:
+        arrays=[(df.east_m.to_numpy(),df.north_m.to_numpy(),df.altitude_m.to_numpy())]
+        if waypoints:
+            arrays.append(tuple(np.array([w[j] for w in waypoints])
+                                for j in (1,0,2)))
+        pts=np.concatenate([np.column_stack(a) for a in arrays],axis=0)
+        lo=np.min(pts,axis=0);hi=np.max(pts,axis=0)
+        margin=max(15.,span*scale*.8)
+        xlo,xhi=lo[0]-margin,hi[0]+margin
+        ylo,yhi=lo[1]-margin,hi[1]+margin
+        zlo,zhi=max(-10.,lo[2]-margin),hi[2]+margin
+    return dict(
+        xaxis=dict(title='East (m)',range=[xlo,xhi],color='#a7c5bc',
+                   gridcolor='#1b483b',backgroundcolor='#081a14',showbackground=True),
+        yaxis=dict(title='North (m)',range=[ylo,yhi],color='#a7c5bc',
+                   gridcolor='#1b483b',backgroundcolor='#081a14',showbackground=True),
+        zaxis=dict(title='Altitude (m)',range=[zlo,zhi],color='#a7c5bc',
+                   gridcolor='#1b483b',backgroundcolor='#081a14',showbackground=True),
+        aspectmode='manual',
+        aspectratio=dict(x=(xhi-xlo)/max(xhi-xlo,yhi-ylo,zhi-zlo),
+                         y=(yhi-ylo)/max(xhi-xlo,yhi-ylo,zhi-zlo),
+                         z=(zhi-zlo)/max(xhi-xlo,yhi-ylo,zhi-zlo)),
+        camera=dict(eye=dict(x=1.55,y=-1.8,z=.95),projection=dict(type='perspective')),
+        bgcolor='#061610',
+    )
+
+
+def aircraft_plotly_twin(df, waypoints, frame_index, profile,
+                         aircraft_name='', camera_mode='Aircraft focus',
+                         show_ekf=True,show_axes=True,show_thrust=True,
+                         animate=False,max_animation_frames=45):
+    """Plotly Mesh3d replay. Flight states come strictly from recorded 6-DOF telemetry."""
+    frame_index=int(clamp(frame_index,0,len(df)-1))
+    row=df.iloc[frame_index]
+    parts,_,span=aircraft_3d_parts(profile,row,aircraft_name)
+    path_extent=max(float(np.ptp(df.east_m)),float(np.ptp(df.north_m)),
+                    float(np.ptp(df.altitude_m)),span)
+    scale=1. if camera_mode=='Aircraft focus' else clamp(.065*path_extent/span,1.,80.)
+    fig=go.Figure()
+    # Plotly 3D on mobile cannot efficiently send tens of thousands of vertices.
+    # Decimate rendering only; retain unmodified physics / exported telemetry.
+    render_stride=max(1,math.ceil(len(df)/1400))
+    route=df.iloc[::render_stride]
+    if route.index[-1]!=df.index[-1]:
+        route=pd.concat([route,df.iloc[[-1]]])
+    def replay_trail(k):
+        sample=df.iloc[:k+1:render_stride]
+        if sample.index[-1]!=df.index[k]:
+            sample=pd.concat([sample,df.iloc[[k]]])
+        return sample
+    # Faint full recorded route indicates context; bright line indicates current history.
+    fig.add_trace(go.Scatter3d(x=route.east_m,y=route.north_m,z=route.altitude_m,
+        mode='lines',name='Recorded truth (full run)',
+        line=dict(color='#225e47',width=3),hoverinfo='skip'))
+    trail_index=1
+    hist=replay_trail(frame_index)
+    fig.add_trace(go.Scatter3d(x=hist.east_m,y=hist.north_m,z=hist.altitude_m,
+        mode='lines',name='Truth through replay',line=dict(color='#27ff9c',width=7)))
+    if show_ekf:
+        fig.add_trace(go.Scatter3d(x=hist.est_east_m,y=hist.est_north_m,
+            z=hist.est_altitude_m,mode='lines',name='EKF estimate',
+            line=dict(color='#59bfff',width=4,dash='dash')))
+    if waypoints:
+        fig.add_trace(go.Scatter3d(x=[w[1] for w in waypoints],
+            y=[w[0] for w in waypoints],z=[w[2] for w in waypoints],
+            mode='markers+text+lines',
+            text=[f'WP-{i+1}' for i in range(len(waypoints))],
+            textposition='top center',name='Mission waypoints',
+            marker=dict(color='#f6a3d5',size=4),
+            line=dict(color='#845d85',width=2,dash='dot')))
+    dynamic_offset=len(fig.data)
+    dynamic,_=aircraft_dynamic_traces(profile,row,aircraft_name,scale,
+                                      show_axes,show_thrust)
+    fig.add_traces(dynamic)
+    scene=aircraft_scene_axes(df,row,waypoints,span,scale,camera_mode)
+    fig.update_layout(height=660,margin=dict(l=0,r=0,t=54,b=0),
+        paper_bgcolor='#061610',font=dict(color='#cbf6e1'),
+        legend=dict(orientation='h',y=-.07,x=0.,font=dict(size=11)),
+        title=dict(text=f'QUATERNION 6-DOF | t={row.time_s:.1f}s | '
+                        f'Roll {row.roll_deg:+.1f}°  Pitch {row.pitch_deg:+.1f}°  '
+                        f'Yaw {row.yaw_deg:.1f}° | Airframe ×{scale:.1f}',
+                   font=dict(size=15)),
+        scene=scene,showlegend=True,uirevision='aircraft-camera')
+    fig.update_layout(meta=dict(geometry='Procedural illustrative airframe',
+        airframe_scale_factor=float(scale),
+        controls='From actual simulated actuator telemetry',
+        propeller_rotation='Illustrative only: no blade-level RPM state'))
+    if animate and len(df)>1:
+        sample=np.unique(np.r_[np.linspace(0,len(df)-1,min(max_animation_frames,len(df)),dtype=int),
+                               frame_index])
+        target_traces=list(range(dynamic_offset,dynamic_offset+len(dynamic)))
+        frame_traces=[trail_index]+([2] if show_ekf else [])+target_traces
+        frames=[]
+        for k in sample:
+            instant=df.iloc[int(k)]
+            h=replay_trail(int(k))
+            update=[go.Scatter3d(x=h.east_m,y=h.north_m,z=h.altitude_m)]
+            if show_ekf:
+                update.append(go.Scatter3d(x=h.est_east_m,y=h.est_north_m,
+                                           z=h.est_altitude_m))
+            moving,_=aircraft_dynamic_traces(profile,instant,aircraft_name,scale,
+                                              show_axes,show_thrust)
+            update.extend(moving)
+            # Aircraft-focus viewport follows the animated airframe. In overview,
+            # the scene stays stationary to show progress along the entire route.
+            animated_scene=(aircraft_scene_axes(df,instant,waypoints,span,scale,
+                                camera_mode) if camera_mode=='Aircraft focus' else None)
+            frames.append(go.Frame(name=f'f{k}',data=update,traces=frame_traces,
+                layout=go.Layout(title=dict(text=f'QUATERNION 6-DOF | '
+                    f't={instant.time_s:.1f}s | Roll {instant.roll_deg:+.1f}°  '
+                    f'Pitch {instant.pitch_deg:+.1f}°  '
+                    f'Yaw {instant.yaw_deg:.1f}° | Airframe ×{scale:.1f}'),
+                    scene=animated_scene)))
+        fig.frames=frames
+        steps=[dict(method='animate',label=f'{df.iloc[k].time_s:.0f}s',
+                    args=[[f'f{k}'],dict(mode='immediate',
+                        frame=dict(duration=0,redraw=True),transition=dict(duration=0))])
+               for k in sample]
+        fig.update_layout(
+            updatemenus=[dict(type='buttons',direction='left',x=.01,y=.01,
+                xanchor='left',yanchor='bottom',showactive=False,
+                buttons=[dict(label='▶ Play',method='animate',args=[None,
+                  dict(frame=dict(duration=150,redraw=True),fromcurrent=True,
+                       transition=dict(duration=0),mode='immediate')]),
+                         dict(label='❚❚ Pause',method='animate',args=[[None],
+                  dict(frame=dict(duration=0,redraw=False),transition=dict(duration=0),
+                       mode='immediate')])])],
+            sliders=[dict(active=int(np.argmin(abs(sample-frame_index))),
+                x=.25,y=.01,len=.73,pad=dict(t=2,b=0),steps=steps,
+                currentvalue=dict(prefix='Preview '))],
+        )
+    return fig
+
+
+# ============================================================================
 # REPLAY / REPORTING
 # ============================================================================
 def plot_series(telemetry,series,title,yaxis=None,height=290,max_points=1300):
@@ -1552,7 +2169,7 @@ def sidebar_inputs():
         swarm_reserve=st.slider('Swarm RTB reserve (%)',5.,40.,15.,1.,disabled=not swarm_enabled)
         swarm_seed=st.number_input('Swarm seed',0,100000,2026,disabled=not swarm_enabled)
 
-        run=st.button('Run v0.8.1 Simulation',type='primary',use_container_width=True)
+        run=st.button('Run v0.8.3 Simulation',type='primary',use_container_width=True)
         reset=st.button('Clear Previous Run',use_container_width=True)
     config=dict(aircraft=name,payload_g=payload,speed_kmh=speed,altitude_m=alt,
         duration_min=duration,dt=dt,capture_radius=capture,waypoints=waypoints,
@@ -1632,6 +2249,7 @@ def display_report(result):
             ('Pack temperature',f'{b.battery_temperature_c:.1f} °C'),
             ('Battery status',str(b.battery_status)),
         ])
+        replay_index=render_battery_pack_view(df,config)
         tab_energy,tab_voltage,tab_thermal=st.tabs(['Capacity and Power','Voltage and Current','Temperature and Cell Margins'])
         with tab_energy:
             plot_series(df,{'battery_remaining_wh':'Remaining usable energy'},'Capacity depletion','Wh')
@@ -1685,17 +2303,72 @@ def display_report(result):
         st.caption('Only the lead vehicle has a full six-DOF and energy model. Others use heuristic propagation.')
         st.dataframe(swarm['final'].round(2),use_container_width=True,hide_index=True)
 
-    st.subheader('Cockpit / Quaternion Flight Replay')
-    # This control reruns Streamlit. Results stay available in session_state.
-    index=st.slider('Replay frame',0,len(df)-1,len(df)-1,key='replay_frame')
+    st.subheader('Quaternion Aircraft Digital Twin | Plotly 3D')
+    # Saved replay index drives the battery visualization, aircraft and HUD.
+    if profile['power_system']=='Battery':
+        index=replay_index
+        st.caption('The battery-pack frame slider also controls the aircraft attitude, control surfaces and HUD.')
+    else:
+        index=st.slider('Flight / aircraft replay frame',0,len(df)-1,len(df)-1,
+                        key='replay_frame')
     frame=df.iloc[index]
-    st.caption(f'Replay time {frame.time_s:.2f} s | Waypoint {int(frame.active_waypoint)+1}')
-    st.plotly_chart(hud_figure(frame),use_container_width=True,config={'displaylogo':False})
-    renderer=st.radio('Trajectory renderer',['Mobile-safe projected 3D','Full WebGL 3D'],
-                      horizontal=True,key='renderer')
-    replay=(projected_replay(df,result['waypoints'],index) if renderer.startswith('Mobile')
-            else webgl_replay(df,result['waypoints'],index))
-    st.plotly_chart(replay,use_container_width=True,config={'displaylogo':False,'scrollZoom':False})
+    c1,c2,c3,c4=st.columns(4)
+    c1.metric('Roll',f'{frame.roll_deg:+.1f}°')
+    c2.metric('Pitch',f'{frame.pitch_deg:+.1f}°')
+    c3.metric('Yaw / heading',f'{frame.yaw_deg:.1f}°')
+    c4.metric('Altitude',f'{frame.altitude_m:.1f} m')
+    st.caption(f'Simulation t = {frame.time_s:.2f} s | Waypoint {int(frame.active_waypoint)+1} | '
+               f'Actual throttle {frame.throttle_actual*100:.0f}% | '
+               f'Quaternion [{frame.qw:+.3f}, {frame.qx:+.3f}, '
+               f'{frame.qy:+.3f}, {frame.qz:+.3f}]')
+    renderer=st.radio('Aircraft display',
+        ['Plotly 3D aircraft mesh (WebGL)','Mobile-safe projected 3D trajectory'],
+        horizontal=True,key='aircraft_renderer')
+    if renderer.startswith('Plotly'):
+        view1,view2=st.columns(2)
+        with view1:
+            camera_mode=st.selectbox('3D camera framing',
+                ['Aircraft focus','Mission overview'],key='aircraft_camera')
+        with view2:
+            show_ekf=st.checkbox('Show EKF-estimated trajectory',True,
+                                 key='aircraft_show_ekf')
+        options=st.columns(3)
+        with options[0]:
+            show_axes=st.checkbox('Body reference axes',False,
+                                  key='aircraft_show_axes')
+        with options[1]:
+            show_thrust=st.checkbox('Thrust direction / magnitude',True,
+                                    key='aircraft_show_thrust')
+        with options[2]:
+            animate=st.checkbox('Plotly Play / Pause animation',False,
+                                 key='aircraft_animation')
+        st.caption('Drag to orbit and pinch to zoom. Aircraft geometry follows the recorded '
+                   'quaternion and position. Ailerons, elevator and rudder use actual simulated '
+                   'actuator positions. Blade spin is illustrative, not a modeled RPM. '
+                   'Aircraft focus uses 1:1 geometry; mission overview enlarges the '
+                   'aircraft for visibility. The scale factor appears in the chart title.')
+        if animate:
+            st.info('Plotly animation samples up to 45 recorded frames and plays '
+                    'independently inside this chart. To synchronize the 3D battery pack, '
+                    'HUD and aircraft at a specific instant, use the shared Streamlit replay slider.')
+        try:
+            replay=aircraft_plotly_twin(df,result['waypoints'],index,profile,
+                scenario['aircraft'],camera_mode,show_ekf,show_axes,
+                show_thrust,animate,max_animation_frames=45)
+            st.plotly_chart(replay,use_container_width=True,
+                config={'displaylogo':False,'responsive':True,'scrollZoom':True})
+        except Exception as exc:
+            st.warning(f'Plotly aircraft rendering failed: {exc}. '
+                       'Showing the mobile-safe trajectory instead.')
+            st.plotly_chart(projected_replay(df,result['waypoints'],index),
+                            use_container_width=True,config={'displaylogo':False})
+    else:
+        st.plotly_chart(projected_replay(df,result['waypoints'],index),
+                        use_container_width=True,config={'displaylogo':False})
+        st.caption('Mobile-safe projected 3D displays the trajectory without a 3D aircraft mesh.')
+    with st.expander('Cockpit HUD for selected frame',expanded=False):
+        st.plotly_chart(hud_figure(frame),use_container_width=True,
+                        config={'displaylogo':False})
     st.subheader('Flight and Navigation Telemetry')
     tab_att,tab_nav,tab_env=st.tabs(['Attitude / envelope','INS and GNSS / EKF','Environment'])
     with tab_att:
@@ -1742,6 +2415,9 @@ def display_report(result):
 **Propulsion:** battery terminal power / ICE shaft power → ESC and motor (if electric) → shaft → propeller/rotor thrust  
 **Flight-control feedback:** simulated true state, **not EKF**  
 **Battery:** {'ideal reservoir' if not config['battery_twin'] else '1-RC Thevenin-style model' if profile['power_system']=='Battery' else 'not applicable'}  
+**3D pack replay:** pack-derived interpolated series voltages and optional display-only thermal spread  
+**3D aircraft twin:** true quaternion attitude + position from physics; generic fixed-wing/multicopter Mesh3d silhouettes, actuator-driven deflections, illustrative blade spin  
+**Aircraft render modes:** aircraft-focus (1:1 geometry) or overview (explicit visual enlargement). Plotly Play/Pause is not synchronized to the external Streamlit battery slider  
 **Turbulence:** first-order correlated Dryden-style approximation, not full spectral Dryden  
 **Autopilot deployment:** no onboard controller, MAVLink, PX4, or ArduPilot integration  
 **GPT-based interpretation:** conceptual only, not implemented  
@@ -1760,7 +2436,7 @@ def main():
     theme_css()
     st.title(f'UAV BATTERY EFFICIENCY ESTIMATOR  v{VERSION}')
     st.caption('Fixed-wing / rotor UAV | Energy • Propulsion • Flight Dynamics • ' 
-               'Multirate Sensor Emulation • INS/EKF • 3D Replay')
+               'Multirate Sensor Emulation • INS/EKF • 3D Battery + Quaternion Aircraft Mesh Replay')
     st.caption('Single-file aerospace research simulator | Built by Tareq Omrani')
     config,run,reset=sidebar_inputs()
     if reset:
@@ -1773,7 +2449,8 @@ def main():
 04 Waypoint guidance → 05 PID control → 06 Envelope safety → 07 Actuator response
 08 Battery / ICE source → 09 Propulsion conversion → 10 Aero + environmental loads
 11 Quaternion six-DOF flight plant → 12 Sensor emulation → 13 INS / EKF
-14 Timestamped flight record → 15 Replay, telemetry, swarm and engineering reports
+14 Timestamped flight record → 15 3D battery / quaternion aircraft Mesh3d twins
+16 Flight replay, INS/EKF diagnostics, telemetry and research exports
 
 SIMULATED TRUTH STATE → AUTOPILOT (not EKF feedback)
 
@@ -1789,7 +2466,7 @@ command gate → PX4 / ArduPilot. NOT IMPLEMENTED / NOT FLIGHT CONNECTED.''',lan
             st.error(f'Simulation could not complete: {exc}')
             st.stop()
     if 'completed_simulation' not in st.session_state:
-        st.info('Choose a platform and mission in the sidebar, then select **Run v0.8.1 Simulation**.')
+        st.info('Choose a platform and mission in the sidebar, then select **Run v0.8.3 Simulation**.')
         st.warning('Research use only: generic models, not a certified flight or BMS implementation.')
         st.stop()
     result=st.session_state['completed_simulation']
