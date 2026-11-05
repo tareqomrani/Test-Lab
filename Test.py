@@ -7,6 +7,8 @@ needed for Streamlit, NumPy, Pandas, Matplotlib, Plotly, PyGeomag and SciPy.
 from __future__ import annotations
 
 from dataclasses import replace
+import streamlit.components.v1 as components
+from plotly.offline import get_plotlyjs
 import io
 import json
 import math
@@ -1511,7 +1513,8 @@ def aircraft_figure_3d(row: pd.Series, view: str = "Isometric",
     }
     if heading_source not in heading_fields:
         raise ValueError("Unknown display heading source")
-    yaw = float(row.get(heading_fields[heading_source], 0.0))
+    # Always render the solid aircraft at truth pose. Estimated heading is the ghost.
+    yaw = float(row.get("true_heading_deg", 0.0))
     pitch = float(row.get("true_pitch_deg", 0.0))
     bank = float(row.get("true_roll_deg", 0.0))
     rot = _aircraft_rotation(yaw, pitch, bank)
@@ -1545,15 +1548,7 @@ def aircraft_figure_3d(row: pd.Series, view: str = "Isometric",
                    "High-wing Rascal-style fuselage", "#E6F1F4", rot)
 
     for side in [-1,1]:
-        main = _aircraft_wing_vertices(span, cfg["root_chord"],
-                                      cfg["tip_chord"], side)
-        _aircraft_hull(fig, main, _AIRCRAFT_BOX_FACES,
-                       "Rascal-style high wing", "#DAEDF2", rot)
-        # Cyan wing-tip outline is an identification marking, not a surface seam.
-        _aircraft_line(fig, main[[2,3]], rot, NEON_BLUE, 5)
-        tail = _aircraft_wing_vertices(.90, .23, .16, side, tail=True)
-        _aircraft_hull(fig, tail, _AIRCRAFT_BOX_FACES,
-                       "Horizontal stabilizer (illustrative)", "#AEC6CD", rot)
+        pass  # High-wing and stabilizer meshes come from add_rascal_detail below.
     # Vertical fin, at the tail: a thin tapered 3-D volume.
     fin = np.array([
         [-.89,.017,.07],[-.65,.017,.07],[-.84,.017,.33],[-.77,.017,.33],
@@ -1573,6 +1568,8 @@ def aircraft_figure_3d(row: pd.Series, view: str = "Isometric",
     ])
     _aircraft_line(fig, prop_loop, rot, "#6D9299", 2)
     _aircraft_line(fig, np.array([[nose_x,0,-.17],[nose_x,0,.17]]),rot,NEON_BLUE,5)
+    add_rascal_detail(fig, row, rot, cfg)
+    add_estimated_ghost(fig, row, cfg)
 
     # Fixed world reference prevents orbiting the model from obscuring heading.
     for axis, endpoint, color in [
@@ -1602,7 +1599,7 @@ def aircraft_figure_3d(row: pd.Series, view: str = "Isometric",
     camera = preset.get(view, preset["Isometric"])
     fig.update_layout(
         template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG,
-        title=dict(text="SIG RASCAL 110  |  " + heading_source.upper(),
+        title=dict(text="RASCAL 110 SCALE REFERENCE | ILLUSTRATIVE CAD",
                    font=dict(color=NEON_BLUE_BRIGHT, size=12), x=.03),
         font=dict(color=TEXT, family="Consolas, monospace"),
         height=480, margin=dict(l=0, r=0, t=54, b=6),
@@ -1616,6 +1613,1192 @@ def aircraft_figure_3d(row: pd.Series, view: str = "Isometric",
         uirevision=f"rascal_airframe_3d_{view}", showlegend=False,
     )
     return fig
+
+# ============================================================================
+# v7: SOURCE-SCALED AIRFRAME AND CIRCULAR COMPASS INTEGRITY ENGINEERING
+# Research visualization. Only SIG-published scale dimensions are authoritative;
+# airfoil, hinges, external fittings, and mounting points are illustrative.
+# ============================================================================
+
+def circular_difference_deg(a, b):
+    """Signed shortest angular displacement a-b in [-180, 180)."""
+    return (np.asarray(a, dtype=float) - np.asarray(b, dtype=float) + 180.0) % 360.0 - 180.0
+
+
+def circular_statistics(angles_deg):
+    """Concentration-based angular dispersion, not linear variance of headings."""
+    a = np.asarray(angles_deg, dtype=float)
+    a = a[np.isfinite(a)]
+    if len(a) == 0:
+        return dict(n=0, mean_deg=float('nan'), circular_std_deg=float('nan'),
+                    circular_variance= float('nan'), variance_deg2=float('nan'),
+                    resultant=float('nan'))
+    radians = np.deg2rad(a)
+    z = np.exp(1j * radians).mean()
+    r = float(np.clip(np.abs(z), 0, 1))
+    std_rad = float(np.sqrt(-2.0 * np.log(max(r, 1e-15))))
+    return dict(n=len(a), mean_deg=float(np.rad2deg(np.angle(z))),
+                circular_std_deg=float(np.rad2deg(std_rad)),
+                circular_variance=1.0-r, variance_deg2=float(np.rad2deg(std_rad)**2),
+                resultant=r)
+
+
+def compass_window_statistics(df: pd.DataFrame, window_s: float | None = 15.,
+                              source: str = 'magnetic', accepted_only: bool = False,
+                              end_s: float | None = None) -> dict:
+    """Truth-referenced descriptive statistics at stored *display* sampling rate.
+
+    Input 3-D sensor samples are generally decimated to telemetry display rates.
+    Circular dispersion is NOT a calibrated EKF covariance; autocorrelation
+    invalidates naive confidence claims and is documented explicitly in UI.
+    """
+    field = {'magnetic': 'mag_true_heading_deg',
+             'fused': 'fused_heading_deg',
+             'true': 'true_heading_deg'}.get(source)
+    if field is None:
+        raise ValueError('Unknown heading series')
+    stop = float(df.time_s.iloc[-1]) if end_s is None else float(end_s)
+    part = df.loc[df.time_s <= stop + 1e-9].copy()
+    if window_s is not None:
+        part = part.loc[part.time_s >= stop - float(window_s) - 1e-9]
+    if accepted_only and source == 'magnetic' and 'mag_accepted' in part.columns:
+        part = part.loc[part.mag_accepted.astype(bool)]
+    values = circular_difference_deg(part[field].to_numpy(dtype=float),
+                                     part.true_heading_deg.to_numpy(dtype=float))
+    values = values[np.isfinite(values)]
+    stats = circular_statistics(values)
+    stats.update(source=source, start_s=float(part.time_s.min()) if len(part) else np.nan,
+                 end_s=stop, accepted_only=bool(accepted_only),
+                 empirical_abs95_deg=float(np.percentile(np.abs(values),95)) if len(values) else np.nan,
+                 rms_deg=float(np.sqrt(np.mean(values**2))) if len(values) else np.nan,
+                 p99_abs_deg=float(np.percentile(np.abs(values),99)) if len(values) else np.nan,
+                 mean_abs_deg=float(np.mean(np.abs(values))) if len(values) else np.nan)
+    return stats
+
+
+def circular_rolling_summary(df: pd.DataFrame, window_s: float = 15.,
+                             source: str = 'magnetic', accepted_only: bool = False) -> pd.DataFrame:
+    """Rolling circular error diagnostics on recorded, potentially autocorrelated samples."""
+    t = df.time_s.to_numpy(dtype=float)
+    fld = 'mag_true_heading_deg' if source=='magnetic' else 'fused_heading_deg'
+    e = circular_difference_deg(df[fld].to_numpy(dtype=float),
+                                df.true_heading_deg.to_numpy(dtype=float))
+    accept = df.mag_accepted.to_numpy(dtype=bool) if accepted_only and source=='magnetic' else np.ones(len(df), bool)
+    res = []
+    for i, ti in enumerate(t):
+        mask = (t >= ti - float(window_s) - 1e-9) & (t <= ti + 1e-9) & accept & np.isfinite(e)
+        s = circular_statistics(e[mask])
+        s2 = dict(time_s=float(ti), bias_deg=s['mean_deg'], sigma_deg=s['circular_std_deg'],
+                  variance_deg2=s['variance_deg2'], n=s['n'],
+                  p95_abs_error_deg=float(np.percentile(np.abs(e[mask]), 95)) if mask.any() else np.nan)
+        res.append(s2)
+    return pd.DataFrame(res)
+
+
+def magnetic_integrity_diagnostics(df: pd.DataFrame, window_s: float = 15.) -> pd.DataFrame:
+    """Conservative *indicators*, not certified fault isolation/probabilities."""
+    roll = circular_rolling_summary(df, window_s, 'magnetic')
+    t = df.time_s.to_numpy(float)
+    field_meas = df.mag_field_ut.to_numpy(float)
+    field_ref = df.mag_field_expected_ut.to_numpy(float)
+    field_delta = np.divide(field_meas-field_ref, field_ref,
+                            out=np.zeros_like(field_meas), where=field_ref>1e-9)
+    innovation = np.abs(df.mag_innovation_deg.to_numpy(float))
+    valid = df.mag_accepted.to_numpy(dtype=bool)
+    nis = df.mag_nis.to_numpy(float) if 'mag_nis' in df else np.full(len(df), np.nan)
+    # Drift/change-point indicators use windows instead of making independence assumptions.
+    change = np.full(len(df), np.nan)
+    trend = np.full(len(df), np.nan)
+    error = circular_difference_deg(df.mag_true_heading_deg, df.true_heading_deg)
+    for i, ti in enumerate(t):
+        pre = (t>=ti-window_s) & (t<ti-window_s/2) & np.isfinite(error)
+        post = (t>=ti-window_s/2) & (t<=ti) & np.isfinite(error)
+        if pre.sum()>=3 and post.sum()>=3:
+            b1 = circular_statistics(error[pre])['mean_deg']
+            b2 = circular_statistics(error[post])['mean_deg']
+            change[i]=abs(float(circular_difference_deg(b2,b1)))
+        if post.sum()>=3:
+            # Unwrap within the local window before regression.
+            ev=np.rad2deg(np.unwrap(np.deg2rad(np.asarray(error)[post])))
+            ts=t[post];dt=ts-ts.mean();den=(dt*dt).sum()
+            if den>1e-9:trend[i]=float(np.sum(dt*(ev-ev.mean()))/den)
+    diag = pd.DataFrame(dict(time_s=t, magnitude_residual_pct=100*field_delta,
+                             mag_innovation_abs_deg=innovation, mag_nis=nis,
+                             mag_accepted=valid, rolling_bias_deg=roll.bias_deg,
+                             rolling_sigma_deg=roll.sigma_deg,
+                             rolling_variance_deg2=roll.variance_deg2,
+                             bias_change_deg=change, bias_trend_degps=trend))
+    diag['field_strength_alert'] = np.abs(diag.magnitude_residual_pct) > 18.
+    diag['innovation_alert'] = (np.isfinite(nis) & (nis > 6.635)) | (innovation > df.mag_gate_deg.to_numpy(float))
+    diag['change_alert'] = diag.bias_change_deg > 5.
+    diag['fault_indicator_count'] = (diag.field_strength_alert.astype(int) +
+                                    diag.innovation_alert.astype(int) +
+                                    diag.change_alert.astype(int) + (~valid).astype(int))
+    return diag
+
+
+def heading_uncertainty_corridor(stat: dict, distances_km) -> pd.DataFrame:
+    """Uncompensated, fixed-bias straight-line approximation (NOT closed-loop flight)."""
+    d = np.asarray(distances_km, dtype=float) * 1000.
+    bias = math.radians(float(stat['mean_deg']))
+    sigma = math.radians(float(stat['circular_std_deg']))
+    return pd.DataFrame(dict(distance_km=d/1000, bias_offset_m=d*np.sin(bias),
+                             one_sigma_m=np.abs(d*np.cos(bias))*sigma,
+                             low95_m=d*np.sin(bias)-1.96*np.abs(d*np.cos(bias))*sigma,
+                             high95_m=d*np.sin(bias)+1.96*np.abs(d*np.cos(bias))*sigma))
+
+
+def mag_body_vectors(row: pd.Series, c) -> tuple[np.ndarray, np.ndarray, str]:
+    """Observed FRD field and config-based idealized FRD field.
+
+    This baseline is *not* a new WMM solution or independent sensor truth.
+    Body FRD is forward, starboard, down. Local nav uses East, North, Up.
+    """
+    m = np.array([float(row.get('mag_body_x_ut',np.nan)),
+                  float(row.get('mag_body_y_ut',np.nan)),
+                  float(row.get('mag_body_z_ut',np.nan))])
+    bmag = float(row.get('mag_field_expected_ut',np.nan))
+    decl = math.radians(float(row.get('magnetic_declination_deg',c.declination_deg)))
+    inc = math.radians(float(getattr(c,'inclination_deg',0.)))
+    if not np.isfinite(bmag): bmag = 0.
+    B = np.array([bmag*math.cos(inc)*math.sin(decl),
+                  bmag*math.cos(inc)*math.cos(decl),-bmag*math.sin(inc)])
+    R = _aircraft_rotation(float(row.true_heading_deg),
+                           float(row.get('true_pitch_deg',0.)),
+                           float(row.get('true_roll_deg',0.)))
+    ideal = np.array([B@R[:,0],-B@R[:,1],-B@R[:,2]])
+    return m,ideal,'Configured field baseline (not independent WMM recalculation)'
+
+
+def magnetic_vector_figure(row: pd.Series, c) -> go.Figure:
+    measured, ideal, label=mag_body_vectors(row,c)
+    fig=go.Figure()
+    for name,v,color in [('MEASURED FRD',measured,ORANGE),('CONFIGURED REFERENCE FRD',ideal,NEON_BLUE)]:
+        if not np.all(np.isfinite(v)):continue
+        fig.add_trace(go.Scatter3d(x=[0,v[0]],y=[0,v[1]],z=[0,v[2]],
+                                  mode='lines+markers',line=dict(color=color,width=10),
+                                  marker=dict(size=[2,6],color=color),name=name,
+                                  hovertemplate=f'{name}<br>X: {v[0]:.2f} µT<br>Y: {v[1]:.2f} µT<br>Z: {v[2]:.2f} µT<extra></extra>'))
+    bound=max(15,float(np.max(np.abs(np.r_[measured,ideal][np.isfinite(np.r_[measured,ideal])])))*1.3)
+    fig.update_layout(height=390,paper_bgcolor=BG,plot_bgcolor=BG,
+                      title=dict(text='BODY-FRAME MAGNETIC VECTOR | µT',font=dict(color=NEON_BLUE_BRIGHT,size=12)),
+                      template='plotly_dark',margin=dict(l=0,r=0,t=42,b=0),
+                      legend=dict(orientation='h',y=-.04,font=dict(size=9)),
+                      scene=dict(bgcolor=BG,aspectmode='cube',camera=dict(eye=dict(x=1.4,y=1.7,z=1.2)),
+                                 xaxis=dict(title='FWD X (µT)',range=[-bound,bound],gridcolor='#17434b'),
+                                 yaxis=dict(title='RIGHT Y (µT)',range=[-bound,bound],gridcolor='#17434b'),
+                                 zaxis=dict(title='DOWN Z (µT)',range=[-bound,bound],gridcolor='#17434b')),
+                      uirevision='mag_body_vector')
+    return fig
+
+
+def magnetic_mounting_trade(distance_m: np.ndarray, moment_ut_m3: float=2.) -> pd.DataFrame:
+    """Unvalidated dipole-like inverse-cube illustration, NOT aircraft-specific EMI."""
+    d=np.maximum(np.asarray(distance_m,float),.05)
+    B=moment_ut_m3/d**3
+    return pd.DataFrame(dict(separation_m=d,illustrative_disturbance_ut=B))
+
+
+def _aerofoil_surface(span_m, croot, ctip, side, xcenter=0., zroot=.16,
+                       dihedral_deg=3.5, chord_from=0., chord_to=1.,
+                       y0=.03, y1=None, nspan=6, nchord=14,
+                       thickness_ratio=.11, camber=.015):
+    """Simplified NACA-like thick surface, not a verified Rascal airfoil."""
+    if y1 is None:y1=span_m/2
+    frac=np.linspace(y0/(span_m/2),y1/(span_m/2),nspan)
+    chords=np.linspace(chord_from,chord_to,nchord)
+    pts=[]
+    for f in frac:
+        length=croot+(ctip-croot)*f
+        y=side*(span_m/2)*f
+        z0=zroot+abs(y)*math.tan(math.radians(dihedral_deg))
+        sweep=-.04*f
+        for surface in [+1,-1]:
+            for u in chords:
+                uc=np.clip(u,0,1)
+                thick=5*thickness_ratio*length*(.2969*np.sqrt(uc)-.1260*uc-.3516*uc**2+.2843*uc**3-.1036*uc**4)
+                cam=camber*length*np.sin(math.pi*uc)
+                pts.append([xcenter+sweep+(0.5-u)*length,y,z0+cam+surface*thick])
+    faces=[]
+    plane=nspan*nchord
+    for face in range(2):
+        offset=face*plane
+        for s in range(nspan-1):
+            for j in range(nchord-1):
+                a=offset+s*nchord+j;b=a+1;c=a+nchord;d=c+1
+                faces.extend([[a,b,c],[b,d,c]] if face==0 else [[a,c,b],[b,c,d]])
+    # End walls at root and tip along chord, closing the wing solid.
+    for s in [0,nspan-1]:
+        for j in range(nchord-1):
+            a=s*nchord+j;b=a+1;c=a+plane;d=b+plane
+            faces.extend([[a,b,c],[b,d,c]])
+    return np.asarray(pts,float),np.asarray(faces,int)
+
+
+def _control_surface(fig, part, side, vertices, faces, rotation, key, hinge, 
+                     color, degrees=0., sign=1., axis='span'):
+    """Hinged control surface, local drawing axes X forward/Y port/Z up."""
+    base=np.asarray(vertices,float)
+    v=base.copy()
+    angle=math.radians(float(degrees)*float(sign))
+    if axis=='span':
+        # Local Y (spanwise) hinge. Delta x rotates into local z.
+        dx=v[:,0]-hinge[0];dz=v[:,2]-hinge[2]
+        v[:,0]=hinge[0]+dx*math.cos(angle)-dz*math.sin(angle)
+        v[:,2]=hinge[2]+dx*math.sin(angle)+dz*math.cos(angle)
+    else:
+        dx=v[:,0]-hinge[0];dy=v[:,1]-hinge[1]
+        v[:,0]=hinge[0]+dx*math.cos(angle)-dy*math.sin(angle)
+        v[:,1]=hinge[1]+dx*math.sin(angle)+dy*math.cos(angle)
+    rendered=v@rotation.T
+    f=np.asarray(faces,dtype=int)
+    fig.add_trace(go.Mesh3d(x=rendered[:,0],y=rendered[:,1],z=rendered[:,2],
+                        i=f[:,0],j=f[:,1],k=f[:,2],name=part,color=color,
+                        showlegend=False,flatshading=True,opacity=1.,
+                        hovertemplate=f'{part}<br>Click to inspect current recorded actuator deflection<extra></extra>',
+                        meta={'live_role':'control_surface','part':part,'control_key':key,
+                              'hinge':list(hinge),'axis':axis,'sign':float(sign),
+                              'local_vertices':base.round(6).tolist()}))
+
+
+def add_rascal_detail(fig, row, rot, cfg):
+    """Physically scaled *illustrative* aerofoils and animated controls."""
+    span=float(cfg['span']);c0=float(cfg['root_chord']);c1=float(cfg['tip_chord'])
+    for side in (-1,1):
+        # Airfoil-based forward wing. Split trailing control surfaces from fixed section.
+        for seglo,seghi in [(0.,.72)]:
+            vs,fs=_aerofoil_surface(span,c0,c1,side,chord_from=seglo,chord_to=seghi)
+            _aircraft_hull(fig,vs,fs,'Airfoil wing (illustrative profile)', '#E0ECF0',rot,hover=True)
+        for control,y0,y1,ctl,sign,color in [
+            ('Flap',.08,.56,'flap_deg',1.,'#69AABD'),
+            ('Aileron',.60,1.0,'aileron_deg',float(side),'#00CDE8')]:
+            v,f=_aerofoil_surface(span,c0,c1,side,chord_from=.73,chord_to=1.,y0=y0*(span/2),y1=y1*(span/2),nspan=4,nchord=8)
+            hinge=(.085+(.5-.73)*c0,side*(y0+y1)*span/4,.16)
+            deg=float(row.get(ctl,0.)) if ctl in row else 0.
+            _control_surface(fig,f'{control} {"port" if side>0 else "starboard"}',side,v,f,rot,ctl,hinge,color,deg,sign)
+        # Wing strut and tubular landing leg, modeled as visual elements only.
+        _aircraft_line(fig,np.array([[.14,side*.14,-.055],[.04,side*(span*.36),.21]]),rot,'#8CABB3',4,'Wing strut')
+        _aircraft_line(fig,np.array([[.17,side*.15,-.07],[.21,side*.30,-.31]]),rot,'#81969B',5,'Landing gear leg')
+        wheel_c=np.array([.21,side*.30,-.33])
+        aa=np.linspace(0,2*np.pi,30)
+        wheel=np.column_stack([wheel_c[0]+.065*np.cos(aa),np.full(len(aa),wheel_c[1]),wheel_c[2]+.065*np.sin(aa)])
+        _aircraft_line(fig,wheel,rot,'#30464D',7,'Fixed wheel')
+        # Airfoil-based horizontal tail stabilizer and elevator.
+        vs,fs=_aerofoil_surface(.90,.23,.16,side,xcenter=-.75,zroot=.095,dihedral_deg=0.,chord_from=0.,chord_to=.70,nspan=4,nchord=9)
+        _aircraft_hull(fig,vs,fs,'Horizontal tail (illustrative)', '#A9C5CE',rot,hover=True)
+        va,fa=_aerofoil_surface(.90,.23,.16,side,xcenter=-.75,zroot=.095,dihedral_deg=0.,chord_from=.72,chord_to=1.,nspan=4,nchord=7)
+        _control_surface(fig,'Elevator',side,va,fa,rot,'elevator_deg',(-.75+(.5-.72)*.23,0.,.095),'#90C9D0',float(row.get('elevator_deg',0.)))
+    # Rudder patch on vertical fin, illustrative hinged box geometry.
+    rv=np.array([[-.88,-.01,.07],[-.84,-.01,.30],[-.81,-.01,.31],[-.68,-.01,.08],
+                 [-.88,.01,.07],[-.84,.01,.30],[-.81,.01,.31],[-.68,.01,.08]])
+    _control_surface(fig,'Rudder',0,rv,_AIRCRAFT_BOX_FACES,rot,'rudder_deg',(-.81,0.,.18),'#78BBCA',float(row.get('rudder_deg',0.)),axis='vertical')
+    # IMU, magnetic and GNSS sensor illustrations. Position is not OEM-certified.
+    for name,loc,color in [('ILLUSTRATIVE IMU',(.05,0,.03),LIME),
+                           ('ILLUSTRATIVE MAGNETOMETER',(-.03,1.17,.27),ORANGE),
+                           ('ILLUSTRATIVE GNSS',(.15,0,.17),NEON_BLUE)]:
+        p=np.array(loc,dtype=float)@rot.T
+        fig.add_trace(go.Scatter3d(x=[p[0]],y=[p[1]],z=[p[2]],mode='markers',
+            marker=dict(size=5,color=color),name=name,showlegend=False,
+            hovertemplate=f'{name}<br>Illustrative mounting position<extra></extra>',
+            meta={'live_role':'sensor_marker','part':name,'local_vertices':[list(loc)]}))
+
+
+def add_estimated_ghost(fig, row, cfg):
+    """True aircraft remains solid. Ghost is an independently estimated pose."""
+    if 'estimated_roll_deg' not in row or 'estimated_pitch_deg' not in row:
+        return
+    if not np.isfinite(float(row.get('estimated_roll_deg',np.nan))) or not np.isfinite(float(row.get('estimated_pitch_deg',np.nan))):
+        return
+    rot=_aircraft_rotation(float(row.get('fused_heading_deg',0)),
+                           float(row.get('estimated_pitch_deg',0)),
+                           float(row.get('estimated_roll_deg',0)))
+    span=float(cfg['span'])
+    # Two minimal translucent surfaces preserve frame rate.
+    for side in (-1,1):
+        vs,fs=_aerofoil_surface(span,cfg['root_chord'],cfg['tip_chord'],side,nspan=4,nchord=8)
+        r=vs@rot.T
+        fig.add_trace(go.Mesh3d(x=r[:,0],y=r[:,1],z=r[:,2],i=fs[:,0],j=fs[:,1],k=fs[:,2],
+                                 opacity=.16,color=ORANGE,showlegend=False,flatshading=True,
+                                 name='ESTIMATED ATTITUDE GHOST',hoverinfo='skip',
+                                 meta={'live_role':'estimated_ghost','local_vertices':vs.round(6).tolist()}))
+    points=np.array([[.80,0,0],[-.93,0,0]])@rot.T
+    fig.add_trace(go.Scatter3d(x=points[:,0],y=points[:,1],z=points[:,2],
+                 mode='lines',line=dict(color=ORANGE,width=8,dash='dash'),
+                 showlegend=False,hoverinfo='skip',name='Estimated centerline',
+                 meta={'live_role':'estimated_ghost','local_vertices':[[.8,0,0],[-.93,0,0]]}))
+
+
+# ============================================================================
+# CLICK-TO-INSPECT + BROWSER-SYNCHRONIZED THREE-DIMENSIONAL INSTRUMENT PLAYBACK
+# All data come from the existing, unchanged simulation output dataframe. The
+# browser may interpolate dial geometry for a smooth display, but NEVER invents
+# sensor samples, estimator updates, integrity flags, or aircraft physics.
+# ============================================================================
+
+def compass_live_html(df: pd.DataFrame, selected_t: float, aircraft_view: str,
+                      heading_source: str, declination: float, configuration=None) -> str:
+    """Build one browser-side Plotly controller for dial, aircraft and track.
+
+    Plotly click events in 3D cannot be returned reliably by stock Streamlit
+    plotly_chart. The embedded HTML listens to plotly_click itself and keeps
+    all dynamic instrument views synchronized, without a dependency on a
+    third-party Streamlit component or further Python-engine modifications.
+    """
+    if df.empty:
+        raise ValueError("Simulation telemetry must contain at least one row")
+    row0 = df.iloc[0]
+    dial = compass_figure_3d(row0, declination)
+    needle_defs = [
+        ("TRUE heading", "true", "T", NEON_BLUE, .83, .19),
+        ("MAG corrected", "mag", "M", ORANGE, .73, .235),
+        ("FUSED heading", "fused", "F", LIME, .92, .275),
+    ]
+    label_to_role = {item[0]:item[1] for item in needle_defs}
+    for trace in dial.data:
+        role = label_to_role.get(getattr(trace, "legendgroup", None))
+        if role:
+            trace.meta = {"live_role": "needle", "kind": role,
+                          "part": "line" if isinstance(trace, go.Scatter3d) else "tip"}
+    for label, kind, short, color, radius, height in needle_defs:
+        rad = math.radians(90. - float(row0[{'true':'true_heading_deg','mag':'mag_true_heading_deg','fused':'fused_heading_deg'}[kind]]))
+        dial.add_trace(go.Scatter3d(
+            x=[radius*.78*math.cos(rad)], y=[radius*.78*math.sin(rad)], z=[height+.012],
+            mode="markers+text", text=[short], textposition="top center",
+            marker=dict(size=12, color=color, opacity=.95,
+                        line=dict(width=1.5, color="#050C13")),
+            textfont=dict(size=11,color=color),
+            name="Inspect " + label, showlegend=False,
+            hovertemplate="Click to inspect " + label + "<extra></extra>",
+            meta={"live_role":"hit", "kind":kind, "radius":radius, "height":height},
+        ))
+    # Estimated-heading uncertainty arc: visualizes the model's reported σ,
+    # not an empirical sensor confidence interval.
+    sigma0 = float(row0.get('heading_sigma_deg', np.nan))
+    if not np.isfinite(sigma0): sigma0 = 0.
+    angle_span = np.linspace(-max(0.1,min(90.,sigma0)),max(0.1,min(90.,sigma0)),35)
+    azi = np.radians(90.0-(float(row0.fused_heading_deg)+angle_span))
+    dial.add_trace(go.Scatter3d(x=.68*np.cos(azi),y=.68*np.sin(azi),z=np.full(35,.32),
+                 mode='lines',line=dict(color=LIME,width=7),opacity=.55,showlegend=False,
+                 name='Model-reported fused heading uncertainty',
+                 hovertemplate=f'Estimator-reported heading σ {sigma0:.2f}°<extra></extra>',
+                 meta={'live_role':'uncertainty_arc'}))
+    dial.add_trace(go.Scatter3d(
+        x=[0], y=[0], z=[.345], mode="markers", marker=dict(color=NEON_BLUE_BRIGHT,size=11),
+        name="Inspect full telemetry", showlegend=False,
+        meta={"live_role":"all"}, hovertemplate="Click to inspect all telemetry<extra></extra>"
+    ))
+    dial.update_layout(height=400, margin=dict(l=0,r=0,t=36,b=0),
+                       title=dict(text="3D COMPASS  |  CLICK A NEEDLE OR HUB",x=.02,
+                                  font=dict(color=NEON_BLUE_BRIGHT,size=12)))
+    # Render the airframe in its canonical 0° heading, 0° pitch, 0° roll so
+    # geometry is transformed from exactly the same known reference axes.
+    neutral = row0.copy()
+    for key in ("true_heading_deg","fused_heading_deg","mag_true_heading_deg",
+                "true_roll_deg","true_pitch_deg"):
+        neutral[key] = 0.
+    airframe = aircraft_figure_3d(neutral, aircraft_view, heading_source)
+    for i, trace in enumerate(airframe.data):
+        existing = getattr(trace, "meta", None)
+        if isinstance(existing, dict) and existing.get('live_role'):
+            continue  # Control surfaces, ghost and sensor-placement markers.
+        if i == len(airframe.data) - 1:
+            trace.meta = {"live_role":"heading_projection"}
+        elif isinstance(trace, (go.Mesh3d, go.Scatter3d)) and getattr(trace,'hoverinfo',None) != 'skip':
+            trace.meta = {"live_role":"airframe", "part":str(getattr(trace,'name', 'Airframe'))}
+        elif i < len(airframe.data) - 4:
+            trace.meta = {"live_role":"airframe", "part":str(getattr(trace,'name', 'Airframe'))}
+    airframe.update_layout(height=400, margin=dict(l=0,r=0,t=36,b=0),
+                           title=dict(text="SIG RASCAL-STYLE AIRFRAME | SYNCHRONIZED",
+                                      x=.02,font=dict(color=NEON_BLUE_BRIGHT,size=12)))
+    # DataFrame.to_json maps NaN/Inf to JSON null, preserving all measured
+    # columns (80 for the v4 physics profile). No artificial values are added.
+    samples = json.loads(df.to_json(orient="records", double_precision=10))
+    source_cfg = configuration
+    # A configured-field, truth-frame prediction is a model reference, NOT a
+    # second independent calibrated physical magnetometer observation.
+    ref_vectors=[]
+    for _, sample in df.iterrows():
+        _, reference, _ = mag_body_vectors(sample, source_cfg or AerospaceConfig())
+        ref_vectors.append([float(x) if np.isfinite(x) else None for x in reference])
+    payload = {
+        "samples": samples,
+        "reference_body_vectors": ref_vectors,
+        "dial": json.loads(dial.to_json()),
+        "airframe": json.loads(airframe.to_json()),
+        "aircraft_heading_source": heading_source,
+        "start_time": float(selected_t),
+        "scenario": str(getattr(df, "name", "") or ""),
+    }
+    raw = json.dumps(payload, separators=(",", ":"), allow_nan=False)
+    # Prevent input strings from prematurely closing a <script> element.
+    raw = raw.replace("</", "<\\/").replace("<!--", "<\\!--")
+    script = get_plotlyjs().replace("</script", "<\\/script")
+    template = r'''<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+*{box-sizing:border-box}body{margin:0;background:#071016;color:#dcf5f7;font:12px system-ui,-apple-system,Segoe UI,sans-serif}
+main{padding:10px 9px}.headline{color:#6af4ff;letter-spacing:.09em;font-weight:800;margin:4px 0 10px;font-size:12px}
+.player{padding:10px;border:1px solid #146574;border-radius:10px;background:#071a20;display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+button,select{background:#102b32;color:#c9fbff;border:1px solid #23768a;border-radius:6px;padding:6px 11px;cursor:pointer;font-size:12px}
+button:hover{background:#125069}button:focus-visible,input:focus-visible{outline:2px solid #00e5ff}
+input[type=range]{flex:1 1 180px;accent-color:#00e5ff;min-width:90px}input[type=checkbox]{accent-color:#00e5ff}
+.tclock{color:#00e5ff;font-weight:800;min-width:90px;font-variant-numeric:tabular-nums}
+.plots{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:8px;margin-top:10px}
+.plot{border:1px solid #193d48;background:#070f16;border-radius:10px;overflow:hidden;height:405px;min-width:0}
+#track{height:178px;margin-top:8px;border:1px solid #193d48;border-radius:10px}
+#magnetic3d{height:310px;border:1px solid #193d48;border-radius:10px;margin-top:8px}
+.fault-strip{display:flex;gap:6px;align-items:center;flex-wrap:wrap;max-height:80px;overflow:auto;padding:8px;border:1px solid #2b4d56;border-radius:8px;margin-top:9px}
+.fault-strip button{padding:3px 8px;font-size:10px;border-color:#8f5934}
+.subhead{color:#81e9ff;font-size:11px;font-weight:700;margin:13px 0 5px;letter-spacing:.06em}
+.inspect{margin-top:9px;border:1px solid #1c6171;border-radius:9px;padding:12px;background:#0b1b22}
+.inspect-head{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px}
+.inspect-title{font-weight:800;color:#68f6ff;letter-spacing:.06em}
+.needle-btns{display:flex;gap:6px;flex-wrap:wrap}.needle-btns button{padding:5px 9px}
+#summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-top:10px}
+.metric{border:1px solid #21434b;border-radius:7px;background:#0d262e;padding:8px;min-width:0;overflow:hidden}
+.metric .k{color:#92afb5;font-size:10px}.metric .v{font-weight:800;font-size:14px;color:#ebfbfc;margin-top:3px;overflow-wrap:anywhere}
+.tablehead{display:flex;gap:10px;justify-content:space-between;align-items:center;margin:11px 0 6px;flex-wrap:wrap}
+#filter{background:#0e2630;border:1px solid #265d6b;color:#e2ffff;border-radius:6px;padding:6px;max-width:300px;width:100%}
+.scroll{max-height:210px;overflow:auto;border:1px solid #22444d;border-radius:5px}
+table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}td{padding:5px 8px;border-bottom:1px solid #1b3942;overflow-wrap:anywhere}td:first-child{color:#a6ccd2;min-width:150px}td:last-child{text-align:right;color:#ddf7fa}
+.note{color:#a7bfc6;margin-top:8px;line-height:1.45}
+@media(max-width:700px){.plots{grid-template-columns:1fr}.plot{height:340px}#summary{grid-template-columns:repeat(2,minmax(0,1fr))}.player{gap:6px}}
+</style></head>
+<body><main><div class="headline">NEON 3D INSTRUMENTS · TRUE/ESTIMATED GHOST · CONTROL SURFACES · MAGNETIC FIELD · FAULT TIMELINE</div>
+<div class="player">
+<button id="play" aria-label="Play or pause">▶ PLAY</button><button id="home" aria-label="Go to start">⏮</button>
+<button id="back" aria-label="Previous recorded sample">◀</button><button id="next" aria-label="Next recorded sample">▶</button>
+<input id="scrub" type="range" min="0" value="0" step="0.01" aria-label="Simulation time" />
+<span id="time" class="tclock">0.00 s</span>
+<label>Speed <select id="rate"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select></label>
+<label><input id="loop" type="checkbox" checked /> Loop</label>
+<label title="Only animation angles are interpolated, not stored measurements"><input id="smooth" type="checkbox" checked /> Smooth dial</label>
+</div><div class="plots"><div id="compass" class="plot"></div><div id="aircraft" class="plot"></div></div>
+<div id="track"></div>
+<div class="subhead">MAGNETIC FIELD VECTOR · BODY FRD AXES (µT) · RECORDED SENSOR SAMPLES</div>
+<div id="magnetic3d"></div>
+<div class="subhead">CLICK TO SEEK · FAULTS AND SENSOR INTEGRITY EVENTS</div>
+<div id="faults" class="fault-strip"></div>
+<div class="inspect"><div class="inspect-head"><div id="inspector-title" class="inspect-title">ALL TELEMETRY · RECORDED SAMPLE</div>
+<div class="needle-btns"><button data-kind="true" style="color:#00e5ff">TRUE</button><button data-kind="mag" style="color:#ff9c43">MAG</button><button data-kind="fused" style="color:#a5ff4d">FUSED</button><button data-kind="all">ALL DATA</button></div></div>
+<div id="summary"></div><div class="tablehead"><span id="inspector-timestamp">Click a needle tip, dial hub, or button to inspect.</span>
+<input id="filter" type="search" placeholder="Filter all recorded telemetry fields" aria-label="Filter telemetry" /></div>
+<div class="scroll"><table><tbody id="full-data"></tbody></table></div>
+<div class="note">Click an aircraft surface or sensor marker to inspect its telemetry. True aircraft and translucent estimated-attitude ghost are physically separate displays. Airfoil and hinge geometry are illustrative, not manufacturer CAD. Magnetic reference vector is calculated from the configured magnetic field and simulated true pose, not independently measured. Numbers in the inspector are exact recorded simulation samples. Smooth motion interpolates only 3D geometry between recorded headings/attitudes, using shortest-arc circular heading interpolation. It does not interpolate IMU samples, fabricate GNSS measurements, improve sensor accuracy, or validate the aircraft's physics. Playback runs locally in your browser, not through Streamlit reruns.</div>
+</div></main><script>__PLOTLY_JS__</script><script>
+"use strict";
+const PAYLOAD=__PAYLOAD__;
+const data=PAYLOAD.samples, dial=PAYLOAD.dial, plane=PAYLOAD.airframe;
+const D=document, $=id=>D.getElementById(id);
+const cEl=$("compass"), aEl=$("aircraft"), tEl=$("track"), mEl=$("magnetic3d");
+const keys={true:"true_heading_deg",mag:"mag_true_heading_deg",fused:"fused_heading_deg"};
+const names={true:"TRUE NORTH",mag:"MAGNETIC CORRECTED",fused:"FUSED ESTIMATE",all:"ALL TELEMETRY"};
+const colors={true:"#00e5ff",mag:"#ff9c43",fused:"#a5ff4d"};
+const definitions={true:{radius:.83,z:.19},mag:{radius:.73,z:.235},fused:{radius:.92,z:.275}};
+let now=Number(PAYLOAD.start_time)||0, playing=false, rate=1, lastWall=null, prevPaint=0;
+let active="all", currentIdx=-1, redrawBusy=false, pending=null, activePart="";
+const lastT=Number(data[data.length-1].time_s)||0;
+now=Math.max(0,Math.min(lastT,now));$("scrub").max=String(lastT);
+function n(v){return (typeof v==="number" && Number.isFinite(v))?v:0}
+function norm(v){return ((v%360)+360)%360}
+function circular(a,b,u){let delta=((norm(b)-norm(a)+540)%360)-180;return norm(a+delta*u)}
+function clampTime(t){return Math.max(0,Math.min(lastT,t))}
+function lookup(t){let lo=0,hi=data.length-1;while(lo<hi){const m=(lo+hi)>>1;if(Number(data[m].time_s)<t)lo=m+1;else hi=m}
+ const next=lo,prev=Math.max(0,next-1);const a=data[prev],b=data[next],span=Math.max(1e-9,n(b.time_s)-n(a.time_s));
+ const u=prev===next?0:Math.max(0,Math.min(1,(t-n(a.time_s))/span));
+ const nearest=(next===prev||u<.5)?prev:next;return {a,b,u,idx:nearest,record:data[nearest]}}
+function sampleAttitude(rec0,rec1,u,enabled){const pick=k=>enabled?circular(n(rec0[k]),n(rec1[k]),u):n(rec0[k]);
+ const lin=k=>enabled?(n(rec0[k])+(n(rec1[k])-n(rec0[k]))*u):n(rec0[k]);
+ return {true:pick(keys.true),mag:pick(keys.mag),fused:pick(keys.fused),pitch:lin("true_pitch_deg"),bank:lin("true_roll_deg")}}
+const cParts=[],pParts=[];
+let uncertaintyArc=-1;
+for(let i=0;i<dial.data.length;i++){
+ const m=dial.data[i].meta;
+ if(m&&["needle","hit"].includes(m.live_role))cParts.push({idx:i,meta:m});
+ else if(m&&m.live_role==="uncertainty_arc")uncertaintyArc=i;
+}
+for(let i=0;i<plane.data.length;i++){
+ const tr=plane.data[i],m=tr.meta;if(!m||!m.live_role)continue;
+ if(m.live_role==="heading_projection"){pParts.push({idx:i,kind:"projection"});continue}
+ if(["airframe","estimated_ghost","sensor_marker","control_surface"].includes(m.live_role)){
+  const local=Array.isArray(m.local_vertices)?m.local_vertices:null;
+  pParts.push({idx:i,kind:m.live_role,bx:local?local.map(p=>p[0]):Array.from(tr.x||[]),
+   by:local?local.map(p=>p[1]):Array.from(tr.y||[]),
+   bz:local?local.map(p=>p[2]):Array.from(tr.z||[]),local:!!local,meta:m})
+ }}
+function coords(kind,part,heading){const spec=definitions[kind],ang=(90-heading)*Math.PI/180;
+ const dx=Math.cos(ang),dy=Math.sin(ang),px=-dy,py=dx,rad=spec.radius,z=spec.z;
+ const end=rad-.13;
+ if(part==="line")return {x:[0,end*dx],y:[0,end*dy],z:[z,z]};
+ if(part==="tip")return {x:[rad*dx,end*dx+.055*px,end*dx-.055*px],y:[rad*dy,end*dy+.055*py,end*dy-.055*py],z:[z,z,z]};
+ return {x:[rad*.78*dx],y:[rad*.78*dy],z:[z+.012]}}
+function rotateArray(part,yaw,pitch,roll,record){
+ const ps=yaw*Math.PI/180, th=pitch*Math.PI/180, ph=roll*Math.PI/180;
+ const cp=Math.cos(ps),sp=Math.sin(ps),ct=Math.cos(th),st=Math.sin(th),cr=Math.cos(ph),sr=Math.sin(ph);
+ const f=[sp*ct,cp*ct,st],port0=[-cp,sp,0],up0=[-sp*st,-cp*st,ct];
+ const port=port0.map((v,j)=>cr*v+sr*up0[j]),up=up0.map((v,j)=>-sr*v+cr*up0[j]);
+ const xx=[],yy=[],zz=[];
+ const meta=part.meta||{},key=meta.control_key;
+ const a=(key?Number(record[key])||0:0)*(Number(meta.sign)||1)*Math.PI/180;
+ const hinge=meta.hinge||[0,0,0];
+ for(let k=0;k<part.bx.length;k++){
+  // Embedded local vertices use FWD / PORT / UP. Legacy neutral-world vertices
+  // need conversion to that frame before applying the dynamic attitude.
+  let x=part.local?part.bx[k]:part.by[k];
+  let y=part.local?part.by[k]:-part.bx[k];
+  let z=part.bz[k];
+  if(key){if(meta.axis==="vertical"){
+    const dx=x-hinge[0],dy=y-hinge[1];x=hinge[0]+dx*Math.cos(a)-dy*Math.sin(a);y=hinge[1]+dx*Math.sin(a)+dy*Math.cos(a);
+   }else{
+    const dx=x-hinge[0],dz=z-hinge[2];x=hinge[0]+dx*Math.cos(a)-dz*Math.sin(a);z=hinge[2]+dx*Math.sin(a)+dz*Math.cos(a);
+   }}
+  xx.push(f[0]*x+port[0]*y+up[0]*z); yy.push(f[1]*x+port[1]*y+up[1]*z); zz.push(f[2]*x+port[2]*y+up[2]*z)
+ }
+ return {x:xx,y:yy,z:zz,forward:f}
+}
+const plotConfig={responsive:true,displaylogo:false,scrollZoom:true,modeBarButtonsToRemove:["toImage"]};
+const trackCfg={responsive:true,displaylogo:false,displayModeBar:false};
+const trackData=[
+ {type:"scattergl",mode:"lines",x:data.map(r=>r.true_e_m),y:data.map(r=>r.true_n_m),line:{color:"#00e5ff",width:2},name:"Truth trajectory",hoverinfo:"skip"},
+ {type:"scattergl",mode:"lines",x:data.map(r=>r.estimated_e_m),y:data.map(r=>r.estimated_n_m),line:{color:"#a5ff4d",width:1,dash:"dot"},name:"Estimated",hoverinfo:"skip"},
+ {type:"scattergl",mode:"markers",x:[n(data[0].true_e_m)],y:[n(data[0].true_n_m)],marker:{size:12,color:"#ff9c43",line:{width:2,color:"white"}},name:"Live aircraft",hovertemplate:"Simulation position<extra></extra>"}
+];
+const trackLayout={template:"plotly_dark",paper_bgcolor:"#071016",plot_bgcolor:"#0a1820",height:171,
+ margin:{l:56,r:18,t:30,b:38},title:{text:"SYNCHRONIZED 2D MISSION TRACK · EAST / NORTH",font:{size:11,color:"#6af4ff"},x:.01},
+ xaxis:{title:{text:"East (m)",font:{size:10}},gridcolor:"#183843",zeroline:false,scaleanchor:"y",scaleratio:1},
+ yaxis:{title:{text:"North (m)",font:{size:10}},gridcolor:"#183843",zeroline:false},
+ legend:{orientation:"h",x:0,y:-.4,font:{size:10}},uirevision:"track"};
+const magneticData=[
+ {type:"scatter3d",mode:"lines+markers",x:[0,0],y:[0,0],z:[0,0],
+  line:{color:"#ff9c43",width:11},marker:{color:"#ff9c43",size:5},name:"Recorded magnetometer"},
+ {type:"scatter3d",mode:"lines+markers",x:[0,0],y:[0,0],z:[0,0],
+  line:{color:"#00e5ff",width:7,dash:"dash"},marker:{color:"#00e5ff",size:4},name:"Configured model reference"}
+];
+let magneticMax=20;
+for(const r of data){for(const k of ['mag_body_x_ut','mag_body_y_ut','mag_body_z_ut']){
+ if(typeof r[k]==='number'&&Number.isFinite(r[k]))magneticMax=Math.max(magneticMax,Math.abs(r[k]))}}
+for(const vector of PAYLOAD.reference_body_vectors){for(const v of vector||[]){
+ if(typeof v==='number'&&Number.isFinite(v))magneticMax=Math.max(magneticMax,Math.abs(v))}}
+magneticMax=Math.min(5000,magneticMax*1.2);
+const magneticLayout={template:"plotly_dark",paper_bgcolor:"#071016",height:305,
+ margin:{l:0,r:0,t:15,b:6},legend:{orientation:"h",x:.02,y:-.04,font:{size:10}},
+ scene:{bgcolor:"#071016",aspectmode:"cube",camera:{eye:{x:1.4,y:-1.8,z:1.1}},
+ xaxis:{title:"FWD X µT",range:[-magneticMax,magneticMax]},yaxis:{title:"RIGHT Y µT",range:[-magneticMax,magneticMax]},zaxis:{title:"DOWN Z µT",range:[-magneticMax,magneticMax]}},uirevision:"body_field"};
+function val(v){if(v===null||v===undefined)return "Not recorded";if(typeof v==="boolean")return v?"TRUE":"FALSE";if(typeof v==="number")return Number.isFinite(v)?(Math.abs(v)>=1000?v.toFixed(2):v.toFixed(4).replace(/0+$/,"").replace(/\.$/,"")):"Not recorded";return String(v)}
+function metric(k,v,color){const card=D.createElement("div");card.className="metric";const title=D.createElement("div");title.className="k";title.textContent=k;
+ const value=D.createElement("div");value.className="v";value.textContent=v;if(color)value.style.color=color;card.append(title,value);return card}
+function renderInspector(){const frame=lookup(now),r=frame.record;$("inspector-title").textContent=(activePart?activePart+" · ":"")+names[active]+" · CLICK-TO-INSPECT";
+ $("inspector-timestamp").textContent="Recorded sample "+(frame.idx+1)+" / "+data.length+"  |  t = "+n(r.time_s).toFixed(2)+" s";
+ const list=[
+ ["TRUE HEADING",val(r.true_heading_deg)+"°",colors.true],
+ ["MAGNETIC CORRECTED",val(r.mag_true_heading_deg)+"°",colors.mag],
+ ["FUSED HEADING",val(r.fused_heading_deg)+"°",colors.fused],
+ ["HEADING ERROR",val(r.mag_error_deg)+"°", "#ff9c43"],
+ ["FIELD STRENGTH",val(r.mag_field_ut)+" μT",null],
+ ["MAG INNOVATION",val(r.mag_innovation_deg)+"°",null],
+ ["MAG SAMPLE",r.mag_accepted===true?"ACCEPTED":"REJECTED",r.mag_accepted?"#a5ff4d":"#ff6368"],
+ ["NAVIGATION HEALTH",val(r.health),null],
+ ["BANK",val(r.true_roll_deg)+"°",null],
+ ["PITCH",val(r.true_pitch_deg)+"°",null],
+ ["AIRSPEED",val(r.airspeed_mps)+" m/s",null],
+ ["POSITION ERROR",val(r.position_error_m)+" m",null],
+ ["AILERON",val(r.aileron_deg)+"°",null],["ELEVATOR",val(r.elevator_deg)+"°",null],
+ ["RUDDER",val(r.rudder_deg)+"°",null],["THROTTLE",val(r.throttle),null],
+ ["MAG NIS",val(r.mag_nis),null],["GNSS NIS",val(r.gnss_nis),null],
+ ["HEADING σ",val(r.heading_sigma_deg)+"°",null]];
+ const chosen=active==="all"?list:list.filter(x=>x[0].startsWith(active==="true"?"TRUE":active==="mag"?"MAG":"FUSED")||["HEADING ERROR","MAG INNOVATION","MAG SAMPLE","FIELD STRENGTH","NAVIGATION HEALTH"].includes(x[0]));
+ const top=$("summary");top.replaceChildren();for(const x of chosen)top.appendChild(metric(...x));
+ const q=$("filter").value.trim().toLowerCase(),table=$("full-data");table.replaceChildren();
+ for(const [k,v] of Object.entries(r)){if(q&&!k.toLowerCase().includes(q)&&!val(v).toLowerCase().includes(q))continue;
+  const tr=D.createElement("tr"),name=D.createElement("td"),value=D.createElement("td");name.textContent=k;value.textContent=val(v);tr.append(name,value);table.appendChild(tr)}
+}
+let previousFrame=-1;
+async function draw(t){if(redrawBusy){pending=t;return}redrawBusy=true;
+ try{
+ const v=lookup(t),smooth=$("smooth").checked,orient=sampleAttitude(smooth?v.a:v.record,smooth?v.b:v.record,v.u,smooth);
+ const cinds=[], cx=[],cy=[],cz=[],hovers=[];
+ for(const part of cParts){const h=orient[part.meta.kind],xyz=coords(part.meta.kind,part.meta.part||"hit",h);
+  cinds.push(part.idx);cx.push(xyz.x);cy.push(xyz.y);cz.push(xyz.z);hovers.push(""+names[part.meta.kind]+": "+h.toFixed(2)+"°<extra></extra>")}
+ const ainds=[],ax=[],ay=[],az=[];
+ const row=v.record;
+ // Solid aircraft ALWAYS represents physical truth. Ghost is estimated attitude.
+ for(const part of pParts){let vtx;
+  if(part.kind==="projection"){const r=orient.true*Math.PI/180;vtx={x:[0,1.25*Math.sin(r)*Math.cos(orient.pitch*Math.PI/180)],y:[0,1.25*Math.cos(r)*Math.cos(orient.pitch*Math.PI/180)],z:[-.47,-.47]}}
+  else if(part.kind==="estimated_ghost"){
+   // Ghost roll/pitch estimates are from the *recorded* attitude estimator, not truth.
+   const ghostYaw=orient.fused;
+   const ghostPitch=typeof row.estimated_pitch_deg==='number'&&Number.isFinite(row.estimated_pitch_deg)?row.estimated_pitch_deg:orient.pitch;
+   const ghostRoll=typeof row.estimated_roll_deg==='number'&&Number.isFinite(row.estimated_roll_deg)?row.estimated_roll_deg:orient.bank;
+   vtx=rotateArray(part,ghostYaw,ghostPitch,ghostRoll,row);
+  }else vtx=rotateArray(part,orient.true,orient.pitch,orient.bank,row);
+  ainds.push(part.idx);ax.push(vtx.x);ay.push(vtx.y);az.push(vtx.z)}
+ const promises=[];
+ if(cinds.length)promises.push(Plotly.restyle(cEl,{x:cx,y:cy,z:cz,hovertemplate:hovers},cinds));
+ if(uncertaintyArc>=0){
+  const sigma=Number.isFinite(Number(v.record.heading_sigma_deg))&&v.record.heading_sigma_deg!==null
+    ?Math.max(.1,Math.min(90.,Number(v.record.heading_sigma_deg))):.1;
+  const ra=Array.from({length:35},(_,i)=>orient.fused+sigma*(-1+2*i/34));
+  promises.push(Plotly.restyle(cEl,{x:[ra.map(a=>.68*Math.cos((90-a)*Math.PI/180))],
+   y:[ra.map(a=>.68*Math.sin((90-a)*Math.PI/180))],z:[ra.map(()=>.32)]},[uncertaintyArc]));
+ }
+ if(ainds.length)promises.push(Plotly.restyle(aEl,{x:ax,y:ay,z:az},ainds));
+ if(v.idx!==previousFrame){const row=v.record;previousFrame=v.idx;
+  promises.push(Plotly.restyle(tEl,{x:[[n(row.true_e_m)]],y:[[n(row.true_n_m)]]},[2]));
+  const obs=[n(row.mag_body_x_ut),n(row.mag_body_y_ut),n(row.mag_body_z_ut)];
+  const ref=PAYLOAD.reference_body_vectors[v.idx]||[0,0,0];
+  promises.push(Plotly.restyle(mEl,{x:[[0,obs[0]],[0,n(ref[0])]],
+   y:[[0,obs[1]],[0,n(ref[1])]],z:[[0,obs[2]],[0,n(ref[2])]]},[0,1]));
+  renderInspector()}
+ $("time").textContent=now.toFixed(2)+" / "+lastT.toFixed(2)+" s";
+ $("scrub").value=String(now);
+ await Promise.all(promises);
+ }finally{redrawBusy=false;if(pending!==null){const p=pending;pending=null;draw(p)}}}
+function select(kind){active=kind;renderInspector();for(const b of D.querySelectorAll("[data-kind]"))b.style.borderColor=b.dataset.kind===kind?"#00e5ff":"#23768a"}
+for(const b of D.querySelectorAll("[data-kind]"))b.addEventListener("click",()=>select(b.dataset.kind));
+$("filter").addEventListener("input",renderInspector);
+$("play").addEventListener("click",()=>{playing=!playing;lastWall=null;$("play").textContent=playing?"⏸ PAUSE":"▶ PLAY"});
+$("home").addEventListener("click",()=>{playing=false;now=0;lastWall=null;$("play").textContent="▶ PLAY";draw(now)});
+function step(shift){playing=false;$("play").textContent="▶ PLAY";const i=lookup(now).idx;now=n(data[Math.max(0,Math.min(data.length-1,i+shift))].time_s);draw(now)}
+$("back").addEventListener("click",()=>step(-1));$("next").addEventListener("click",()=>step(1));
+$("scrub").addEventListener("input",e=>{now=clampTime(Number(e.target.value));playing=false;$("play").textContent="▶ PLAY";draw(now)});
+$("rate").addEventListener("change",e=>{rate=Number(e.target.value)||1});
+$("smooth").addEventListener("change",()=>draw(now));
+let priorWall=null, priorDraw=0;
+function tick(w){if(priorWall===null)priorWall=w;
+ const dt=Math.min((w-priorWall)/1000,.2);priorWall=w;
+ if(playing){now+=dt*rate;if(now>=lastT){if($("loop").checked){now=0;previousFrame=-1}else{now=lastT;playing=false;$("play").textContent="▶ PLAY"}}
+  if(w-priorDraw>=65){priorDraw=w;draw(now)}}requestAnimationFrame(tick)}
+async function init(){await Promise.all([
+ Plotly.newPlot(cEl,dial.data,dial.layout,plotConfig),Plotly.newPlot(aEl,plane.data,plane.layout,plotConfig),
+ Plotly.newPlot(tEl,trackData,trackLayout,trackCfg),
+ Plotly.newPlot(mEl,magneticData,magneticLayout,plotConfig)]);
+ cEl.on("plotly_click",event=>{const hit=event.points&&event.points[0];const meta=hit&&dial.data[hit.curveNumber]&&dial.data[hit.curveNumber].meta;
+  activePart="";if(meta){if(meta.live_role==="all")select("all");else if(meta.kind)select(meta.kind)}else select("all")});
+ aEl.on("plotly_click",event=>{const hit=event.points&&event.points[0];const meta=hit&&plane.data[hit.curveNumber]&&plane.data[hit.curveNumber].meta;
+  activePart=meta&&(meta.part||meta.live_role)||"AIRCRAFT";select("all")});
+ let count=0;
+ for(let j=0;j<data.length;j++){
+  const r=data[j],prev=j?data[j-1]:null;
+  let msg="";if(r.mag_fault_active&&(!prev||!prev.mag_fault_active))msg="MAG FAULT";
+  else if(r.gnss_fault_active&&(!prev||!prev.gnss_fault_active))msg="GNSS FAULT";
+  else if(prev&&r.mag_accepted!==prev.mag_accepted)msg=r.mag_accepted?"MAG RECOVERED":"MAG REJECTED";
+  else if(prev&&r.health!==prev.health)msg="HEALTH: "+r.health;
+  if(msg&&count<60){count++;const b=D.createElement("button");b.textContent=Number(r.time_s).toFixed(1)+"s · "+msg;
+   b.addEventListener("click",()=>{playing=false;$("play").textContent="▶ PLAY";now=Number(r.time_s);draw(now)});$("faults").appendChild(b)}
+ }
+ if(!count)$("faults").textContent="No health/fault state transitions in this recorded scenario.";
+ select("all");await draw(now);requestAnimationFrame(tick);
+}
+init().catch(err=>{const el=D.createElement("pre");el.style.color="#ff8080";el.textContent="Instrument playback unavailable: "+String(err);D.body.prepend(el)});
+</script></body></html>'''
+    return template.replace("__PLOTLY_JS__", script).replace("__PAYLOAD__", raw)
+
+
+# ============================================================================
+# v8: MATRIX-BASED FLIGHT & SENSOR ENGINEERING LAB
+# All analysis is supplemental. This code never modifies the original engines,
+# sensor observations, or recorded estimator states.
+# ============================================================================
+
+
+def matrix_attitude_diagnostics(row: pd.Series) -> dict:
+    """ENU drawing DCM from aircraft axes (forward, port, up); quaternion xyzw.
+
+    R is a 3-D geometry transform, not an assertion about the internal
+    FRD-to-NED flight-dynamics implementation.
+    """
+    from scipy.spatial.transform import Rotation
+    yaw = float(row.get('true_heading_deg', 0.0))
+    pitch = float(row.get('true_pitch_deg', 0.0))
+    roll = float(row.get('true_roll_deg', 0.0))
+    rotation = _aircraft_rotation(yaw, pitch, roll)
+    ortho = rotation.T @ rotation
+    q = Rotation.from_matrix(rotation).as_quat()
+    pos = np.array([float(row.get('true_e_m', 0.0)),
+                    float(row.get('true_n_m', 0.0)),
+                    float(row.get('true_altitude_m', 0.0))])
+    # Illustrative installations, offsets in drawing body FWD / PORT / UP.
+    mounts = np.array([[.0, .0, .0], [.21, -.22, .13], [-.57, .03, .11]])
+    names = ['Approx. CG / body origin', 'Illustrative magnetometer',
+             'Illustrative GNSS antenna']
+    enu = mounts @ rotation.T + pos
+    return dict(R=rotation, RtR=ortho, determinant=float(np.linalg.det(rotation)),
+                ortho_error=float(np.linalg.norm(ortho-np.eye(3))),
+                quaternion=q, position_enu=pos,
+                mounts_body=mounts, mounts_enu=enu, mount_names=names)
+
+
+def deterministic_magnetic_sweep(n: int = 360, magnitude_ut: float = 43.6,
+                                 coverage: str = 'Full 3-axis excitation',
+                                 soft_matrix: np.ndarray | None = None,
+                                 hard_bias_ut: np.ndarray | None = None,
+                                 noise_std_ut: float = .12, seed: int = 101) -> dict:
+    """Controlled synthetic calibration exercise, separate from flight physics."""
+    n = int(n)
+    if n < 30 or not np.isfinite(magnitude_ut) or magnitude_ut <= 0:
+        raise ValueError('Calibration requires at least 30 samples and a positive field intensity.')
+    k = np.arange(n, dtype=float)
+    phi = np.pi*(3.0-np.sqrt(5.0))*k
+    if coverage == 'Full 3-axis excitation':
+        z = 1.0 - 2.0*(k+.5)/n
+        r = np.sqrt(np.maximum(0., 1.-z*z))
+        v = np.column_stack((r*np.cos(phi), r*np.sin(phi), z))
+    elif coverage == 'Mostly yaw-only':
+        # Constant earth-field inclination and only a yaw maneuver.
+        z = np.full(n, .82)
+        rr = np.sqrt(1.-z*z)
+        v = np.column_stack((rr*np.cos(2*np.pi*k/n),
+                             rr*np.sin(2*np.pi*k/n), z))
+    elif coverage == 'Limited pitch and roll':
+        z = .70 + .10*np.sin(2*np.pi*k/n)
+        rr = np.sqrt(1.-z*z)
+        v = np.column_stack((rr*np.cos(2*np.pi*k/n),
+                             rr*np.sin(2*np.pi*k/n), z))
+    else:
+        raise ValueError('Unknown calibration-excitation profile.')
+    S = np.eye(3) if soft_matrix is None else np.asarray(soft_matrix, dtype=float)
+    b = np.array([3.0, -1.5, 2.0]) if hard_bias_ut is None else np.asarray(hard_bias_ut, dtype=float)
+    if S.shape != (3,3) or b.shape != (3,):
+        raise ValueError('Invalid calibration-matrix shape.')
+    rng = np.random.default_rng(int(seed))
+    ideal = magnitude_ut*v
+    measured = ideal @ S.T + b + rng.normal(0.,float(noise_std_ut),ideal.shape)
+    return dict(raw=measured, ideal=ideal, soft_matrix=S, hard_bias_ut=b,
+                noise_std_ut=float(noise_std_ut), coverage=coverage,
+                expected_intensity_ut=float(magnitude_ut))
+
+
+def fit_magnetic_ellipsoid(measurements_ut: np.ndarray,
+                           expected_intensity_ut: float) -> dict:
+    """Fit symmetric affine ellipsoid with SVD and SPD guardrails.
+
+    x=raw/B, x.T A x + 2*g.T x = 1. The SPD quadratic form is
+    recentered and its square root turns the ellipsoid into a sphere.
+    An ill-excited or indefinite fit fails visibly instead of silently
+    reporting meaningless correction coefficients.
+    """
+    raw = np.asarray(measurements_ut, dtype=float)
+    B = float(expected_intensity_ut)
+    if raw.ndim != 2 or raw.shape[1] != 3 or B <= 0 or not np.isfinite(B):
+        raise ValueError('Calibration data must be N×3 and reference field positive.')
+    raw = raw[np.all(np.isfinite(raw),axis=1)]
+    if len(raw) < 30:
+        return dict(ok=False, reason='Fewer than 30 complete 3-axis measurements.', n=len(raw))
+    x = raw/B
+    xx, yy, zz = x.T
+    design = np.column_stack((xx*xx, yy*yy, zz*zz,
+                              2*xx*yy, 2*xx*zz, 2*yy*zz,
+                              2*xx, 2*yy, 2*zz))
+    # Scaling by 3-D reference intensity prevents unit-induced poor conditioning.
+    u, singular, vh = np.linalg.svd(design, full_matrices=False)
+    maxsv = float(singular[0])
+    rank = int(np.sum(singular > maxsv * 1e-10))
+    cond = float(singular[0]/singular[-1]) if singular[-1] > 1e-15 else float('inf')
+    diagnostics = dict(n=len(raw), rank=rank, condition=cond, singular_values=singular,
+                       design_matrix=design)
+    if rank < 9 or cond > 1e5:
+        return dict(ok=False, reason='Insufficient 3-axis excitation (rank deficient or poorly conditioned).',
+                    **diagnostics)
+    coeff = vh.T @ ((u.T @ np.ones(len(raw)))/singular)
+    A = np.array([[coeff[0],coeff[3],coeff[4]],
+                  [coeff[3],coeff[1],coeff[5]],
+                  [coeff[4],coeff[5],coeff[2]]],float)
+    g = np.array(coeff[6:9],float)
+    ev = np.linalg.eigvalsh(A)
+    if np.min(ev) <= 1e-10:
+        return dict(ok=False, reason='Fitted ellipsoid quadratic form is not positive-definite.',
+                    **diagnostics)
+    center = -np.linalg.solve(A,g)
+    k = 1.0+float(g @ np.linalg.solve(A,g))
+    if k <= 1e-10:
+        return dict(ok=False, reason='Fitted ellipsoid normalization is invalid.',
+                    **diagnostics)
+    shape_matrix = A/k
+    values, vectors = np.linalg.eigh(shape_matrix)
+    if np.min(values) <= 1e-10:
+        return dict(ok=False, reason='Fitted ellipsoid has invalid semiaxes.',
+                    **diagnostics)
+    correction = (vectors*np.sqrt(values)) @ vectors.T
+    bias = center*B
+    calibrated = (raw-bias) @ correction.T
+    corrected_norm = np.linalg.norm(calibrated,axis=1)
+    raw_norm = np.linalg.norm(raw,axis=1)
+    # Report deviations from EXPECTED field, including bias; do not hide systematic offsets.
+    before = float(np.sqrt(np.mean((raw_norm-B)**2)))
+    after = float(np.sqrt(np.mean((corrected_norm-B)**2)))
+    return dict(ok=True, reason='', center_ut=bias, correction=correction,
+                normalized_shape=shape_matrix, semiaxes_ut=B/np.sqrt(values),
+                calibrated=calibrated, norm_rmse_before_ut=before,
+                norm_rmse_after_ut=after, **diagnostics)
+
+
+def matrix_position_covariance(df: pd.DataFrame, row_idx: int, window_s: float,
+                               source: str = 'Estimator diagonal (recorded)') -> dict:
+    """Separate recorded covariance diagonals from empirical centered error scatter."""
+    index = int(np.clip(row_idx,0,len(df)-1))
+    row = df.iloc[index]
+    end = float(row.time_s)
+    mask = (df.time_s.to_numpy(float) >= end-float(window_s)-1e-9) & (df.time_s.to_numpy(float)<=end+1e-9)
+    part = df.loc[mask]
+    err = np.column_stack((part.true_e_m.to_numpy(float)-part.estimated_e_m.to_numpy(float),
+                           part.true_n_m.to_numpy(float)-part.estimated_n_m.to_numpy(float)))
+    err = err[np.all(np.isfinite(err),axis=1)]
+    bias = np.mean(err, axis=0) if len(err) else np.zeros(2)
+    if source == 'Estimator diagonal (recorded)':
+        # Off-diagonal state covariance terms are not exported by this engine.
+        cov = np.diag([max(0., float(row.position_cov_ee)),
+                       max(0., float(row.position_cov_nn))])
+        center = np.array([float(row.estimated_e_m), float(row.estimated_n_m)])
+        description = 'Recorded E and N covariance diagonals only; cross-covariance is unavailable and set to zero FOR DISPLAY.'
+    elif source == 'Empirical truth-error covariance (window)':
+        if len(err)<3:
+            raise ValueError('At least three truth/error samples are required for empirical covariance.')
+        cov = np.cov(err,rowvar=False,ddof=1)
+        center = np.array([float(row.estimated_e_m),float(row.estimated_n_m)])+bias
+        description = 'Sample covariance of centered truth-minus-estimate residuals in the selected window; not instantaneous filter uncertainty or calibrated coverage.'
+    else:
+        raise ValueError('Unknown covariance source')
+    eig, vec = np.linalg.eigh((cov+cov.T)*.5)
+    eig = np.maximum(eig, 0.)
+    r = np.sqrt(5.991464547*np.maximum(eig,0.))
+    th = np.linspace(0,2*np.pi,145)
+    loop = center[:,None]+vec @ (r[:,None]*np.vstack((np.cos(th),np.sin(th))))
+    return dict(P=cov,eigenvalues=eig,eigenvectors=vec,ellipse=loop,center=center,
+                empirical_mean_error=bias,empirical_count=len(err),description=description,
+                row=row)
+
+
+def linearized_fusion_diagnostics(row: pd.Series, config, dt_s: float,
+                                  position_noise_m_sqrt_s: float=.45,
+                                  yaw_noise_deg_sqrt_s: float=.25,
+                                  magnetic_sigma_deg: float=3.0,
+                                  availability_aware: bool=True) -> dict:
+    """Observable three-state [E,N,heading-radians] *demonstration* KF.
+
+    Does NOT reconstruct or overwrite the actual engine's 6/15-state EKF.
+    P0 has only recorded diagonal marginals, not unlogged correlations.
+    """
+    dt = max(float(dt_s),1e-6)
+    psi = math.radians(float(row.fused_heading_deg))
+    v = float(row.get('airspeed_mps',getattr(config,'speed_mps',0.)))
+    F = np.eye(3)
+    F[0,2] = dt*v*math.cos(psi)
+    F[1,2] = -dt*v*math.sin(psi)
+    p0 = np.diag([max(float(row.position_cov_ee), 1e-10),
+                  max(float(row.position_cov_nn), 1e-10),
+                  max(math.radians(float(row.heading_sigma_deg))**2, 1e-12)])
+    q = np.diag([position_noise_m_sqrt_s**2*dt]*2+
+                [math.radians(yaw_noise_deg_sqrt_s)**2*dt])
+    predicted = F @ p0 @ F.T+q
+    # GNSS samples and magnetometer acceptance flags from the recorded timeline.
+    gnss_on = bool(row.get('gnss_accepted',False)) if availability_aware else True
+    mag_on = bool(row.get('mag_accepted',False)) if availability_aware else True
+    hrows=[]; rvars=[]; names=[]
+    gnss_sigma = max(float(getattr(config,'gnss_sigma_m',1.5)),.001)
+    if gnss_on:
+        hrows += [[1.,0.,0.],[0.,1.,0.]]
+        rvars += [gnss_sigma**2]*2
+        names += ['GNSS East position','GNSS North position']
+    if mag_on:
+        hrows += [[0.,0.,1.]]
+        rvars.append(math.radians(max(.01,float(magnetic_sigma_deg)))**2)
+        names.append('Magnetic heading (hypothetical R)')
+    H = np.asarray(hrows,float).reshape(-1,3)
+    R = np.diag(rvars)
+    if len(H):
+        S = H @ predicted @ H.T + R
+        K = np.linalg.solve(S,H @ predicted).T
+        I_KH = np.eye(3)-K@H
+        updated = I_KH@predicted@I_KH.T+K@R@K.T
+    else:
+        S = np.empty((0,0)); K=np.empty((3,0)); updated=predicted.copy()
+    O = np.vstack([H,H@F,H@F@F]) if len(H) else np.empty((0,3))
+    sv = np.linalg.svd(O,compute_uv=False) if len(O) else np.array([])
+    rank = int(np.linalg.matrix_rank(O,tol=max(float(sv[0]),1.)*1e-10)) if len(O) else 0
+    return dict(F=F,P0=p0,Q=q,P_pred=predicted,H=H,R=R,S=S,K=K,P_post=updated,
+                observability=O,obs_singular_values=sv,obs_rank=rank,
+                measurement_names=names,availability_aware=availability_aware)
+
+
+def la_covariance_figure(df: pd.DataFrame, data: dict) -> go.Figure:
+    point = data['row']; circle=data['ellipse']
+    fig=go.Figure()
+    fig.add_trace(go.Scatter(x=circle[0],y=circle[1],mode='lines',name='Gaussian 95% reference',
+                             line=dict(color=NEON_BLUE,width=3),fill='toself',
+                             fillcolor='rgba(0,229,255,.10)'))
+    fig.add_trace(go.Scatter(x=[float(point.estimated_e_m)],y=[float(point.estimated_n_m)],
+                             mode='markers',name='Recorded estimated position',marker=dict(color=LIME,size=10)))
+    fig.add_trace(go.Scatter(x=[float(point.true_e_m)],y=[float(point.true_n_m)],
+                             mode='markers',name='Simulated truth',marker=dict(color=ORANGE,size=10,symbol='x')))
+    fig.update_layout(title='Covariance eigensystem | East/North error ellipse',
+                      xaxis_title='East (m)',yaxis_title='North (m)',height=440,
+                      yaxis=dict(scaleanchor='x',scaleratio=1),
+                      legend=dict(orientation='h',y=-.18))
+    return theme(fig,440)
+
+
+def la_attitude_figure(data: dict) -> go.Figure:
+    R = data['R']; origin=data['position_enu']; mounts=data['mounts_enu']
+    fig=go.Figure()
+    colors=[ORANGE, NEON_BLUE,LIME]
+    for i,label in enumerate(['Body forward','Body port','Body up']):
+        end=origin+R[:,i]*.65
+        fig.add_trace(go.Scatter3d(x=[origin[0],end[0]],y=[origin[1],end[1]],
+                                   z=[origin[2],end[2]],mode='lines+markers',
+                                   line=dict(color=colors[i],width=9),marker=dict(size=3),name=label))
+    fig.add_trace(go.Scatter3d(x=mounts[:,0],y=mounts[:,1],z=mounts[:,2],
+                 mode='markers+text',text=data['mount_names'],textposition='top center',
+                 marker=dict(size=6,color=[LIME,ORANGE,NEON_BLUE]),name='Body-frame installation markers'))
+    fig.update_layout(template='plotly_dark',paper_bgcolor=BG,plot_bgcolor=BG,
+                      height=460,margin=dict(t=45,b=0,l=0,r=0),
+                      scene=dict(xaxis_title='East (m)',yaxis_title='North (m)',
+                                 zaxis_title='Up (m)',aspectmode='data'),
+                      title='Live body-frame basis vectors transformed to ENU')
+    return fig
+
+
+def la_magnetic_fit_figure(sweep: dict, fit: dict) -> go.Figure:
+    raw=sweep['raw']; ideal=sweep.get('ideal')
+    fig=go.Figure()
+    max_samples=220
+    inds=np.unique(np.linspace(0,len(raw)-1,min(len(raw),max_samples)).astype(int))
+    fig.add_trace(go.Scatter3d(x=raw[inds,0],y=raw[inds,1],z=raw[inds,2],
+                               mode='markers',name='Raw magnetic vector',
+                               marker=dict(size=2.4,color=ORANGE,opacity=.75)))
+    if fit['ok']:
+        cal=fit['calibrated']
+        fig.add_trace(go.Scatter3d(x=cal[inds,0],y=cal[inds,1],z=cal[inds,2],
+                                   mode='markers',name='SVD-fit correction',
+                                   marker=dict(size=2.4,color=NEON_BLUE,opacity=.75)))
+    if ideal is not None:
+        fig.add_trace(go.Scatter3d(x=ideal[inds,0],y=ideal[inds,1],z=ideal[inds,2],
+                                   mode='markers',name='Known synthetic truth',
+                                   marker=dict(size=1.7,color=LIME,opacity=.37)))
+    fig.update_layout(template='plotly_dark',paper_bgcolor=BG,plot_bgcolor=BG,
+                      title='3-axis magnetic calibration | raw versus correction',
+                      height=510,margin=dict(t=50,b=0,l=0,r=0),
+                      scene=dict(xaxis_title='Body X (µT)',yaxis_title='Body Y (µT)',
+                                 zaxis_title='Body Z (µT)',aspectmode='data'),
+                      legend=dict(orientation='h',y=-.08))
+    return fig
+
+
+def la_matrix_table(matrix: np.ndarray, rows: list[str], cols: list[str]) -> pd.DataFrame:
+    return pd.DataFrame(np.asarray(matrix,dtype=float),index=rows,columns=cols)
+
+
+def linear_algebra_lab(df: pd.DataFrame, c, time_s: float):
+    """All visual/math controls are isolated from production engine state."""
+    panel_header('04 / MATRIX LABORATORY', 'Linear Algebra & State Estimation',
+                 'Live aircraft transforms, calibration observability, covariance eigensystems and a transparent reduced-order Kalman demonstration.',
+                 compass=True)
+    idx=min(len(df)-1,max(0,int(round(float(time_s)/float(c.dt_s)))))
+    row=df.iloc[idx]
+    st.caption(f'Linked to recorded mission timestamp {float(row.time_s):.2f} s. '
+               'Original flight dynamics, sensor-fusion algorithms and telemetry are not modified by controls in this laboratory.')
+    la_tabs=st.tabs(['AIRCRAFT ROTATIONS','MAGNETIC SVD & CALIBRATION',
+                     'COVARIANCE & EIGENVECTORS','SENSOR-FUSION MATRICES'])
+    with la_tabs[0]:
+        st.subheader('Rigid-body transformations | forward / port / up → East / North / Up')
+        att=matrix_attitude_diagnostics(row)
+        p1,p2,p3=st.columns(3)
+        p1.metric('DCM determinant',f"{att['determinant']:.9f}")
+        p2.metric('Orthogonality residual ‖RᵀR−I‖F',f"{att['ortho_error']:.2e}")
+        p3.metric('Quaternion norm',f"{np.linalg.norm(att['quaternion']):.9f}")
+        col1,col2=st.columns([1.2,1])
+        with col1:
+            st.plotly_chart(la_attitude_figure(att),use_container_width=True,key='v8_la_attitude')
+        with col2:
+            st.markdown('**Body-to-ENU direction cosine matrix**')
+            st.dataframe(la_matrix_table(att['R'],['East','North','Up'],
+                              ['Forward','Port','Up']),use_container_width=True)
+            st.markdown('**Orthogonality check: RᵀR**')
+            st.dataframe(la_matrix_table(att['RtR'],['F','P','U'],['F','P','U']),use_container_width=True)
+            st.write('Quaternion (x, y, z, w):',np.round(att['quaternion'],7).tolist())
+        st.markdown('**Illustrative installation coordinate transform**')
+        pos=pd.DataFrame(att['mounts_enu'],columns=['East m','North m','Up m'])
+        pos.insert(0,'Location',att['mount_names'])
+        st.dataframe(pos,use_container_width=True,hide_index=True)
+        st.caption('The mounting offsets and aircraft shape are illustrations, not OEM installation drawings. '
+                   'The transform uses the existing Plotly forward/port/up drawing frame, '
+                   'not an undocumented claim that the simulator uses this same internal coordinate convention.')
+    with la_tabs[1]:
+        st.subheader('Hard-iron bias, soft-iron matrix and calibration identifiability')
+        source=st.radio('Calibration data source',
+                        ['Controlled synthetic 3-axis sweep','Recorded mission magnetometer'],horizontal=True,
+                        key='v8_la_mag_data_source')
+        if source=='Controlled synthetic 3-axis sweep':
+            x1,x2,x3=st.columns(3)
+            with x1:
+                coverage=st.selectbox('Orientation excitation',
+                        ['Full 3-axis excitation','Limited pitch and roll','Mostly yaw-only'],key='v8_la_excitation')
+                strength=st.slider('Soft-iron X-axis scale',.65,1.50,1.20,.05,key='v8_la_softx')
+            with x2:
+                coupling=st.slider('Cross-axis soft-iron coupling',-.25,.25,.12,.01,key='v8_la_cross')
+                bias_x=st.slider('Hard-iron X offset (µT)',-12.,12.,4.,.5,key='v8_la_biasx')
+            with x3:
+                noise=st.slider('Sensor noise σ (µT)',0.,.7,.12,.02,key='v8_la_mag_noise')
+                n=st.select_slider('Sweep samples',options=[90,180,360,720],value=360,key='v8_la_magn')
+            B = float(row.get('mag_field_expected_ut',43.6))
+            if not np.isfinite(B) or B<=0: B=43.6
+            S=np.array([[strength,coupling,.03],[coupling,.85,.06],[.03,.06,1.08]],float)
+            sweep=deterministic_magnetic_sweep(n,B,coverage,S,np.array([bias_x,-2.,2.5]),noise)
+            data_label='Independent controlled synthetic calibration exercise'
+        else:
+            fields=['mag_body_x_ut','mag_body_y_ut','mag_body_z_ut']
+            raw=df[fields].to_numpy(float)
+            B=float(np.nanmedian(df.mag_field_expected_ut.to_numpy(float)))
+            if not np.isfinite(B) or B<=0:B=43.6
+            sweep=dict(raw=raw,ideal=None,expected_intensity_ut=B)
+            data_label='Recorded mission magnetometer telemetry, possibly already affected by onboard correction and limited aircraft attitude excitation'
+        fit=fit_magnetic_ellipsoid(sweep['raw'],sweep['expected_intensity_ut'])
+        st.caption(data_label+'. Earth-field intensity reference from the selected simulation, not ground-truth calibration of real hardware.')
+        if source=='Recorded mission magnetometer' and bool(df.mag_fault_active.astype(bool).any()):
+            st.warning('This recorded mission contains injected magnetic faults. Variation caused by EMI or field disturbance can be mistaken for attitude excitation and can corrupt an ellipsoid fit. Use the controlled full-axis sweep to test calibration identifiability.')
+        k1,k2,k3,k4=st.columns(4)
+        k1.metric('Excitation design rank',f"{fit['rank'] if 'rank' in fit else 0} / 9")
+        k2.metric('Design matrix condition',f"{fit.get('condition',float('nan')):.2g}")
+        k3.metric('Reference field',f"{sweep['expected_intensity_ut']:.2f} µT")
+        k4.metric('Calibration status','IDENTIFIABLE' if fit['ok'] else 'NOT IDENTIFIABLE')
+        if not fit['ok']:
+            st.warning('Calibration was not accepted: '+fit['reason']+' Avoid treating numerical coefficients as physical calibration.')
+        else:
+            r1,r2,r3=st.columns(3)
+            r1.metric('Raw magnitude RMS residual',f"{fit['norm_rmse_before_ut']:.3f} µT")
+            r2.metric('Corrected RMS residual',f"{fit['norm_rmse_after_ut']:.3f} µT")
+            r3.metric('Fit samples',str(fit['n']))
+        st.plotly_chart(la_magnetic_fit_figure(sweep,fit),use_container_width=True,key='v8_la_mag_3d')
+        left,right=st.columns(2)
+        with left:
+            if fit['ok']:
+                st.markdown('**Estimated hard-iron offset (µT)**')
+                st.write(np.round(fit['center_ut'],4).tolist())
+                st.markdown('**Estimated symmetric correction matrix**')
+                st.dataframe(la_matrix_table(fit['correction'],['X','Y','Z'],['X','Y','Z']),use_container_width=True)
+            if source=='Controlled synthetic 3-axis sweep':
+                st.markdown('**Injected soft-iron distortion matrix**')
+                st.dataframe(la_matrix_table(sweep['soft_matrix'],['X','Y','Z'],['X','Y','Z']),use_container_width=True)
+        with right:
+            if 'singular_values' in fit:
+                fig=go.Figure(go.Bar(x=[f'σ{i+1}' for i in range(len(fit['singular_values']))],
+                                     y=fit['singular_values'],marker_color=NEON_BLUE))
+                fig.update_layout(title='Singular spectrum of the quadratic calibration design',
+                                  yaxis_type='log',yaxis_title='Singular value',height=370)
+                st.plotly_chart(theme(fig,370),use_container_width=True,key='v8_la_svd_spectrum')
+        st.caption('This SVD/ellipsoid laboratory estimates a symmetric correction from a constant-intensity model. '
+                   'Yaw-only or low-rank calibration is rejected. A successful numerical fit does not independently verify '
+                   'sensor temperature stability, time-varying EMI, aircraft mounting, calibration uncertainty, or flightworthiness.')
+        if fit['ok']:
+            output=pd.DataFrame(np.column_stack((sweep['raw'],fit['calibrated'])),
+                columns=['raw_x_ut','raw_y_ut','raw_z_ut','corrected_x_ut','corrected_y_ut','corrected_z_ut'])
+            st.download_button('Download calibration experiment CSV',output.to_csv(index=False),
+                         'magnetometer_linear_algebra_experiment.csv','text/csv',key='v8_la_cal_csv')
+    with la_tabs[2]:
+        st.subheader('Position covariance eigendecomposition | recorded vs empirical')
+        c1,c2=st.columns(2)
+        with c1:
+            source=st.selectbox('Covariance basis',
+                     ['Estimator diagonal (recorded)','Empirical truth-error covariance (window)'],
+                     key='v8_la_cov_source')
+        with c2:
+            window=st.select_slider('Empirical error window (s)',options=[5,10,20,40,60],
+                                    value=20,key='v8_la_cov_window')
+        try:
+            cov=matrix_position_covariance(df,idx,window,source)
+        except ValueError as exc:
+            st.warning(str(exc));cov=matrix_position_covariance(df,idx,window,'Estimator diagonal (recorded)')
+        q1,q2,q3=st.columns(3)
+        q1.metric('Principal axis σmax',f"{math.sqrt(float(cov['eigenvalues'][-1])):.3f} m")
+        q2.metric('Minor axis σmin',f"{math.sqrt(float(cov['eigenvalues'][0])):.3f} m")
+        q3.metric('Error samples in window',str(cov['empirical_count']))
+        st.caption(cov['description']+' The 95% contour presumes a bivariate Gaussian distribution; empirical coverage is not established by the shape.')
+        left,right=st.columns([1.15,.85])
+        with left:
+            st.plotly_chart(la_covariance_figure(df,cov),use_container_width=True,key='v8_la_covariance')
+        with right:
+            st.markdown('**Covariance matrix P (m²)**')
+            st.dataframe(la_matrix_table(cov['P'],['East','North'],['East','North']),use_container_width=True)
+            st.markdown('**Eigenvalues λ (m²)**')
+            st.write(np.round(cov['eigenvalues'],7).tolist())
+            st.markdown('**Eigenvectors (columns of V)**')
+            st.dataframe(la_matrix_table(cov['eigenvectors'],['East','North'],['λmin','λmax']),use_container_width=True)
+            st.caption('P=VΛVᵀ. A 2D Gaussian 95% contour uses χ²₂(0.95)=5.991. '
+                       'Sample error covariance is not equivalent to the filter covariance at one timestamp.')
+        with st.expander('Optional 3D teaching ellipsoid: assumed vertical covariance',expanded=False):
+            vertical_sigma=st.slider('Assumed vertical 1σ (m)',.25,20.,3.,.25,key='v8_la_vertical_sigma')
+            P3=np.zeros((3,3));P3[:2,:2]=cov['P'];P3[2,2]=vertical_sigma**2
+            values,vectors=np.linalg.eigh(P3)
+            uu,vv=np.meshgrid(np.linspace(0,2*np.pi,40),np.linspace(0,np.pi,21))
+            sphere=np.stack((np.cos(uu)*np.sin(vv),np.sin(uu)*np.sin(vv),np.cos(vv)),axis=0).reshape(3,-1)
+            ell=vectors @ (np.sqrt(np.maximum(values,0))[:,None]*math.sqrt(7.814727903)*sphere)
+            ell=ell.reshape(3,*uu.shape)
+            fig=go.Figure(go.Surface(x=ell[0],y=ell[1],z=ell[2],
+                         surfacecolor=np.zeros_like(ell[0]),colorscale=[[0,NEON_BLUE],[1,NEON_BLUE]],
+                         showscale=False,opacity=.42))
+            fig.update_layout(template='plotly_dark',paper_bgcolor=BG,
+                 title='Illustrative χ²₃ 95% ellipsoid | vertical σ is user-assumed',height=440,
+                 scene=dict(xaxis_title='Relative East (m)',yaxis_title='Relative North (m)',
+                            zaxis_title='Relative Up (m)',aspectmode='data'))
+            st.plotly_chart(fig,use_container_width=True,key='v8_la_cov3d')
+            st.caption('Vertical variance is not exported by the active estimator and has been selected manually. '
+                       'The 3D ellipsoid is an educational what-if, NOT a recorded aircraft uncertainty ellipsoid.')
+    with la_tabs[3]:
+        st.subheader('Reduced-order linearized Kalman update and observability')
+        st.info('This is a clearly separated 3-state diagnostic model [East m, North m, heading rad], '
+                'not an extraction of the original 6-state EKF or 6-DOF navigation filter. '
+                'Its Kalman gain, F, H and matrix updates are hypothetical, but initialized from recorded marginal variances.')
+        i1,i2,i3,i4=st.columns(4)
+        with i1:
+            qpos=st.slider('Position process σ (m/√s)',.01,2.,.45,.05,key='v8_la_posnoise')
+        with i2:
+            qyaw=st.slider('Heading process σ (°/√s)',.01,3.,.25,.05,key='v8_la_yawnoise')
+        with i3:
+            rmag=st.slider('Heading measurement σ (°)',.2,15.,3.,.2,key='v8_la_mag_sigma')
+        with i4:
+            avail=st.checkbox('Use recorded sensor acceptance flags',value=True,
+                              key='v8_la_use_acceptance')
+        fusion=linearized_fusion_diagnostics(row,c,float(c.dt_s),qpos,qyaw,rmag,avail)
+        a1,a2,a3=st.columns(3)
+        a1.metric('Available measurement components',str(fusion['H'].shape[0]))
+        a2.metric('Local linearized observability rank',f"{fusion['obs_rank']} / 3")
+        a3.metric('Posterior trace',f"{np.trace(fusion['P_post']):.5f}")
+        st.caption('State units mix meters and radians. The covariance trace therefore mixes m² and rad² '
+                   'and is not a physical scalar accuracy score. Sensor availability at this instant: '
+                   +(', '.join(fusion['measurement_names']) if fusion['measurement_names'] else 'no accepted updates')+'.')
+        mat1,mat2=st.columns(2)
+        with mat1:
+            st.markdown('**F | Linearized state transition**')
+            st.dataframe(la_matrix_table(fusion['F'],['E','N','ψ'],['E','N','ψ']),use_container_width=True)
+            st.markdown('**Q | Assumed discrete process covariance**')
+            st.dataframe(la_matrix_table(fusion['Q'],['E','N','ψ'],['E','N','ψ']),use_container_width=True)
+            st.markdown('**H | Active measurement Jacobian**')
+            st.dataframe(la_matrix_table(fusion['H'],fusion['measurement_names'],['E','N','ψ']),use_container_width=True)
+        with mat2:
+            st.markdown('**P⁻ | Predicted covariance**')
+            st.dataframe(la_matrix_table(fusion['P_pred'],['E','N','ψ'],['E','N','ψ']),use_container_width=True)
+            st.markdown('**K | Illustrative Kalman gain**')
+            st.dataframe(la_matrix_table(fusion['K'],['E','N','ψ'],fusion['measurement_names']),use_container_width=True)
+            st.markdown('**P⁺ | Joseph-form updated covariance**')
+            st.dataframe(la_matrix_table(fusion['P_post'],['E','N','ψ'],['E','N','ψ']),use_container_width=True)
+        fig=go.Figure()
+        lab=['East (m²)','North (m²)','Yaw (rad²)']
+        fig.add_trace(go.Bar(name='Before local update',x=lab,y=np.diag(fusion['P_pred']),marker_color=ORANGE))
+        fig.add_trace(go.Bar(name='After local update',x=lab,y=np.diag(fusion['P_post']),marker_color=NEON_BLUE))
+        fig.update_layout(title='Marginal variance changes under hypothetical accepted measurements',
+                          barmode='group',height=370,yaxis_title='Diagonal covariance (mixed units)')
+        st.plotly_chart(theme(fig,370),use_container_width=True,key='v8_la_kalman_bar')
+        if len(fusion['obs_singular_values']):
+            st.markdown('**Local observability singular spectrum**')
+            st.write(np.round(fusion['obs_singular_values'],6).tolist())
+        st.caption('F is a constant-speed north-referenced local kinematic Jacobian; the actual aircraft controller '
+                   'and nonlinear dynamics are more complex. No unlogged sensor measurements or filter gains '
+                   'are retroactively invented. NIS values in the Sensor Integrity tab come from the real simulation logs.')
+        export=dict(simulation_time_s=float(row.time_s),attitude=matrix_attitude_diagnostics(row)['R'].tolist(),
+                    kalman_diagnostic={k:(v.tolist() if isinstance(v,np.ndarray) else v)
+                                     for k,v in fusion.items()})
+        st.download_button('Download matrix and Kalman diagnostic JSON',json.dumps(export,indent=2),
+                           'linear_algebra_state_estimation.json','application/json',key='v8_la_matrix_json')
+
 
 def mission_plot(df: pd.DataFrame, row_idx: int, c: SimConfig, view3d: bool) -> go.Figure:
     q = df.iloc[row_idx]
@@ -1878,6 +3061,14 @@ if "cfg" not in st.session_state:
     st.session_state.cfg = SixDOFConfig(duration_s=90,fault_start_s=25.,fault_end_s=65.)
 if "df" not in st.session_state:
     st.session_state.df, st.session_state.metrics = simulate(st.session_state.cfg)
+if "linked_playing" not in st.session_state:
+    st.session_state.linked_playing = False
+if "linked_playback_speed" not in st.session_state:
+    st.session_state.linked_playback_speed = 1.0
+if "linked_loop_playback" not in st.session_state:
+    st.session_state.linked_loop_playback = True
+if "linked_command_heading" not in st.session_state:
+    st.session_state.linked_command_heading = float(st.session_state.cfg.heading_deg)
 
 c = config_from_sidebar()
 df = st.session_state.df
@@ -1921,7 +3112,7 @@ st.markdown(
 st.markdown(
     '<div class="hud-side-note" style="margin:10px 0 8px;border-color:rgba(0,229,255,.33);">'
     '<b style="color:#73F6FF;">LINKED 3D FLIGHT INSTRUMENTS</b> &nbsp; '
-    'The mission track, 3D compass and Rascal airframe use the same simulation-time selection.'
+    'Use the linked snapshot slider to set the initial time. The live Plotly player inside the Compass tab synchronizes both 3D instruments and the track.'
     '</div>', unsafe_allow_html=True)
 # Keep the synchronized inspector in bounds when a new mission is shorter.
 if "linked_flight_time_s" in st.session_state:
@@ -1929,14 +3120,64 @@ if "linked_flight_time_s" in st.session_state:
         st.session_state["linked_flight_time_s"], 0.0, float(df.time_s.iloc[-1])
     ))
 shared_flight_time_s = st.slider(
-    "Synchronized mission / compass / aircraft time (s)",
+    "Initial 3D playback time / static mission snapshot (s)",
     min_value=0.0, max_value=float(df.time_s.iloc[-1]), value=0.0,
     step=float(c.dt_s), key="linked_flight_time_s",
 )
 
-mission_tab, compass_tab, integrity_tab, uq_tab, verification_tab, sources_tab = st.tabs([
-    "✈ MISSION & PLAYBACK", "🧭 COMPASS INSTRUMENT", "📡 SENSOR INTEGRITY",
-    "📊 MONTE CARLO", "✅ V&V / EXPORT", "📚 AIRCRAFT SOURCES",
+st.markdown(
+    '<div class="hud-side-note" style="margin:8px 0 14px;border-color:rgba(255,168,58,.40);">'
+    '<b style="color:#FFB74D;">INTERACTIVE FLIGHT COMMAND</b> &nbsp; '
+    'Set a new commanded heading, then rerun the mission so the autopilot, aircraft, compass, and trajectory all respond together.'
+    '</div>', unsafe_allow_html=True)
+cmd_col, apply_col, info_col = st.columns([1.4, 0.8, 1.8], gap="medium")
+with cmd_col:
+    command_heading = st.slider(
+        "Commanded heading for the next simulation (°)", 0, 359,
+        int(round(float(st.session_state.get("linked_command_heading", c.heading_deg)))),
+        key="linked_command_heading_slider",
+        help="This is a flight-command input. Applying it reruns the selected physics model and controller with a new heading reference."
+    )
+    st.session_state.linked_command_heading = float(command_heading)
+with apply_col:
+    st.write("")
+    st.write("")
+    if st.button("↻ APPLY HEADING COMMAND", use_container_width=True):
+        proposed = replace(c, heading_deg=float(command_heading))
+        result, m = simulate(proposed)
+        st.session_state.cfg = proposed
+        st.session_state.df, st.session_state.metrics = result, m
+        st.session_state.linked_flight_time_s = 0.0
+        st.session_state.linked_playing = False
+        st.session_state.pop("mc", None)
+        st.rerun()
+with info_col:
+    st.markdown(
+        f'<div class="compass-note">CURRENT MISSION COMMAND: <strong>{float(c.heading_deg):.1f}°</strong>'
+        f' &nbsp; | &nbsp; NEXT SELECTED COMMAND: <strong>{float(command_heading):.1f}°</strong><br>'
+        'Applying the command regenerates the mission. The linked time playback below then animates the same run across the mission plot, 3D compass, and 3D aircraft.'
+        '</div>', unsafe_allow_html=True)
+
+with st.expander("Static snapshot navigation", expanded=False):
+    st.caption("For frame-accurate continuous playback, use Play inside the interactive 3D compass panel. These controls select a static mission snapshot and the initial 3D player time.")
+    snap_a, snap_b, snap_c = st.columns(3)
+    with snap_a:
+        if st.button("⏮ START", use_container_width=True, key="inspect_start"):
+            st.session_state.linked_flight_time_s = 0.0
+            st.rerun()
+    with snap_b:
+        if st.button("◀ SAMPLE", use_container_width=True, key="inspect_back"):
+            st.session_state.linked_flight_time_s = float(max(0.0, st.session_state.linked_flight_time_s - float(c.dt_s)))
+            st.rerun()
+    with snap_c:
+        if st.button("SAMPLE ▶", use_container_width=True, key="inspect_next"):
+            st.session_state.linked_flight_time_s = float(min(float(df.time_s.iloc[-1]), st.session_state.linked_flight_time_s + float(c.dt_s)))
+            st.rerun()
+st.caption("The interactive 3D player's controls are fully synchronized in your browser. It uses your simulation's existing telemetry rather than rerunning the dynamics during playback.")
+
+mission_tab, compass_tab, variance_tab, algebra_tab, integrity_tab, uq_tab, verification_tab, sources_tab = st.tabs([
+    "✈ MISSION & PLAYBACK", "🧭 COMPASS INSTRUMENT", "🧮 COMPASS VARIANCE",
+    "📐 LINEAR ALGEBRA", "📡 SENSOR INTEGRITY", "📊 MONTE CARLO", "✅ V&V / EXPORT", "📚 AIRCRAFT SOURCES",
 ])
 
 with mission_tab:
@@ -1954,8 +3195,8 @@ with mission_tab:
     ], four=True)
     view3d = st.checkbox("Show 3D mission overview" + (" (actual modeled altitude)" if isinstance(c,SixDOFConfig) else " (constant-altitude visualization)"), value=False)
     st.plotly_chart(mission_plot(df, idx, c, view3d), use_container_width=True)
-    with st.expander("▶ Browser-side mission playback", expanded=True):
-        st.caption("Play animates the simulated UAV marker. The time inspector above is independent and permits precise numerical inspection.")
+    with st.expander("▶ Legacy standalone mission animation", expanded=False):
+        st.caption("This original Plotly animation is kept for reference. The primary synchronized playback controller now lives above the tabs and drives the mission snapshot, 3D compass, and 3D aircraft together.")
         st.plotly_chart(animated_mission(df, c), use_container_width=True)
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=df.along_track_m, y=df.cross_track_m,
@@ -1980,28 +3221,26 @@ with compass_tab:
                                      help="Orbit and zoom freely after selecting a camera preset.")
     with heading_col:
         aircraft_heading_source = st.selectbox(
-            "Aircraft heading display",
+            "Heading data highlighted for comparison",
             ["True heading (physical)", "Fused heading (estimated)",
              "Magnetic corrected (sensor)"],
             key="aircraft_heading_display",
-            help="Only changes the displayed aircraft orientation; never the simulator, autopilot, or truth state.",
+            help="Solid aircraft remains true physical pose, ghost remains fused estimated pose. This selector highlights data only; it never changes vehicle truth.",
         )
-    left, right = st.columns([1, 1], gap="medium")
-    with left:
-        st.plotly_chart(compass_figure_3d(
-            q, float(q.get("magnetic_declination_deg", c.declination_deg))),
-            use_container_width=True, key="linked_neon_compass_3d",
-            config={"displaylogo":False, "scrollZoom":True},
+    st.caption("Click any colored 3D needle tip or the center hub to inspect measurements. Use the in-panel Play control for synchronized motion of the compass, airframe, and mission track. The inspector includes EVERY recorded telemetry field for the selected timestamp.")
+    with st.spinner("Loading interactive 3D instruments..."):
+        components.html(
+            compass_live_html(df, float(view_idx), aircraft_view,
+                              aircraft_heading_source,
+                              float(q.get("magnetic_declination_deg", c.declination_deg)),
+                              configuration=c),
+            height=1680, scrolling=True,
         )
-    with right:
-        st.plotly_chart(aircraft_figure_3d(q, aircraft_view, aircraft_heading_source),
-                        use_container_width=True, key="linked_rascal_airframe_3d",
-                        config={"displaylogo":False, "scrollZoom":True})
-    st.caption("The compass uses TRUE (cyan), magnetic declination-corrected (amber) and FUSED (green) headings. "
-               "The aircraft shows the selected heading source at the SAME timestamp; "
-               "bank and pitch use true simulated attitude. Switching the heading source changes "
-               "the visualization only, never the aircraft's actual path or flight controller. "
-               "Positive roll corresponds to right wing down; positive pitch is nose up.")
+    st.caption("The neon compass retains true (cyan), magnetic-corrected (amber), and fused (green) headings. "
+               "The solid aircraft always shows true simulated attitude; the translucent amber aircraft "
+               "uses the separately estimated fused heading, bank, and pitch where recorded. Actual "
+               "actuator telemetry drives the illustrated ailerons, rudder and elevator. "
+               "Airfoil, control geometry, wheel, struts and mounting positions are source-scaled illustrations, not OEM CAD.")
     if "true_roll_deg" not in df.columns or "true_pitch_deg" not in df.columns:
         st.info("The selected legacy physics profile does not model all attitude axes. "
                 "Missing bank/pitch angles appear as 0° in the 3D airframe visualization.")
@@ -2044,6 +3283,134 @@ with compass_tab:
         unsafe_allow_html=True,
     )
     st.caption("Actual declination and applied correction are separately configurable. A heading offset from a magnetometer fault is not the same as geographic magnetic variation.")
+
+with variance_tab:
+    panel_header("03 / ANGULAR STATISTICS & FLIGHT DEVIATION", "Compass Variance Estimator",
+                 "Truth-referenced circular statistics of recorded, display-rate simulation telemetry. Not sensor calibration or aircraft flight validation.",
+                 compass=True)
+    ss1, ss2, ss3, ss4=st.columns(4)
+    with ss1:
+        variance_source=st.selectbox("Heading measurement",["magnetic","fused"],
+                          format_func=lambda x: "Magnetometer corrected" if x=="magnetic" else "Sensor-fused estimate",
+                          key="variance_source_v7")
+    with ss2:
+        variance_window=st.selectbox("Rolling analysis duration (s)",[5,15,30,60,"Full mission"],index=2,
+                                    key="variance_window_v7")
+    with ss3:
+        variance_end=st.slider("End of analysis interval (s)",0.0,float(df.time_s.iloc[-1]),
+                               float(df.time_s.iloc[-1]),step=float(c.dt_s),key="variance_end_v7")
+    with ss4:
+        accepted_only=st.checkbox("Exclude magnetometer-rejected samples",value=False,
+                                   key="variance_accepted_only_v7",
+                                   help="This changes the descriptive sample population. It is only meaningful for magnetometer analysis.")
+    duration=float(variance_window) if isinstance(variance_window,int) else None
+    stt=compass_window_statistics(df,duration,variance_source,accepted_only,variance_end)
+    if stt['n']<3:
+        st.warning("At least three recorded samples are needed to characterize dispersion. Increase the window or disable the accepted-only filter.")
+    k1,k2,k3,k4=st.columns(4)
+    k1.metric("Circular bias (°)",f"{stt['mean_deg']:+.3f}" if np.isfinite(stt['mean_deg']) else "N/A")
+    k2.metric("Circular variance (°²)",f"{stt['variance_deg2']:.3f}" if np.isfinite(stt['variance_deg2']) else "N/A")
+    k3.metric("Circular standard deviation (°)",f"{stt['circular_std_deg']:.3f}" if np.isfinite(stt['circular_std_deg']) else "N/A")
+    k4.metric("Empirical |error| 95th (°)",f"{stt['empirical_abs95_deg']:.3f}" if np.isfinite(stt['empirical_abs95_deg']) else "N/A")
+    st.caption(f"Analysis: {stt['n']} recorded telemetry rows, from {stt['start_s']:.2f} s to {stt['end_s']:.2f} s. "
+               "Variance in °² is the squared circular standard deviation derived from resultant length; 1−R is shown separately in downloads. "
+               "Bias and empirical error quantiles require SIMULATED TRUE HEADING. Measurement autocorrelation and decimation mean this is NOT a calibrated 95% confidence interval.")
+    if 'heading_sigma_deg' in df.columns:
+        hs=pd.to_numeric(df.loc[df.time_s<=variance_end,'heading_sigma_deg'],errors='coerce').dropna()
+        if len(hs):
+            st.metric("Estimator-reported heading σ at selected end (°)",f"{hs.iloc[-1]:.2f}")
+            st.caption("Estimator covariance prediction, not the observed circular dispersion. The two should be examined independently.")
+    rolling=circular_rolling_summary(df,float(variance_window) if isinstance(variance_window,int) else max(10.,float(df.time_s.iloc[-1])),variance_source,accepted_only)
+    measured_col='mag_true_heading_deg' if variance_source=='magnetic' else 'fused_heading_deg'
+    errs=np.asarray(circular_difference_deg(df[measured_col],df.true_heading_deg),float)
+    figv=make_subplots(rows=2,cols=1,shared_xaxes=True,
+             subplot_titles=('Wrapped heading error and rolling bias','Circular standard deviation and empirical absolute-95th'))
+    figv.add_trace(go.Scattergl(x=df.time_s,y=errs,name="Signed heading error",line=dict(color=ORANGE,width=1.3)),row=1,col=1)
+    figv.add_trace(go.Scattergl(x=rolling.time_s,y=rolling.bias_deg,name="Rolling circular bias",line=dict(color=NEON_BLUE,width=2)),row=1,col=1)
+    figv.add_trace(go.Scattergl(x=rolling.time_s,y=rolling.sigma_deg,name="Rolling circular σ",line=dict(color=LIME,width=2)),row=2,col=1)
+    figv.add_trace(go.Scattergl(x=rolling.time_s,y=rolling.p95_abs_error_deg,name="Observed |error| p95",line=dict(color=ORANGE,width=1.5,dash="dot")),row=2,col=1)
+    figv.update_yaxes(title_text='Angle (°)',row=1,col=1)
+    figv.update_yaxes(title_text='Angle (°)',row=2,col=1)
+    figv.update_xaxes(title_text='Simulation time (s)',row=2,col=1)
+    figv.update_layout(title='Heading bias, noise dispersion and tail errors',height=530)
+    st.plotly_chart(theme(figv,530),use_container_width=True)
+
+    panel_header("04 / SENSOR INTEGRITY ANALYSIS", "Magnetic Disturbance Diagnostics",
+                 "Field magnitude, innovation gating, change-point indicators and estimated bias trend. Heuristic thresholds are illustrative, not certified detection performance.",compass=True)
+    diagnostics=magnetic_integrity_diagnostics(df,15.)
+    id1,id2,id3,id4=st.columns(4)
+    id1.metric("Field magnitude alerts",int(diagnostics.field_strength_alert.sum()))
+    id2.metric("Innovation alerts",int(diagnostics.innovation_alert.sum()))
+    id3.metric("Bias-change alerts",int(diagnostics.change_alert.sum()))
+    id4.metric("Recorded MAG rejects",int((~diagnostics.mag_accepted).sum()))
+    di=make_subplots(rows=3,cols=1,shared_xaxes=True,subplot_titles=(
+       'Measured vs model reference total magnetic intensity',
+       'Magnitude residual and heading-bias change',
+       'Magnetometer innovation NIS'))
+    di.add_trace(go.Scattergl(x=df.time_s,y=df.mag_field_ut,name='Measured |B|',line=dict(color=ORANGE)),row=1,col=1)
+    di.add_trace(go.Scattergl(x=df.time_s,y=df.mag_field_expected_ut,name='Model |B| reference',line=dict(color=NEON_BLUE,dash='dash')),row=1,col=1)
+    di.add_trace(go.Scattergl(x=diagnostics.time_s,y=diagnostics.magnitude_residual_pct,name='Field residual (%)',line=dict(color=ORANGE)),row=2,col=1)
+    di.add_trace(go.Scattergl(x=diagnostics.time_s,y=diagnostics.bias_change_deg,name='Bias change (°)',line=dict(color=LIME)),row=2,col=1)
+    di.add_trace(go.Scattergl(x=df.time_s,y=df.mag_nis,name='MAG NIS',line=dict(color=NEON_BLUE)),row=3,col=1)
+    di.add_hline(y=6.635,line_color=RED,line_dash='dash',annotation_text='χ²(1) 99% reference',row=3,col=1)
+    di.update_xaxes(title_text='Simulation time (s)',row=3,col=1)
+    di.update_layout(title='Magnetic integrity evidence',height=650)
+    st.plotly_chart(theme(di,650),use_container_width=True)
+    if bool(diagnostics.fault_indicator_count.max()>0):
+        st.warning('One or more heuristic indicators triggered. They are not proof of an EMI source, calibration defect, or spoofing. Interpret jointly with the simulated fault timeline and attitude telemetry.')
+    snap=df.iloc[max(0,min(len(df)-1,int(round(variance_end/float(c.dt_s)))))]
+    st.plotly_chart(magnetic_vector_figure(snap,c),use_container_width=True)
+    st.caption('Measured body-frame X/Y/Z components are recorded telemetry. The cyan reference is a configurable field baseline reconstructed from the model field magnitude, configured inclination/declination and simulated true attitude. It does not recalculate the actual WMM inclination when WMM is selected, and it is not an independent magnetic measurement.')
+
+    panel_header("05 / ESTIMATED NAVIGATION EFFECT", "Uncompensated Heading Drift Corridor",
+                 "First-order geometrical uncertainty transfer, independent of the actual closed-loop UAV path.",compass=True)
+    max_distance=st.slider('Projected straight-line distance (km)',0.5,15.0,5.0,.5,key='variance_range_km')
+    if stt['n']>=3 and np.isfinite(stt['circular_std_deg']):
+        corr=heading_uncertainty_corridor(stt,np.linspace(0.,max_distance,100))
+        figc=go.Figure()
+        figc.add_trace(go.Scatter(x=corr.distance_km,y=corr.high95_m,mode='lines',
+                                   line=dict(color='rgba(0,229,255,.1)'),showlegend=False,hoverinfo='skip'))
+        figc.add_trace(go.Scatter(x=corr.distance_km,y=corr.low95_m,mode='lines',
+                                   fill='tonexty',fillcolor='rgba(0,229,255,.18)',
+                                   line=dict(color='rgba(0,229,255,.1)'),name='Illustrative ±1.96σ'))
+        figc.add_trace(go.Scatter(x=corr.distance_km,y=corr.bias_offset_m,mode='lines',
+                                   line=dict(color=ORANGE,width=3),name='Bias-only lateral offset'))
+        figc.add_hline(y=0,line_color=MUTED,line_dash='dash')
+        figc.update_layout(title='Projected uncompensated lateral deviation',height=400,
+                     xaxis_title='Straight-line distance (km)',yaxis_title='Lateral displacement (m)')
+        st.plotly_chart(theme(figc,400),use_container_width=True)
+        st.caption('Assumes persistent fixed heading bias and locally linear small-angle uncertainty. The shaded band assumes Gaussian, independent heading uncertainty and is NOT an empirically validated coverage probability or a prediction of the closed-loop fault-tolerant guidance system.')
+
+    panel_header('06 / INTEGRATION TRADE STUDY','Illustrative Magnetometer Mounting Separation',
+                 'Compare dipole-like inverse-cube interference with mounting distance. This standalone what-if does not change the existing flight engine.',compass=True)
+    dm,sm=st.columns([1,3])
+    with dm:
+        moment=st.slider('Illustrative interference scale (µT·m³)',0.1,4.0,1.0,.1,key='mag_dipole_moment')
+        separation=st.slider('Illustrative sensor separation (m)',0.15,1.5,.75,.05,key='mag_mount_distance')
+    mounting=magnetic_mounting_trade(np.linspace(.15,1.5,120),moment)
+    hm=go.Figure()
+    hm.add_trace(go.Scatter(x=mounting.separation_m,y=mounting.illustrative_disturbance_ut,
+                          mode='lines',line=dict(color=NEON_BLUE,width=3),name='Inverse-cube illustrative field'))
+    hm.add_vline(x=separation,line_color=ORANGE,line_dash='dash')
+    hm.update_layout(title='Synthetic dipole-like interference versus separation',height=360,
+                     xaxis_title='Distance (m)',yaxis_title='Illustrative field disturbance (µT)')
+    with sm:
+        st.plotly_chart(theme(hm,360),use_container_width=True)
+    disturbance=moment/max(separation,.05)**3
+    horizontal=float(getattr(c,'horizontal_field_ut',25.))
+    bound_angle=math.degrees(math.atan2(disturbance,max(horizontal,1e-6)))
+    st.metric('Illustrative perpendicular-field heading offset upper case',f'{bound_angle:.1f}°')
+    st.caption('This is a synthetic magnetostatic dipole-style scaling scenario, not a measured EMI field, manufacturer specification, or installation recommendation. Real interference depends on current, geometry, shielding, and magnetic orientation. The model deliberately does NOT modify flight-control state.')
+    summary=pd.DataFrame([stt])
+    st.download_button('Download compass variance summary CSV',summary.to_csv(index=False),
+                       file_name='compass_circular_statistics.csv',mime='text/csv')
+    st.download_button('Download rolling statistics and integrity CSV',
+                       rolling.merge(diagnostics,on='time_s',how='left',suffixes=('_heading','_diagnostic')).to_csv(index=False),
+                       file_name='compass_variance_integrity_timeseries.csv',mime='text/csv')
+    st.caption('Verification boundary: the app has synthetic truth, not a measured real aircraft reference. A high-quality physical magnetometer requires independent calibration and mounting-effect tests. Green/yellow/red displays are engineering research diagnostics only.')
+
+with algebra_tab:
+    linear_algebra_lab(df, c, shared_flight_time_s)
 
 with integrity_tab:
     panel_header("03 / SENSOR HEALTH & FAULT MONITORING", "Sensor Integrity",
@@ -2099,6 +3466,38 @@ with integrity_tab:
             st.caption("Surrogate coefficients are assumed. Controller uses estimated vertical state and synthetic pitot feedback; no real-airframe identification or external SITL calibration.")
         else:
             st.caption(f"Maximum simulated bank: {metrics['max_abs_bank_deg']:.1f}°. Maximum turn rate: {metrics['max_abs_turn_rate_dps']:.1f}°/s. Constant speed and coordinated-turn assumptions apply. No pitch, throttle, stall, or identified aerodynamics.")
+
+    if isinstance(c,SixDOFConfig):
+        with st.expander('AIRCRAFT FLIGHT ENVELOPE | 6-DOF CONTROLS AND ATTITUDE',expanded=False):
+            st.caption('These displays show the surrogate plant states and actuator deflections, not a manufacturer-certified Rascal flight envelope. No aerodynamic stall boundary, structural load limit, or propulsion test curve is available for this active model.')
+            flightfig=make_subplots(rows=3,cols=1,shared_xaxes=True,
+                       subplot_titles=('Airspeed and angle of attack (distinct units)',
+                                       'True and estimated roll / pitch',
+                                       'Actual simulated flight-control deflection'))
+            flightfig.add_trace(go.Scattergl(x=df.time_s,y=df.airspeed_mps,name='Airspeed m/s',line=dict(color=NEON_BLUE)),row=1,col=1)
+            flightfig.add_trace(go.Scattergl(x=df.time_s,y=df.angle_of_attack_deg,name='Angle of attack °',line=dict(color=ORANGE)),row=1,col=1)
+            for field,name,color,dash in [('true_roll_deg','True roll °',NEON_BLUE,'solid'),
+                                          ('estimated_roll_deg','Estimated roll °',ORANGE,'dash'),
+                                          ('true_pitch_deg','True pitch °',LIME,'solid'),
+                                          ('estimated_pitch_deg','Estimated pitch °','#EAEAEA','dash')]:
+                if field in df:
+                    flightfig.add_trace(go.Scattergl(x=df.time_s,y=df[field],name=name,line=dict(color=color,dash=dash)),row=2,col=1)
+            for field,name,color in [('aileron_deg','Aileron °',NEON_BLUE),('elevator_deg','Elevator °',ORANGE),('rudder_deg','Rudder °',LIME)]:
+                if field in df:
+                    flightfig.add_trace(go.Scattergl(x=df.time_s,y=df[field],name=name,line=dict(color=color)),row=3,col=1)
+            flightfig.update_xaxes(title_text='Simulation time (s)',row=3,col=1)
+            flightfig.update_layout(height=720,title='Recorded 6-DOF dynamics and actual control actuation')
+            st.plotly_chart(theme(flightfig,720),use_container_width=True)
+            normal_n=-pd.to_numeric(df.accel_fz_mps2,errors='coerce')/9.80665
+            turn_rad=np.abs(np.deg2rad(pd.to_numeric(df.true_turn_rate_dps,errors='coerce').to_numpy(float)))
+            radius=np.where(turn_rad>math.radians(.5),df.airspeed_mps.to_numpy(float)/np.maximum(turn_rad,1e-8),np.nan)
+            n1,n2,n3=st.columns(3)
+            n1.metric('Peak |normal-specific-force proxy| (g)',f'{np.nanmax(np.abs(normal_n)):.2f}')
+            n2.metric('Peak simulated bank (°)',f'{np.nanmax(np.abs(df.true_roll_deg)):.1f}')
+            n3.metric('Min kinematic turn-radius proxy (m)',f'{np.nanmin(radius):.1f}' if np.isfinite(radius).any() else 'N/A')
+            if float(df.airspeed_mps.min())<13:
+                st.warning('Modeled airspeed fell below the UI research envelope minimum of 13 m/s. This is not a manufacturer-derived stall speed.')
+            st.caption('Normal-specific-force proxy and instantaneous turn-radius approximation are diagnostics, not aerodynamic structural limits or predictions of safe maneuverability. A full stall and propulsion model remains unvalidated.')
 
 with uq_tab:
     panel_header("04 / UNCERTAINTY QUANTIFICATION", "Monte Carlo Sensitivity",
