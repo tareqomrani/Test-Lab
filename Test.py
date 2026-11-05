@@ -1,4 +1,4 @@
-"""UAV Compass & Navigation Digital Twin v6: single-file Streamlit deployment.
+"""UAV Compass Variance Simulator: single-file Streamlit deployment.
 
 Upload this app.py to repository root and set Streamlit main file to app.py.
 All ten original simulation/helper modules are embedded. requirements.txt is still
@@ -759,7 +759,7 @@ def v_and_v(df,metrics):
             vv_aircraft(df,metrics) if 'true_roll_deg' in df.columns
             else vv_legacy(df,metrics))
 
-st.set_page_config(page_title="UAV Compass & Navigation Digital Twin", page_icon="🧭", layout="wide")
+st.set_page_config(page_title="UAV Compass Variance Simulator", page_icon="🧭", layout="wide")
 
 # HUD palette follows the Directed Energy Engagement Digital Twin visual language.
 # Neon cyan is reserved for compass, heading-reference and azimuth instrumentation.
@@ -1284,6 +1284,339 @@ def compass_figure(row: pd.Series, declination: float):
 
 
 
+
+# ============================================================================
+# LINKED INTERACTIVE 3-D COMPASS + RASCAL REFERENCE AIRFRAME
+# Geometry-only Rascal visualization. The physics plant remains the explicitly
+# uncalibrated 12 kg research surrogate; we do NOT infer Rascal flight fidelity
+# from using manufacturer wingspan/length on a Plotly model.
+# ============================================================================
+
+def _compass_3d_arrow(fig: go.Figure, heading_deg: float, color: str,
+                      label: str, radius: float, z: float, width: float) -> None:
+    """Add an independently labelled 3-D azimuth needle (0=N, 90=E)."""
+    theta = math.radians(90.0 - float(heading_deg))
+    direction = np.array([math.cos(theta), math.sin(theta)])
+    transverse = np.array([-direction[1], direction[0]])
+    stem_end = direction * (radius - 0.13)
+    fig.add_trace(go.Scatter3d(
+        x=[0.0, float(stem_end[0])], y=[0.0, float(stem_end[1])], z=[z, z],
+        mode="lines", name=label, legendgroup=label, showlegend=True,
+        line=dict(color=color, width=width),
+        hovertemplate=f"{label}: {heading_deg % 360:.2f}°<extra></extra>"
+    ))
+    tip = direction * radius
+    base_a = stem_end + transverse * 0.055
+    base_b = stem_end - transverse * 0.055
+    fig.add_trace(go.Mesh3d(
+        x=[tip[0], base_a[0], base_b[0]],
+        y=[tip[1], base_a[1], base_b[1]], z=[z, z, z],
+        i=[0], j=[1], k=[2], flatshading=True, color=color,
+        opacity=1.0, showlegend=False, hoverinfo="skip", legendgroup=label
+    ))
+
+
+def compass_figure_3d(row: pd.Series, declination: float) -> go.Figure:
+    """Rotatable three-dimensional neon-cyan instrument, with distinct headings."""
+    fig = go.Figure()
+    t = np.linspace(0.0, 2 * np.pi, 121)
+    # Shallow machined dial: a dark face, raised toroidal rim and cyan halo.
+    base_r = np.r_[0.0, 0.95 * np.cos(t[:-1])]
+    base_y = np.r_[0.0, 0.95 * np.sin(t[:-1])]
+    faces_n = len(t) - 1
+    fig.add_trace(go.Mesh3d(
+        x=base_r, y=base_y, z=np.zeros(len(base_r)) - 0.055,
+        i=np.zeros(faces_n - 1, dtype=int),
+        j=np.arange(1, faces_n, dtype=int),
+        k=np.arange(2, faces_n + 1, dtype=int),
+        color="#062025", opacity=0.87, hoverinfo="skip", showlegend=False,
+        flatshading=True,
+    ))
+    ring_u = np.linspace(0.0, 2 * np.pi, 100)
+    ring_v = np.linspace(0.0, 2 * np.pi, 11)
+    uu, vv = np.meshgrid(ring_u, ring_v)
+    tube = 0.035
+    fig.add_trace(go.Surface(
+        x=(1.0 + tube * np.cos(vv)) * np.cos(uu),
+        y=(1.0 + tube * np.cos(vv)) * np.sin(uu),
+        z=0.06 + tube * np.sin(vv),
+        showscale=False, hoverinfo="skip", opacity=0.98,
+        colorscale=[[0, NEON_BLUE_DEEP], [0.5, NEON_BLUE], [1, NEON_BLUE_BRIGHT]],
+        surfacecolor=(np.cos(vv) + 1) / 2,
+        lighting=dict(ambient=0.9, diffuse=0.55, specular=0.3),
+    ))
+    for radius, color, weight, opacity in [
+        (1.035, NEON_BLUE, 12, .12), (1.022, NEON_BLUE, 5, .28),
+        (.80, NEON_BLUE_DEEP, 2, .55), (.59, CYAN_GRID, 2, .48),
+    ]:
+        fig.add_trace(go.Scatter3d(
+            x=radius * np.cos(t), y=radius * np.sin(t),
+            z=np.full_like(t, 0.082), mode="lines",
+            line=dict(color=color, width=weight), opacity=opacity,
+            showlegend=False, hoverinfo="skip",
+        ))
+    # Two bundled traces keep the tick count small and GPU rendering efficient.
+    for major in [False, True]:
+        xx, yy, zz = [], [], []
+        for deg in range(0, 360, 5):
+            if (deg % 30 == 0) != major:
+                continue
+            theta = math.radians(90.0 - deg)
+            inner = 0.86 if major else (0.925 if deg % 15 == 0 else 0.947)
+            xx.extend([inner * math.cos(theta), .978 * math.cos(theta), None])
+            yy.extend([inner * math.sin(theta), .978 * math.sin(theta), None])
+            zz.extend([.102, .102, None])
+        fig.add_trace(go.Scatter3d(
+            x=xx, y=yy, z=zz, mode="lines", showlegend=False, hoverinfo="skip",
+            line=dict(color=NEON_BLUE_BRIGHT if major else NEON_BLUE_DEEP,
+                      width=5 if major else 2),
+        ))
+    labels = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+    a = np.radians(90.0 - np.arange(0, 360, 45))
+    fig.add_trace(go.Scatter3d(
+        x=1.16 * np.cos(a), y=1.16 * np.sin(a),
+        z=np.full(8, 0.17), mode="text", text=labels,
+        textfont=dict(color=NEON_BLUE_BRIGHT, size=13),
+        showlegend=False, hoverinfo="skip",
+    ))
+    _compass_3d_arrow(fig, float(row.true_heading_deg), NEON_BLUE,
+                      "TRUE heading", .83, .19, 10)
+    _compass_3d_arrow(fig, float(row.mag_true_heading_deg), ORANGE,
+                      "MAG corrected", .73, .235, 8)
+    _compass_3d_arrow(fig, float(row.fused_heading_deg), LIME,
+                      "FUSED heading", .92, .275, 6)
+    fig.add_trace(go.Scatter3d(
+        x=[0], y=[0], z=[.29], mode="markers", showlegend=False,
+        marker=dict(size=7, color=NEON_BLUE_BRIGHT), hoverinfo="skip",
+    ))
+    fig.update_layout(
+        template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG,
+        title=dict(text=f"3D COMPASS  |  MAG DECLINATION {declination:+.1f}°",
+                   font=dict(color=NEON_BLUE_BRIGHT, size=13), x=.03),
+        font=dict(color=TEXT, family="Consolas, monospace"),
+        height=480, margin=dict(l=0, r=0, t=54, b=6),
+        legend=dict(orientation="h", x=.5, xanchor="center", y=-.025,
+                    font=dict(size=10, color=TEXT), bgcolor="rgba(0,0,0,0)"),
+        scene=dict(
+            bgcolor=BG, xaxis=dict(visible=False), yaxis=dict(visible=False),
+            zaxis=dict(visible=False), aspectmode="manual",
+            aspectratio=dict(x=1, y=1, z=.4),
+            camera=dict(eye=dict(x=1.22, y=-1.65, z=1.45),
+                        up=dict(x=0, y=0, z=1)),
+            dragmode="orbit",
+        ),
+        uirevision="compass_neon_3d",
+        showlegend=True,
+    )
+    return fig
+
+
+def _rascal_geometry() -> dict[str, object]:
+    """SIG-published span, length and wing area; remaining shape is illustrative."""
+    reference = manufacturer_si()
+    span = float(reference["span_m"])
+    length = float(reference["fuselage_length_m"])
+    mean_chord = float(reference["wing_area_m2"]) / span
+    return dict(span=span, length=length,
+                root_chord=mean_chord * 1.30,
+                tip_chord=mean_chord * .70)
+
+
+def _aircraft_rotation(heading_deg: float, pitch_deg: float,
+                       roll_deg: float) -> np.ndarray:
+    """Right-handed aircraft drawing axes FWD/PORT/UP mapped to East/North/Up.
+
+    Heading: clockwise from true north. Pitch positive nose up. Roll positive
+    right wing down. This is a *drawing transform*, not the plant FRD/NED DCM.
+    """
+    psi, theta, phi = np.radians([heading_deg, pitch_deg, roll_deg])
+    forward = np.array([math.sin(psi) * math.cos(theta),
+                        math.cos(psi) * math.cos(theta), math.sin(theta)])
+    port_level = np.array([-math.cos(psi), math.sin(psi), 0.0])
+    up_pitched = np.array([-math.sin(psi) * math.sin(theta),
+                           -math.cos(psi) * math.sin(theta), math.cos(theta)])
+    port = math.cos(phi) * port_level + math.sin(phi) * up_pitched
+    up = -math.sin(phi) * port_level + math.cos(phi) * up_pitched
+    return np.column_stack([forward, port, up])
+
+
+def _aircraft_hull(fig: go.Figure, vertices: np.ndarray, faces: np.ndarray,
+                   name: str, color: str, rotation: np.ndarray,
+                   *, opacity: float = 1.0, hover: bool = False) -> None:
+    rendered = np.asarray(vertices, dtype=float) @ rotation.T
+    tri = np.asarray(faces, dtype=int)
+    fig.add_trace(go.Mesh3d(
+        x=rendered[:,0], y=rendered[:,1], z=rendered[:,2],
+        i=tri[:,0], j=tri[:,1], k=tri[:,2],
+        name=name, color=color, flatshading=True, opacity=opacity,
+        lighting=dict(ambient=.68, diffuse=.67, specular=.28, roughness=.55),
+        hovertemplate=(name + "<extra></extra>") if hover else None,
+        hoverinfo=None if hover else "skip", showlegend=False,
+    ))
+
+
+def _aircraft_line(fig: go.Figure, points: np.ndarray, rot: np.ndarray,
+                   color: str, width: float = 3, name: str = "") -> None:
+    pts = np.asarray(points, dtype=float) @ rot.T
+    fig.add_trace(go.Scatter3d(
+        x=pts[:,0], y=pts[:,1], z=pts[:,2],
+        mode="lines", line=dict(color=color, width=width),
+        showlegend=False, hoverinfo="skip", name=name,
+    ))
+
+
+def _aircraft_wing_vertices(span: float, root_chord: float,
+                            tip_chord: float, side: int,
+                            *, tail: bool = False) -> np.ndarray:
+    """Tapered thick wing solid; port is positive local y."""
+    halfspan = span / 2
+    y_root = side * (.055 if not tail else .018)
+    y_tip = side * halfspan
+    x_center_root = -.76 if tail else .085
+    x_center_tip = -.82 if tail else .02
+    z_root = .084 if tail else .135
+    z_tip = .10 if tail else .208
+    thick = .017 if tail else .030
+    return np.array([
+        [x_center_root + root_chord/2, y_root, z_root + thick],
+        [x_center_root - root_chord/2, y_root, z_root + thick],
+        [x_center_tip + tip_chord/2, y_tip, z_tip + thick],
+        [x_center_tip - tip_chord/2, y_tip, z_tip + thick],
+        [x_center_root + root_chord/2, y_root, z_root - thick],
+        [x_center_root - root_chord/2, y_root, z_root - thick],
+        [x_center_tip + tip_chord/2, y_tip, z_tip - thick],
+        [x_center_tip - tip_chord/2, y_tip, z_tip - thick],
+    ])
+
+
+_AIRCRAFT_BOX_FACES = np.array([
+    [0, 1, 2], [1, 3, 2], [4, 6, 5], [5, 6, 7],
+    [0, 2, 4], [4, 2, 6], [1, 5, 3], [5, 7, 3],
+    [0, 4, 1], [1, 4, 5], [2, 3, 6], [3, 7, 6],
+], dtype=int)
+
+
+def aircraft_figure_3d(row: pd.Series, view: str = "Isometric",
+                       heading_source: str = "True heading (physical)") -> go.Figure:
+    """Interactively orbit a Rascal-shaped airframe linked to simulated attitude.
+
+    Geometry uses manufacturer span/length/area. Its wing planform, tail size,
+    fuselage sections and paint are visualization approximations, NOT CAD or CFD.
+    """
+    cfg = _rascal_geometry()
+    heading_fields = {
+        "True heading (physical)": "true_heading_deg",
+        "Fused heading (estimated)": "fused_heading_deg",
+        "Magnetic corrected (sensor)": "mag_true_heading_deg",
+    }
+    if heading_source not in heading_fields:
+        raise ValueError("Unknown display heading source")
+    yaw = float(row.get(heading_fields[heading_source], 0.0))
+    pitch = float(row.get("true_pitch_deg", 0.0))
+    bank = float(row.get("true_roll_deg", 0.0))
+    rot = _aircraft_rotation(yaw, pitch, bank)
+    fig = go.Figure()
+    length = float(cfg["length"])
+    span = float(cfg["span"])
+    # Elliptical tapered fuselage with a three-dimensional, triangulated shell.
+    stations = [
+        (-.50 * length, .025, .030),
+        (-.41 * length, .052, .060),
+        (-.20 * length, .078, .090),
+        (.04 * length, .115, .128),
+        (.30 * length, .110, .110),
+        (.44 * length, .067, .070),
+        (.50 * length, .020, .027),
+    ]
+    n_circ = 12
+    vertices = []
+    for x, width, height in stations:
+        for ang in np.linspace(0, 2*np.pi, n_circ, endpoint=False):
+            vertices.append([x, width*math.cos(ang), .012 + height*math.sin(ang)])
+    faces = []
+    for k in range(len(stations) - 1):
+        for j in range(n_circ):
+            a = k*n_circ + j
+            b = k*n_circ + (j + 1) % n_circ
+            c = (k + 1)*n_circ + j
+            d = (k + 1)*n_circ + (j + 1) % n_circ
+            faces.extend([[a,b,c],[b,d,c]])
+    _aircraft_hull(fig, np.asarray(vertices), np.asarray(faces),
+                   "High-wing Rascal-style fuselage", "#E6F1F4", rot)
+
+    for side in [-1,1]:
+        main = _aircraft_wing_vertices(span, cfg["root_chord"],
+                                      cfg["tip_chord"], side)
+        _aircraft_hull(fig, main, _AIRCRAFT_BOX_FACES,
+                       "Rascal-style high wing", "#DAEDF2", rot)
+        # Cyan wing-tip outline is an identification marking, not a surface seam.
+        _aircraft_line(fig, main[[2,3]], rot, NEON_BLUE, 5)
+        tail = _aircraft_wing_vertices(.90, .23, .16, side, tail=True)
+        _aircraft_hull(fig, tail, _AIRCRAFT_BOX_FACES,
+                       "Horizontal stabilizer (illustrative)", "#AEC6CD", rot)
+    # Vertical fin, at the tail: a thin tapered 3-D volume.
+    fin = np.array([
+        [-.89,.017,.07],[-.65,.017,.07],[-.84,.017,.33],[-.77,.017,.33],
+        [-.89,-.017,.07],[-.65,-.017,.07],[-.84,-.017,.33],[-.77,-.017,.33],
+    ])
+    _aircraft_hull(fig, fin, _AIRCRAFT_BOX_FACES,
+                   "Vertical stabilizer (illustrative)", "#B8D2D9", rot)
+    # Visually distinct canopy and motor cowling markings.
+    _aircraft_line(fig,
+        np.array([[.22,-.107,.075],[.37,-.070,.13],[.52,0,.125],[.37,.070,.13],[.22,.107,.075]]),
+        rot, NEON_BLUE_DEEP, 4)
+    # Propeller disk located at the modeled nose, no thrust is inferred from it.
+    theta = np.linspace(0, 2*np.pi, 73)
+    nose_x = .50 * length + .020
+    prop_loop = np.column_stack([
+        np.full(len(theta),nose_x), .20 * np.cos(theta), .20 * np.sin(theta),
+    ])
+    _aircraft_line(fig, prop_loop, rot, "#6D9299", 2)
+    _aircraft_line(fig, np.array([[nose_x,0,-.17],[nose_x,0,.17]]),rot,NEON_BLUE,5)
+
+    # Fixed world reference prevents orbiting the model from obscuring heading.
+    for axis, endpoint, color in [
+        ("EAST", [1.70,0,-.47], NEON_BLUE),
+        ("NORTH", [0,1.70,-.47], LIME),
+        ("UP", [0,0,.90], ORANGE),
+    ]:
+        fig.add_trace(go.Scatter3d(
+            x=[0,endpoint[0]], y=[0,endpoint[1]], z=[-.47,endpoint[2]],
+            mode="lines+text", text=["",axis], textposition="top center",
+            line=dict(color=color,width=3,dash="dash"),
+            textfont=dict(color=color,size=10), hoverinfo="skip", showlegend=False,
+        ))
+    fwd = rot[:, 0]
+    fig.add_trace(go.Scatter3d(
+        x=[0, 1.25*fwd[0]], y=[0, 1.25*fwd[1]],
+        z=[-.47, -.47], mode="lines", line=dict(color=NEON_BLUE, width=7),
+        name="True heading projection", showlegend=False,
+        hovertemplate=f"True heading {yaw:.1f}°<extra></extra>",
+    ))
+    preset = {
+        "Isometric": dict(x=2.55,y=-2.95,z=1.88),
+        "Top": dict(x=.18,y=-.12,z=4.5),
+        "Side": dict(x=3.8,y=.3,z=1.0),
+        "Chase": dict(x=-2.9 * fwd[0],y=-2.9 * fwd[1],z=1.45),
+    }
+    camera = preset.get(view, preset["Isometric"])
+    fig.update_layout(
+        template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG,
+        title=dict(text="SIG RASCAL 110  |  " + heading_source.upper(),
+                   font=dict(color=NEON_BLUE_BRIGHT, size=12), x=.03),
+        font=dict(color=TEXT, family="Consolas, monospace"),
+        height=480, margin=dict(l=0, r=0, t=54, b=6),
+        scene=dict(
+            bgcolor=BG,
+            xaxis=dict(visible=False), yaxis=dict(visible=False),
+            zaxis=dict(visible=False),
+            aspectmode="data", camera=dict(eye=camera, up=dict(x=0,y=0,z=1)),
+            dragmode="orbit",
+        ),
+        uirevision=f"rascal_airframe_3d_{view}", showlegend=False,
+    )
+    return fig
+
 def mission_plot(df: pd.DataFrame, row_idx: int, c: SimConfig, view3d: bool) -> go.Figure:
     q = df.iloc[row_idx]
     xs = df.true_e_m.to_numpy()
@@ -1557,7 +1890,7 @@ health_css = "fault" if any(x in health.upper() for x in ("UNRELIABLE", "CRITICA
 st.markdown(
     '<div class="hud-hero">'
     '<div class="kicker">AEROSPACE DIGITAL TWIN // NAVIGATION LAB</div>'
-    '<h1>UAV <span>COMPASS</span> &amp; NAVIGATION DIGITAL TWIN</h1>'
+    '<h1>UAV <span>Compass</span> Variance Simulator</h1>'
     '<div class="subtitle">PHYSICS-INFORMED FLIGHT SIMULATION / SENSOR FUSION / '
     'FAULT-TOLERANT AUTONOMY / UNCERTAINTY ANALYSIS / V&amp;V</div>'
     '<div class="statusline">'
@@ -1585,6 +1918,22 @@ st.markdown(
     '</div>', unsafe_allow_html=True,
 )
 
+st.markdown(
+    '<div class="hud-side-note" style="margin:10px 0 8px;border-color:rgba(0,229,255,.33);">'
+    '<b style="color:#73F6FF;">LINKED 3D FLIGHT INSTRUMENTS</b> &nbsp; '
+    'The mission track, 3D compass and Rascal airframe use the same simulation-time selection.'
+    '</div>', unsafe_allow_html=True)
+# Keep the synchronized inspector in bounds when a new mission is shorter.
+if "linked_flight_time_s" in st.session_state:
+    st.session_state["linked_flight_time_s"] = float(np.clip(
+        st.session_state["linked_flight_time_s"], 0.0, float(df.time_s.iloc[-1])
+    ))
+shared_flight_time_s = st.slider(
+    "Synchronized mission / compass / aircraft time (s)",
+    min_value=0.0, max_value=float(df.time_s.iloc[-1]), value=0.0,
+    step=float(c.dt_s), key="linked_flight_time_s",
+)
+
 mission_tab, compass_tab, integrity_tab, uq_tab, verification_tab, sources_tab = st.tabs([
     "✈ MISSION & PLAYBACK", "🧭 COMPASS INSTRUMENT", "📡 SENSOR INTEGRITY",
     "📊 MONTE CARLO", "✅ V&V / EXPORT", "📚 AIRCRAFT SOURCES",
@@ -1593,8 +1942,8 @@ mission_tab, compass_tab, integrity_tab, uq_tab, verification_tab, sources_tab =
 with mission_tab:
     panel_header("01 / GUIDANCE, NAVIGATION & CONTROL", "Mission & Playback",
                  "Inspect truth, estimated state, trajectory deviation, and browser-side playback.")
-    selected_t = st.slider("Inspect simulation at time (s)", min_value=0.0,
-                           max_value=float(df.time_s.iloc[-1]), value=0.0, step=float(c.dt_s))
+    selected_t = shared_flight_time_s
+    st.caption(f"Linked mission snapshot: {selected_t:.2f} s. Adjust the synchronized time slider above the tabs.")
     idx = min(len(df)-1, max(0, int(round(selected_t / c.dt_s))))
     snap = df.iloc[idx]
     hud_kpis([
@@ -1619,38 +1968,81 @@ with mission_tab:
     st.plotly_chart(theme(fig, 340), use_container_width=True)
 
 with compass_tab:
-    panel_header("02 / HEADING INSTRUMENTATION", "Neon Compass Instrument",
-                 "Cyan: true-north reference  |  Amber: magnetic solution  |  Green: fused heading.",
+    panel_header("02 / SYNCHRONIZED 3D INSTRUMENTS", "3D Compass & Rascal Airframe",
+                 "Orbit, zoom or pan each Plotly model. Both respond to the linked mission time above.",
                  compass=True)
-    view_idx = st.slider("Compass snapshot (s)", 0.0, float(df.time_s.iloc[-1]), 0.0,
-                         float(c.dt_s), key="compass_time")
-    q = df.iloc[min(len(df)-1, int(round(view_idx/c.dt_s)))]
-    left, right = st.columns([1.1, 1.0])
+    view_idx = shared_flight_time_s
+    q = df.iloc[min(len(df)-1, max(0, int(round(view_idx / c.dt_s))))]
+    view_col, heading_col = st.columns(2)
+    with view_col:
+        aircraft_view = st.selectbox("Aircraft 3D camera", ["Isometric", "Top", "Side", "Chase"],
+                                     key="aircraft_3d_view",
+                                     help="Orbit and zoom freely after selecting a camera preset.")
+    with heading_col:
+        aircraft_heading_source = st.selectbox(
+            "Aircraft heading display",
+            ["True heading (physical)", "Fused heading (estimated)",
+             "Magnetic corrected (sensor)"],
+            key="aircraft_heading_display",
+            help="Only changes the displayed aircraft orientation; never the simulator, autopilot, or truth state.",
+        )
+    left, right = st.columns([1, 1], gap="medium")
     with left:
-        compass = compass_figure(q, float(q.get("magnetic_declination_deg",c.declination_deg)))
-        st.pyplot(compass, use_container_width=True)
-        plt.close(compass)
+        st.plotly_chart(compass_figure_3d(
+            q, float(q.get("magnetic_declination_deg", c.declination_deg))),
+            use_container_width=True, key="linked_neon_compass_3d",
+            config={"displaylogo":False, "scrollZoom":True},
+        )
     with right:
-        compass_readouts(q)
-        panel_header("HEADING ERROR GEOMETRY", "Uncompensated Drift",
-                     "Straight-line theoretical reference, not the closed-loop simulated trajectory.",
-                     compass=True)
-        theoretical = theoretical_drift_m_per_km(float(q.mag_error_deg))
-        if np.isfinite(theoretical):
-            st.markdown(
-                f'<div class="compass-note"><strong>{theoretical:,.1f} m</strong> lateral deviation '
-                'per 1 km along-track, with a fixed uncompensated heading offset.</div>',
-                unsafe_allow_html=True,
-            )
-        else:
-            st.warning("Forward along-track drift geometry is undefined for a 90° or greater uncompensated heading offset.")
-        st.caption("This geometric benchmark assumes constant heading error, no crosswind, and no closed-loop correction. The mission plot uses simulated closed-loop dynamics.")
+        st.plotly_chart(aircraft_figure_3d(q, aircraft_view, aircraft_heading_source),
+                        use_container_width=True, key="linked_rascal_airframe_3d",
+                        config={"displaylogo":False, "scrollZoom":True})
+    st.caption("The compass uses TRUE (cyan), magnetic declination-corrected (amber) and FUSED (green) headings. "
+               "The aircraft shows the selected heading source at the SAME timestamp; "
+               "bank and pitch use true simulated attitude. Switching the heading source changes "
+               "the visualization only, never the aircraft's actual path or flight controller. "
+               "Positive roll corresponds to right wing down; positive pitch is nose up.")
+    if "true_roll_deg" not in df.columns or "true_pitch_deg" not in df.columns:
+        st.info("The selected legacy physics profile does not model all attitude axes. "
+                "Missing bank/pitch angles appear as 0° in the 3D airframe visualization.")
+    model_reference = manufacturer_si()
+    st.caption(f"Geometry reference: SIG Rascal 110 EG ARF | published wingspan "
+               f"{model_reference['span_m']:.3f} m, fuselage length "
+               f"{model_reference['fuselage_length_m']:.3f} m and wing area "
+               f"{model_reference['wing_area_m2']:.3f} m². "
+               "Wing planform, tail, fuselage profile and markings are illustrative, not OEM CAD. "
+               "The active v4 flight dynamics remain a generic, uncalibrated 12 kg research surrogate, "
+               "not a Rascal-specific physics model.")
+    compass_readouts(q)
+    hud_kpis([
+        ("SIMULATED BANK", f"{float(q.get('true_roll_deg', 0.0)):+.1f}°", "blue"),
+        ("SIMULATED PITCH", f"{float(q.get('true_pitch_deg', 0.0)):+.1f}°", "blue"),
+        ("SIMULATION TIME", f"{float(q.time_s):.2f} s", ""),
+        ("MAGNETIC INTEGRITY", "ACCEPTED" if bool(q.mag_accepted) else "REJECTED", "green" if bool(q.mag_accepted) else "fault"),
+    ], four=True)
+    with st.expander("View the original neon 2D compass", expanded=False):
+        original_compass = compass_figure(q, float(q.get("magnetic_declination_deg", c.declination_deg)))
+        st.pyplot(original_compass, use_container_width=True)
+        plt.close(original_compass)
+    panel_header("HEADING ERROR GEOMETRY", "Uncompensated Drift",
+                 "Straight-line theoretical reference, not the closed-loop simulated trajectory.",
+                 compass=True)
+    theoretical = theoretical_drift_m_per_km(float(q.mag_error_deg))
+    if np.isfinite(theoretical):
         st.markdown(
-            f'<div class="compass-note">MAG SAMPLE: <strong>{"ACCEPTED" if q.mag_accepted else "REJECTED"}</strong>'
-            f' &nbsp; | &nbsp; FIELD: <strong>{q.mag_field_ut:.2f} μT</strong>'
-            f' &nbsp; | &nbsp; INNOVATION: <strong>{q.mag_innovation_deg:+.2f}°</strong></div>',
+            f'<div class="compass-note"><strong>{theoretical:,.1f} m</strong> lateral deviation '
+            'per 1 km along-track, with a fixed uncompensated heading offset.</div>',
             unsafe_allow_html=True,
         )
+    else:
+        st.warning("Forward along-track drift geometry is undefined for a 90° or greater uncompensated heading offset.")
+    st.caption("This geometric benchmark assumes constant heading error, no crosswind, and no closed-loop correction. The mission plot uses simulated closed-loop dynamics.")
+    st.markdown(
+        f'<div class="compass-note">MAG SAMPLE: <strong>{"ACCEPTED" if q.mag_accepted else "REJECTED"}</strong>'
+        f' &nbsp; | &nbsp; FIELD: <strong>{q.mag_field_ut:.2f} μT</strong>'
+        f' &nbsp; | &nbsp; INNOVATION: <strong>{q.mag_innovation_deg:+.2f}°</strong></div>',
+        unsafe_allow_html=True,
+    )
     st.caption("Actual declination and applied correction are separately configurable. A heading offset from a magnetometer fault is not the same as geographic magnetic variation.")
 
 with integrity_tab:
@@ -1906,7 +2298,7 @@ with sources_tab:
     st.caption("Recommended electrical power is in watts and must not be converted directly to a propeller thrust force. No OEM aerodynamic tables, measured inertia or propulsion thrust curves were identified in the cited primary manufacturer specifications.")
 
 st.markdown(
-    '<div class="hud-foot">UAV COMPASS &amp; NAVIGATION DIGITAL TWIN &nbsp; | &nbsp; '
+    '<div class="hud-foot">UAV COMPASS VARIANCE SIMULATOR &nbsp; | &nbsp; '
     'PYTHON • STREAMLIT • NUMPY • PANDAS • MATPLOTLIB • PLOTLY &nbsp; | &nbsp; '
     'SYNTHETIC AEROSPACE RESEARCH ENVIRONMENT • NOT FOR OPERATIONAL FLIGHT USE</div>',
     unsafe_allow_html=True,
